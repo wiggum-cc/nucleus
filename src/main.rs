@@ -1,8 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
-use nucleus::container::{Container, ContainerConfig};
+use nucleus::container::{Container, ContainerConfig, ContainerStateManager};
 use nucleus::isolation::NamespaceConfig;
-use nucleus::resources::ResourceLimits;
+use nucleus::resources::{ResourceLimits, ResourceStats};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -38,9 +38,30 @@ enum Commands {
         #[arg(long, default_value = "native")]
         runtime: String,
 
+        /// Run in rootless mode with user namespace
+        #[arg(long)]
+        rootless: bool,
+
+        /// Use OCI bundle format (requires gVisor)
+        #[arg(long)]
+        oci: bool,
+
         /// Command to run in container
         #[arg(last = true)]
         command: Vec<String>,
+    },
+
+    /// List running containers
+    Ps {
+        /// Show all containers (including stopped)
+        #[arg(short, long)]
+        all: bool,
+    },
+
+    /// Show resource usage statistics for containers
+    Stats {
+        /// Container ID (if not specified, shows all containers)
+        container_id: Option<String>,
     },
 }
 
@@ -55,12 +76,127 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Ps { all } => {
+            let state_mgr = ContainerStateManager::new()?;
+
+            let states = if all {
+                state_mgr.list_states()?
+            } else {
+                state_mgr.list_running()?
+            };
+
+            if states.is_empty() {
+                println!("No containers found");
+                return Ok(());
+            }
+
+            // Print header
+            println!(
+                "{:<15} {:<10} {:<10} {:<10} {:<10} {}",
+                "CONTAINER ID", "PID", "STATUS", "RUNTIME", "ROOTLESS", "COMMAND"
+            );
+
+            // Print each container
+            for state in states {
+                let status = if state.is_running() {
+                    "Running"
+                } else {
+                    "Stopped"
+                };
+                let runtime = if state.using_gvisor {
+                    "gvisor"
+                } else {
+                    "native"
+                };
+                let rootless = if state.rootless { "yes" } else { "no" };
+                let command = state.command.join(" ");
+                let command_display = if command.len() > 40 {
+                    format!("{}...", &command[..37])
+                } else {
+                    command
+                };
+
+                println!(
+                    "{:<15} {:<10} {:<10} {:<10} {:<10} {}",
+                    &state.id[..state.id.len().min(15)],
+                    state.pid,
+                    status,
+                    runtime,
+                    rootless,
+                    command_display
+                );
+            }
+
+            Ok(())
+        }
+
+        Commands::Stats { container_id } => {
+            let state_mgr = ContainerStateManager::new()?;
+
+            let states = if let Some(id) = container_id {
+                vec![state_mgr.load_state(&id)?]
+            } else {
+                state_mgr.list_running()?
+            };
+
+            if states.is_empty() {
+                println!("No running containers found");
+                return Ok(());
+            }
+
+            // Print header
+            println!(
+                "{:<15} {:<10} {:<15} {:<15} {:<10} {:<10}",
+                "CONTAINER ID", "CPU TIME", "MEM USAGE", "MEM LIMIT", "MEM %", "PIDS"
+            );
+
+            // Print stats for each container
+            for state in states {
+                if !state.is_running() {
+                    continue;
+                }
+
+                if let Some(cgroup_path) = &state.cgroup_path {
+                    match ResourceStats::from_cgroup(cgroup_path) {
+                        Ok(stats) => {
+                            let mem_usage = ResourceStats::format_memory(stats.memory_usage);
+                            let mem_limit = if stats.memory_limit > 0 {
+                                ResourceStats::format_memory(stats.memory_limit)
+                            } else {
+                                "unlimited".to_string()
+                            };
+                            let cpu_time = ResourceStats::format_cpu_time(stats.cpu_usage_ns);
+
+                            println!(
+                                "{:<15} {:<10} {:<15} {:<15} {:<10.2} {:<10}",
+                                &state.id[..state.id.len().min(15)],
+                                cpu_time,
+                                mem_usage,
+                                mem_limit,
+                                stats.memory_percent,
+                                stats.pid_count
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to read stats for {}: {}", state.id, e);
+                        }
+                    }
+                } else {
+                    eprintln!("No cgroup path for container {}", state.id);
+                }
+            }
+
+            Ok(())
+        }
+
         Commands::Run {
             context,
             memory,
             cpus,
             hostname,
             runtime,
+            rootless,
+            oci,
             command,
         } => {
             if command.is_empty() {
@@ -100,6 +236,18 @@ fn main() -> Result<()> {
 
             if runtime == "gvisor" {
                 config = config.with_gvisor(true);
+            }
+
+            // Enable rootless mode if requested
+            if rootless {
+                info!("Enabling rootless mode");
+                config = config.with_rootless();
+            }
+
+            // Enable OCI bundle mode if requested
+            if oci {
+                info!("Enabling OCI bundle mode");
+                config = config.with_oci_bundle();
             }
 
             // Run container

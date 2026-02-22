@@ -1,4 +1,5 @@
 use crate::error::{NucleusError, Result};
+use crate::security::OciBundle;
 use std::ffi::CString;
 use std::path::Path;
 use std::process::Command;
@@ -54,7 +55,7 @@ impl GVisorRuntime {
         ))
     }
 
-    /// Execute a command using gVisor (runsc)
+    /// Execute a command using gVisor (runsc) - legacy non-OCI mode
     ///
     /// This implements the transition: native_kernel -> gvisor_kernel
     pub fn exec_with_gvisor(
@@ -90,6 +91,50 @@ impl GVisorRuntime {
         args.push(container_id.to_string());
 
         debug!("runsc args: {:?}", args);
+
+        // Convert to CStrings for exec
+        let program = CString::new(self.runsc_path.as_str())
+            .map_err(|e| NucleusError::GVisorError(format!("Invalid runsc path: {}", e)))?;
+
+        let c_args: Result<Vec<CString>> = args
+            .iter()
+            .map(|arg| {
+                CString::new(arg.as_str())
+                    .map_err(|e| NucleusError::GVisorError(format!("Invalid argument: {}", e)))
+            })
+            .collect();
+        let c_args = c_args?;
+
+        // execve - this replaces the current process with runsc
+        nix::unistd::execve::<std::ffi::CString, std::ffi::CString>(&program, &c_args, &[])?;
+
+        // Should never reach here
+        Ok(())
+    }
+
+    /// Execute using gVisor with an OCI bundle
+    ///
+    /// This is the OCI-compliant way to run containers with gVisor
+    pub fn exec_with_oci_bundle(&self, container_id: &str, bundle: &OciBundle) -> Result<()> {
+        info!(
+            "Executing with gVisor using OCI bundle at {:?}",
+            bundle.bundle_path()
+        );
+
+        // Build runsc run command with OCI bundle
+        // runsc run --bundle <bundle-path> <container-id>
+        let args = vec![
+            "run".to_string(),
+            "--bundle".to_string(),
+            bundle.bundle_path().to_string_lossy().to_string(),
+            "--network".to_string(),
+            "none".to_string(),
+            "--platform".to_string(),
+            "ptrace".to_string(), // Use ptrace platform (works without KVM)
+            container_id.to_string(),
+        ];
+
+        debug!("runsc OCI args: {:?}", args);
 
         // Convert to CStrings for exec
         let program = CString::new(self.runsc_path.as_str())

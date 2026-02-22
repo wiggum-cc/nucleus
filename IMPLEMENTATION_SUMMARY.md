@@ -6,11 +6,11 @@ Nucleus is an extremely lightweight Docker alternative for agents, implemented u
 
 ## Implementation Statistics
 
-- **Source files**: 23 Rust files
-- **Lines of code**: ~2,250 lines (implementation)
+- **Source files**: 27 Rust files
+- **Lines of code**: ~3,745 lines (implementation)
 - **Test files**: 10 test files (6 property-based + 4 tla-connect drivers)
 - **Test code**: ~1,320 lines
-- **Total tests**: 76 tests (72 passing, 4 ignored - require root)
+- **Total tests**: 82 tests (77 passing, 5 ignored - require root/gVisor/Apalache)
 - **Model-based tests**:
   - 32 property-based tests (state transitions, terminal states, liveness)
   - 6 tla-connect property tests (invalid transitions)
@@ -28,13 +28,16 @@ nucleus/
 │   ├── error.rs                  # Error types
 │   ├── container/                # Container orchestration
 │   │   ├── config.rs             # Configuration builder
-│   │   └── runtime.rs            # Container lifecycle
+│   │   ├── runtime.rs            # Container lifecycle
+│   │   └── state.rs              # Container state tracking
 │   ├── isolation/                # Namespace isolation
 │   │   ├── namespaces.rs         # Namespace management
+│   │   ├── usermap.rs            # UID/GID mapping (rootless)
 │   │   └── state.rs              # State machine
 │   ├── resources/                # Resource control
 │   │   ├── cgroup.rs             # cgroup v2 interface
 │   │   ├── limits.rs             # Resource limits
+│   │   ├── stats.rs              # Resource usage statistics
 │   │   └── state.rs              # State machine
 │   ├── filesystem/               # Filesystem management
 │   │   ├── tmpfs.rs              # tmpfs mounting
@@ -45,6 +48,7 @@ nucleus/
 │       ├── capabilities.rs       # Capability dropping
 │       ├── seccomp.rs            # Seccomp filtering
 │       ├── gvisor.rs             # gVisor integration
+│       ├── oci.rs                # OCI bundle format
 │       └── state.rs              # State machine
 └── tests/
     ├── model_based_security.rs   # Security spec tests
@@ -255,6 +259,24 @@ nucleus run --context ./data --memory 512M --cpus 2 --hostname agent-1 /bin/agen
 
 # With gVisor runtime (requires gVisor/runsc installed)
 nucleus run --runtime gvisor /bin/agent
+
+# With rootless mode (user namespace)
+nucleus run --rootless /bin/agent
+
+# With OCI bundle format (requires gVisor)
+nucleus run --oci /bin/agent
+
+# List running containers
+nucleus ps
+
+# List all containers (including stopped)
+nucleus ps --all
+
+# Show resource usage statistics
+nucleus stats
+
+# Show stats for a specific container
+nucleus stats <container-id>
 ```
 
 ## Dependencies
@@ -268,6 +290,9 @@ nucleus run --runtime gvisor /bin/agent
 - `anyhow 1`: Error handling
 - `thiserror 2`: Error type derivation
 - `tracing`: Structured logging
+- `serde 1`: Serialization/deserialization
+- `serde_json 1`: JSON support
+- `dirs 5`: Standard directory paths
 
 ### Development Dependencies
 - `tempfile 3`: Temporary directories for tests
@@ -285,10 +310,10 @@ nucleus run --runtime gvisor /bin/agent
 - [x] gVisor integration (`runsc` execution)
 
 ### Mid-term
-- [ ] User namespace UID/GID mapping (rootless mode)
-- [ ] Resource monitoring (`nucleus stats`)
-- [ ] Container listing (`nucleus ps`)
-- [ ] gVisor OCI bundle support (full OCI runtime spec compatibility)
+- [x] User namespace UID/GID mapping (rootless mode)
+- [x] Resource monitoring (`nucleus stats`)
+- [x] Container listing (`nucleus ps`)
+- [x] gVisor OCI bundle support (full OCI runtime spec compatibility)
 
 ### Long-term
 - [ ] Attach to running container (`nucleus attach`)

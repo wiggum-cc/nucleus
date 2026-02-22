@@ -26,6 +26,12 @@ pub enum NucleusError {
     #[error("Invalid resource limit: {0}")]
     InvalidResourceLimit(String),
 
+    #[error("Resource error: {0}")]
+    ResourceError(String),
+
+    #[error("Configuration error: {0}")]
+    ConfigError(String),
+
     #[error("Invalid path: {path:?}")]
     InvalidPath { path: PathBuf },
 

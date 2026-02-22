@@ -1,4 +1,5 @@
 use crate::error::{NucleusError, Result};
+use crate::isolation::usermap::{UserNamespaceConfig, UserNamespaceMapper};
 use nix::sched::{unshare, CloneFlags};
 use nix::unistd::sethostname;
 use tracing::{debug, info};
@@ -87,6 +88,7 @@ impl Default for NamespaceConfig {
 pub struct NamespaceManager {
     config: NamespaceConfig,
     unshared: bool,
+    user_mapper: Option<UserNamespaceMapper>,
 }
 
 impl NamespaceManager {
@@ -94,7 +96,14 @@ impl NamespaceManager {
         Self {
             config,
             unshared: false,
+            user_mapper: None,
         }
+    }
+
+    /// Create a new namespace manager with user namespace mapping
+    pub fn with_user_mapping(mut self, user_config: UserNamespaceConfig) -> Self {
+        self.user_mapper = Some(UserNamespaceMapper::new(user_config));
+        self
     }
 
     /// Create namespaces via unshare(2)
@@ -114,6 +123,17 @@ impl NamespaceManager {
         unshare(flags).map_err(|e| {
             NucleusError::NamespaceError(format!("Failed to unshare namespaces: {}", e))
         })?;
+
+        // If user namespace is enabled and we have a mapper, setup UID/GID mappings
+        // This must be done immediately after unshare(CLONE_NEWUSER)
+        if self.config.user {
+            if let Some(mapper) = &self.user_mapper {
+                info!("Setting up user namespace UID/GID mappings");
+                mapper.setup_mappings()?;
+            } else {
+                debug!("User namespace enabled but no mapper configured");
+            }
+        }
 
         self.unshared = true;
         info!("Successfully created namespaces");

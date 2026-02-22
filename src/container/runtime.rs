@@ -1,9 +1,9 @@
-use crate::container::ContainerConfig;
+use crate::container::{ContainerConfig, ContainerState, ContainerStateManager};
 use crate::error::{NucleusError, Result};
 use crate::filesystem::{ContextPopulator, TmpfsMount, create_minimal_fs, create_dev_nodes, mount_procfs, switch_root};
 use crate::isolation::NamespaceManager;
 use crate::resources::Cgroup;
-use crate::security::{CapabilityManager, GVisorRuntime, SeccompManager};
+use crate::security::{CapabilityManager, GVisorRuntime, OciBundle, OciConfig, SeccompManager};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, ForkResult, Pid};
@@ -35,6 +35,9 @@ impl Container {
     pub fn run(&self) -> Result<i32> {
         info!("Starting container: {}", self.config.name);
 
+        // Create state manager
+        let state_mgr = ContainerStateManager::new()?;
+
         // Create cgroup
         let cgroup_name = format!("nucleus-{}", self.config.name);
         let mut cgroup = Cgroup::create(&cgroup_name)?;
@@ -43,6 +46,11 @@ impl Container {
         // Create namespace manager
         let mut namespace_mgr = NamespaceManager::new(self.config.namespaces.clone());
 
+        // Configure user namespace mapping if provided
+        if let Some(user_config) = &self.config.user_ns_config {
+            namespace_mgr = namespace_mgr.with_user_mapping(user_config.clone());
+        }
+
         // Unshare namespaces in parent process
         namespace_mgr.unshare_namespaces()?;
 
@@ -50,6 +58,27 @@ impl Container {
         match unsafe { fork() }? {
             ForkResult::Parent { child } => {
                 info!("Forked child process: {}", child);
+
+                // Save container state
+                let cgroup_path = format!("/sys/fs/cgroup/{}", cgroup_name);
+                // Convert cpu_quota_us to millicores for storage
+                let cpu_millicores = self.config.limits.cpu_quota_us.map(|quota| {
+                    // quota is in microseconds per period (100ms)
+                    // millicores = (quota / period) * 1000
+                    (quota * 1000) / self.config.limits.cpu_period_us
+                });
+                let state = ContainerState::new(
+                    self.config.name.clone(),
+                    self.config.name.clone(),
+                    child.as_raw() as u32,
+                    self.config.command.clone(),
+                    self.config.limits.memory_bytes,
+                    cpu_millicores,
+                    self.config.use_gvisor,
+                    self.config.user_ns_config.is_some(),
+                    Some(cgroup_path),
+                );
+                state_mgr.save_state(&state)?;
 
                 // Attach child to cgroup
                 cgroup.attach_process(child.as_raw() as u32)?;
@@ -62,6 +91,9 @@ impl Container {
 
                 // Cleanup cgroup
                 cgroup.cleanup()?;
+
+                // Delete container state
+                state_mgr.delete_state(&self.config.name)?;
 
                 info!("Container {} exited with code {}", self.config.name, exit_code);
 
@@ -152,6 +184,12 @@ impl Container {
             e
         })?;
 
+        // Check if we should use OCI bundle format
+        if self.config.use_oci_bundle {
+            return self.setup_and_exec_gvisor_oci(&gvisor);
+        }
+
+        // Legacy non-OCI mode
         // Create root directory for runsc
         let container_root = PathBuf::from("/tmp").join(format!("nucleus-gvisor-{}", self.config.name));
 
@@ -169,6 +207,49 @@ impl Container {
         // Execute with gVisor
         // This will replace the current process with runsc
         gvisor.exec_with_gvisor(&self.config.name, &container_root, &self.config.command)?;
+
+        // Should never reach here
+        Ok(())
+    }
+
+    /// Set up container with gVisor using OCI bundle format
+    fn setup_and_exec_gvisor_oci(&self, gvisor: &GVisorRuntime) -> Result<()> {
+        info!("Using gVisor with OCI bundle format");
+
+        // Create OCI config
+        let mut oci_config = OciConfig::new(self.config.command.clone(), self.config.hostname.clone());
+
+        // Add resource limits
+        oci_config = oci_config.with_resources(&self.config.limits);
+
+        // Add user namespace if configured
+        if self.config.user_ns_config.is_some() {
+            oci_config = oci_config.with_user_namespace();
+        }
+
+        // Create OCI bundle
+        let bundle_path = PathBuf::from("/tmp").join(format!("nucleus-oci-{}", self.config.name));
+        let bundle = OciBundle::new(bundle_path, oci_config);
+        bundle.create()?;
+
+        // Populate rootfs with minimal filesystem
+        let rootfs = bundle.rootfs_path();
+        create_minimal_fs(&rootfs)?;
+
+        // Create device nodes
+        let dev_path = rootfs.join("dev");
+        create_dev_nodes(&dev_path)?;
+
+        // Populate context if provided
+        if let Some(context_dir) = &self.config.context_dir {
+            let context_dest = rootfs.join("context");
+            let populator = ContextPopulator::new(context_dir, &context_dest);
+            populator.populate()?;
+        }
+
+        // Execute with gVisor using OCI bundle
+        // This will replace the current process with runsc
+        gvisor.exec_with_oci_bundle(&self.config.name, &bundle)?;
 
         // Should never reach here
         Ok(())
