@@ -1,0 +1,26 @@
+[package]
+name = "nucleus"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Extremely lightweight Docker alternative for agents — isolated execution using cgroups, namespaces, and memfs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/0kenx/nucleus"
+homepage = "https://github.com/0kenx/nucleus"
+readme = "README.md"
+keywords = ["container", "isolation", "cgroups", "namespaces", "agents"]
+categories = ["command-line-utilities", "os::linux-apis"]
+
+[[bin]]
+name = "nucleus"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
