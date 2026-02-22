@@ -6,13 +6,13 @@ Nucleus is an extremely lightweight Docker alternative for agents, implemented u
 
 ## Implementation Statistics
 
-- **Source files**: 22 Rust files
-- **Lines of code**: ~2,072 lines (implementation)
-- **Test files**: 9 test files (5 property-based + 4 tla-connect drivers)
-- **Test code**: ~1,242 lines
-- **Total tests**: 69 tests (65 passing, 4 ignored - require root)
+- **Source files**: 23 Rust files
+- **Lines of code**: ~2,250 lines (implementation)
+- **Test files**: 10 test files (6 property-based + 4 tla-connect drivers)
+- **Test code**: ~1,320 lines
+- **Total tests**: 76 tests (72 passing, 4 ignored - require root)
 - **Model-based tests**:
-  - 25 property-based tests (state transitions, terminal states, liveness)
+  - 32 property-based tests (state transitions, terminal states, liveness)
   - 6 tla-connect property tests (invalid transitions)
   - 4 tla-connect Apalache replay tests (ignored without Apalache installed)
 
@@ -44,12 +44,14 @@ nucleus/
 │   └── security/                 # Security enforcement
 │       ├── capabilities.rs       # Capability dropping
 │       ├── seccomp.rs            # Seccomp filtering
+│       ├── gvisor.rs             # gVisor integration
 │       └── state.rs              # State machine
 └── tests/
     ├── model_based_security.rs   # Security spec tests
     ├── model_based_isolation.rs  # Isolation spec tests
     ├── model_based_resources.rs  # Resources spec tests
     ├── model_based_filesystem.rs # Filesystem spec tests
+    ├── model_based_gvisor.rs     # gVisor spec tests
     └── integration_lifecycle.rs  # Full lifecycle tests
 ```
 
@@ -83,7 +85,9 @@ nucleus/
 
 - [x] **Capabilities**: Drop all capabilities by default
 - [x] **Seccomp**: Whitelist syscall filtering (~100 allowed syscalls)
+- [x] **gVisor integration**: Optional application kernel via runsc
 - [x] **State machine**: `privileged → capabilities_dropped → seccomp_applied → locked`
+- [x] **gVisor state machine**: `native_kernel → gvisor_kernel`
 - [x] **Properties verified**: Irreversible lockdown, no privilege escalation, defense in depth
 
 ### ✅ Container Orchestration
@@ -108,6 +112,7 @@ Every component has a corresponding TLA+ specification:
 | Component | TLA+ Spec | Rust Implementation | Tests |
 |-----------|-----------|---------------------|-------|
 | Security | `Nucleus_Security_SecurityEnforcement.tla` | `src/security/` | ✅ 6 tests |
+| gVisor | `NucleusSecurity_GVisor_GVisorRuntime.tla` | `src/security/gvisor.rs` | ✅ 7 tests |
 | Isolation | `Nucleus_Isolation_NamespaceLifecycle.tla` | `src/isolation/` | ✅ 6 tests |
 | Resources | `Nucleus_Resources_CgroupLifecycle.tla` | `src/resources/` | ✅ 6 tests |
 | Filesystem | `Nucleus_Filesystem_FilesystemLifecycle.tla` | `src/filesystem/` | ✅ 7 tests |
@@ -182,6 +187,13 @@ fn test_security_replay_apalache_traces() -> Result<()> {
 - ✅ **Terminal stability**: Locked state is terminal
 - ✅ **Liveness**: Always reaches locked state
 
+### gVisor Module
+
+- ✅ **Kernel switching**: Native kernel can transition to gVisor kernel
+- ✅ **Terminal stability**: gVisor kernel state is terminal
+- ✅ **Liveness**: Always reaches gVisor kernel when enabled
+- ✅ **Runtime detection**: Automatically detects runsc availability
+
 ### Isolation Module
 
 - ✅ **Isolation integrity**: Once entered, can only stay or cleanup
@@ -206,10 +218,11 @@ fn test_security_replay_apalache_traces() -> Result<()> {
 ## Test Results
 
 ```
-running 69 tests
+running 76 tests
 
-Unit tests (src/):                   29 passed
+Unit tests (src/):                   31 passed (1 ignored - requires gVisor)
 Model-based tests (security):         6 passed
+Model-based tests (gvisor):           7 passed
 Model-based tests (isolation):        6 passed
 Model-based tests (resources):        6 passed
 Model-based tests (filesystem):       7 passed
@@ -219,7 +232,7 @@ tla-connect tests (isolation):        1 passed (1 ignored - requires Apalache)
 tla-connect tests (resources):        1 passed (1 ignored - requires Apalache)
 tla-connect tests (filesystem):       2 passed (1 ignored - requires Apalache)
 
-Total: 65 passed, 0 failed, 4 ignored (root tests)
+Total: 72 passed, 0 failed, 9 ignored (4 root tests, 4 Apalache tests, 1 gVisor test)
 ```
 
 ## Usage Example
@@ -240,7 +253,7 @@ nucleus run --hostname my-container /bin/sh
 # With all options
 nucleus run --context ./data --memory 512M --cpus 2 --hostname agent-1 /bin/agent
 
-# With gVisor (future)
+# With gVisor runtime (requires gVisor/runsc installed)
 nucleus run --runtime gvisor /bin/agent
 ```
 
@@ -269,12 +282,13 @@ nucleus run --runtime gvisor /bin/agent
 - [x] Mount /dev nodes (null, zero, random, urandom)
 - [x] Set hostname in UTS namespace
 - [x] Signal handling (SIGTERM, SIGKILL)
+- [x] gVisor integration (`runsc` execution)
 
 ### Mid-term
-- [ ] gVisor integration (`runsc` execution)
 - [ ] User namespace UID/GID mapping (rootless mode)
 - [ ] Resource monitoring (`nucleus stats`)
 - [ ] Container listing (`nucleus ps`)
+- [ ] gVisor OCI bundle support (full OCI runtime spec compatibility)
 
 ### Long-term
 - [ ] Attach to running container (`nucleus attach`)

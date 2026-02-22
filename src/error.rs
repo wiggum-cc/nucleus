@@ -32,6 +32,9 @@ pub enum NucleusError {
     #[error("Process execution failed: {0}")]
     ExecError(String),
 
+    #[error("gVisor runtime error: {0}")]
+    GVisorError(String),
+
     #[error("Syscall error: {0}")]
     SyscallError(#[from] nix::Error),
 

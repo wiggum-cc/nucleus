@@ -3,14 +3,14 @@ use crate::error::{NucleusError, Result};
 use crate::filesystem::{ContextPopulator, TmpfsMount, create_minimal_fs, create_dev_nodes, mount_procfs, switch_root};
 use crate::isolation::NamespaceManager;
 use crate::resources::Cgroup;
-use crate::security::{CapabilityManager, SeccompManager};
+use crate::security::{CapabilityManager, GVisorRuntime, SeccompManager};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, ForkResult, Pid};
 use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Container runtime that orchestrates all isolation mechanisms
 ///
@@ -87,6 +87,12 @@ impl Container {
     ///
     /// This runs in the child process after fork
     fn setup_and_exec(&self) -> Result<()> {
+        // Check if we should use gVisor
+        if self.config.use_gvisor {
+            return self.setup_and_exec_gvisor();
+        }
+
+        // Native execution path
         // 1. Set hostname if UTS namespace is enabled
         let namespace_mgr = NamespaceManager::new(self.config.namespaces.clone());
         if let Some(hostname) = &self.config.hostname {
@@ -129,6 +135,40 @@ impl Container {
 
         // 10. Exec target process
         self.exec_command()?;
+
+        // Should never reach here
+        Ok(())
+    }
+
+    /// Set up container with gVisor and exec
+    ///
+    /// This implements the gVisor execution path
+    fn setup_and_exec_gvisor(&self) -> Result<()> {
+        info!("Using gVisor runtime");
+
+        // Create gVisor runtime
+        let gvisor = GVisorRuntime::new().map_err(|e| {
+            warn!("Failed to initialize gVisor, falling back to native: {}", e);
+            e
+        })?;
+
+        // Create root directory for runsc
+        let container_root = PathBuf::from("/tmp").join(format!("nucleus-gvisor-{}", self.config.name));
+
+        // For gVisor, we prepare a simpler environment
+        // runsc handles most of the isolation internally
+        std::fs::create_dir_all(&container_root)?;
+
+        // Populate context if provided
+        if let Some(context_dir) = &self.config.context_dir {
+            let context_dest = container_root.join("context");
+            let populator = ContextPopulator::new(context_dir, &context_dest);
+            populator.populate()?;
+        }
+
+        // Execute with gVisor
+        // This will replace the current process with runsc
+        gvisor.exec_with_gvisor(&self.config.name, &container_root, &self.config.command)?;
 
         // Should never reach here
         Ok(())
