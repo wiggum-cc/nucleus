@@ -30,6 +30,10 @@ enum Commands {
         #[arg(long)]
         cpus: Option<f64>,
 
+        /// Hostname to set in container (requires UTS namespace)
+        #[arg(long)]
+        hostname: Option<String>,
+
         /// Container runtime (default: native, or gvisor)
         #[arg(long, default_value = "native")]
         runtime: String,
@@ -55,6 +59,7 @@ fn main() -> Result<()> {
             context,
             memory,
             cpus,
+            hostname,
             runtime,
             command,
         } => {
@@ -80,12 +85,17 @@ fn main() -> Result<()> {
             }
 
             // Build configuration
-            let mut config = ContainerConfig::new(container_id, command)
+            let mut config = ContainerConfig::new(container_id.clone(), command)
                 .with_limits(limits)
                 .with_namespaces(NamespaceConfig::all());
 
             if let Some(ctx) = context {
                 config = config.with_context(PathBuf::from(ctx));
+            }
+
+            // Set hostname (default is container_id)
+            if let Some(host) = hostname {
+                config = config.with_hostname(Some(host));
             }
 
             if runtime == "gvisor" {

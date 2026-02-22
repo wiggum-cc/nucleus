@@ -1,5 +1,6 @@
 use crate::error::{NucleusError, Result};
 use nix::mount::{mount, MsFlags};
+use nix::sys::stat::{mknod, makedev, Mode, SFlag};
 use nix::unistd::chroot;
 use std::path::Path;
 use tracing::{info, warn};
@@ -22,6 +23,38 @@ pub fn create_minimal_fs(root: &Path) -> Result<()> {
     }
 
     info!("Created minimal filesystem structure");
+
+    Ok(())
+}
+
+/// Create essential device nodes in /dev
+pub fn create_dev_nodes(dev_path: &Path) -> Result<()> {
+    info!("Creating device nodes at {:?}", dev_path);
+
+    // Device nodes: (name, type, major, minor)
+    let devices = vec![
+        ("null", SFlag::S_IFCHR, 1, 3),
+        ("zero", SFlag::S_IFCHR, 1, 5),
+        ("random", SFlag::S_IFCHR, 1, 8),
+        ("urandom", SFlag::S_IFCHR, 1, 9),
+    ];
+
+    for (name, dev_type, major, minor) in devices {
+        let path = dev_path.join(name);
+        let mode = Mode::from_bits(0o666).unwrap();
+        let dev = makedev(major, minor);
+
+        mknod(&path, dev_type, mode, dev).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to create device node {:?}: {}",
+                path, e
+            ))
+        })?;
+
+        info!("Created device node: {:?}", path);
+    }
+
+    info!("Successfully created all device nodes");
 
     Ok(())
 }
@@ -124,8 +157,6 @@ fn chroot_impl(new_root: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // Note: Testing pivot_root and chroot requires root privileges
     // These are tested in integration tests
 }

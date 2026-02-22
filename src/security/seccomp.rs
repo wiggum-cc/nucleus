@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn test_apply_idempotent() {
-        let mut mgr = SeccompManager::new();
+        let mgr = SeccompManager::new();
         // Note: We can't actually test application in unit tests
         // as it would affect the test process itself
         // This is tested in integration tests instead

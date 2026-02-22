@@ -21,7 +21,7 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-nix = { version = "0.29", features = ["process", "sched", "mount", "user", "signal", "fs"] }
+nix = { version = "0.29", features = ["process", "sched", "mount", "user", "signal", "fs", "hostname"] }
 libc = "0.2"
 caps = "0.5"
 seccompiler = "0.4"

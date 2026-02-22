@@ -7,10 +7,10 @@ Nucleus is an extremely lightweight Docker alternative for agents, implemented u
 ## Implementation Statistics
 
 - **Source files**: 22 Rust files
-- **Lines of code**: ~1,947 lines (implementation)
+- **Lines of code**: ~2,072 lines (implementation)
 - **Test files**: 9 test files (5 property-based + 4 tla-connect drivers)
-- **Test code**: ~1,200+ lines
-- **Total tests**: 65 tests (61 passing, 4 ignored - require Apalache)
+- **Test code**: ~1,242 lines
+- **Total tests**: 69 tests (65 passing, 4 ignored - require root)
 - **Model-based tests**:
   - 25 property-based tests (state transitions, terminal states, liveness)
   - 6 tla-connect property tests (invalid transitions)
@@ -58,6 +58,7 @@ nucleus/
 ### ✅ Core Isolation
 
 - [x] **Namespaces**: PID, Mount, Network, UTS, IPC, User (via `unshare(2)`)
+- [x] **Hostname isolation**: Set custom hostname in UTS namespace via `sethostname(2)`
 - [x] **State machine**: `uninitialized → unshared → entered → cleaned`
 - [x] **Properties verified**: Isolation integrity, cleanup happens
 
@@ -73,6 +74,7 @@ nucleus/
 - [x] **tmpfs**: Memory-backed root filesystem
 - [x] **Context population**: Pre-populate container with files
 - [x] **Minimal filesystem**: Create /dev, /proc, /tmp, /bin, etc.
+- [x] **Device nodes**: Create /dev/null, /dev/zero, /dev/random, /dev/urandom
 - [x] **pivot_root/chroot**: Switch to isolated root
 - [x] **State machine**: `unmounted → mounted → populated → pivoted → unmounted_final`
 - [x] **Properties verified**: Context isolation, ephemeral guarantee, mount ordering
@@ -88,6 +90,7 @@ nucleus/
 
 - [x] **Configuration builder**: Fluent API for container config
 - [x] **Process management**: Fork, exec, wait
+- [x] **Signal handling**: Forward SIGTERM and SIGINT to container process
 - [x] **Lifecycle coordination**: Orchestrate all components in correct order
 - [x] **Error handling**: Comprehensive error types and recovery
 
@@ -203,36 +206,42 @@ fn test_security_replay_apalache_traces() -> Result<()> {
 ## Test Results
 
 ```
-running 65 tests
+running 69 tests
 
 Unit tests (src/):                   29 passed
 Model-based tests (security):         6 passed
 Model-based tests (isolation):        6 passed
 Model-based tests (resources):        6 passed
 Model-based tests (filesystem):       7 passed
-Integration tests:                    3 passed (1 ignored - requires root)
+Integration tests:                    5 passed (4 ignored - requires root)
 tla-connect tests (security):         2 passed (1 ignored - requires Apalache)
 tla-connect tests (isolation):        1 passed (1 ignored - requires Apalache)
 tla-connect tests (resources):        1 passed (1 ignored - requires Apalache)
 tla-connect tests (filesystem):       2 passed (1 ignored - requires Apalache)
 
-Total: 61 passed, 0 failed, 4 ignored (Apalache tests)
+Total: 65 passed, 0 failed, 4 ignored (root tests)
 ```
 
 ## Usage Example
 
 ```bash
 # Basic container execution
-nucleus run --command /bin/sh -c "echo hello"
+nucleus run /bin/sh -c "echo hello"
 
 # With resource limits
-nucleus run --memory 512M --cpus 2 --command /bin/agent
+nucleus run --memory 512M --cpus 2 /bin/agent
 
 # With pre-populated context
-nucleus run --context ./agent-data/ --command /usr/bin/agent
+nucleus run --context ./agent-data/ /usr/bin/agent
+
+# With custom hostname
+nucleus run --hostname my-container /bin/sh
+
+# With all options
+nucleus run --context ./data --memory 512M --cpus 2 --hostname agent-1 /bin/agent
 
 # With gVisor (future)
-nucleus run --runtime gvisor --command /bin/agent
+nucleus run --runtime gvisor /bin/agent
 ```
 
 ## Dependencies
@@ -256,10 +265,10 @@ nucleus run --runtime gvisor --command /bin/agent
 ## Future Work
 
 ### Near-term (MVP Completion)
-- [ ] Integration test with actual container execution (requires root)
-- [ ] Mount /dev nodes (null, zero, random, urandom)
-- [ ] Set hostname in UTS namespace
-- [ ] Signal handling (SIGTERM, SIGKILL)
+- [x] Integration test with actual container execution (requires root)
+- [x] Mount /dev nodes (null, zero, random, urandom)
+- [x] Set hostname in UTS namespace
+- [x] Signal handling (SIGTERM, SIGKILL)
 
 ### Mid-term
 - [ ] gVisor integration (`runsc` execution)

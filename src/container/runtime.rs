@@ -1,13 +1,15 @@
 use crate::container::ContainerConfig;
 use crate::error::{NucleusError, Result};
-use crate::filesystem::{ContextPopulator, TmpfsMount, create_minimal_fs, mount_procfs, switch_root};
+use crate::filesystem::{ContextPopulator, TmpfsMount, create_minimal_fs, create_dev_nodes, mount_procfs, switch_root};
 use crate::isolation::NamespaceManager;
 use crate::resources::Cgroup;
 use crate::security::{CapabilityManager, SeccompManager};
+use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, ForkResult, Pid};
 use std::ffi::CString;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
 use tracing::{error, info};
 
 /// Container runtime that orchestrates all isolation mechanisms
@@ -52,6 +54,9 @@ impl Container {
                 // Attach child to cgroup
                 cgroup.attach_process(child.as_raw() as u32)?;
 
+                // Set up signal handling
+                self.setup_signal_handlers(child)?;
+
                 // Wait for child to exit
                 let exit_code = self.wait_for_child(child)?;
 
@@ -82,37 +87,47 @@ impl Container {
     ///
     /// This runs in the child process after fork
     fn setup_and_exec(&self) -> Result<()> {
-        // 1. Mount tmpfs as container root
+        // 1. Set hostname if UTS namespace is enabled
+        let namespace_mgr = NamespaceManager::new(self.config.namespaces.clone());
+        if let Some(hostname) = &self.config.hostname {
+            namespace_mgr.set_hostname(hostname)?;
+        }
+
+        // 2. Mount tmpfs as container root
         let container_root = PathBuf::from("/tmp").join(format!("nucleus-{}", self.config.name));
         let mut tmpfs = TmpfsMount::new(&container_root, Some(1024 * 1024 * 1024)); // 1GB default
         tmpfs.mount()?;
 
-        // 2. Create minimal filesystem structure
+        // 3. Create minimal filesystem structure
         create_minimal_fs(&container_root)?;
 
-        // 3. Populate context if provided
+        // 4. Create device nodes
+        let dev_path = container_root.join("dev");
+        create_dev_nodes(&dev_path)?;
+
+        // 5. Populate context if provided
         if let Some(context_dir) = &self.config.context_dir {
             let context_dest = container_root.join("context");
             let populator = ContextPopulator::new(context_dir, &context_dest);
             populator.populate()?;
         }
 
-        // 4. Mount procfs
+        // 6. Mount procfs
         let proc_path = container_root.join("proc");
         mount_procfs(&proc_path)?;
 
-        // 5. Switch root filesystem
+        // 7. Switch root filesystem
         switch_root(&container_root)?;
 
-        // 6. Drop capabilities
+        // 8. Drop capabilities
         let mut cap_mgr = CapabilityManager::new();
         cap_mgr.drop_all()?;
 
-        // 7. Apply seccomp filter
+        // 9. Apply seccomp filter
         let mut seccomp_mgr = SeccompManager::new();
         seccomp_mgr.apply_minimal_filter()?;
 
-        // 8. Exec target process
+        // 10. Exec target process
         self.exec_command()?;
 
         // Should never reach here
@@ -148,19 +163,68 @@ impl Container {
         Ok(())
     }
 
+    /// Set up signal handlers to forward signals to child process
+    fn setup_signal_handlers(&self, child: Pid) -> Result<()> {
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet};
+
+        // Store child PID in static for signal handler access
+        static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+        CHILD_PID.store(child.as_raw(), Ordering::SeqCst);
+
+        // Signal handler that forwards signals to child
+        extern "C" fn forward_signal(sig: i32) {
+            let child_pid = CHILD_PID.load(Ordering::SeqCst);
+            if child_pid > 0 {
+                let pid = Pid::from_raw(child_pid);
+                let signal = Signal::try_from(sig).ok();
+                if let Some(signal) = signal {
+                    let _ = kill(pid, signal);
+                }
+            }
+        }
+
+        let handler = SigHandler::Handler(forward_signal);
+        let action = SigAction::new(handler, SaFlags::empty(), SigSet::empty());
+
+        // Set up handlers for SIGTERM and SIGINT
+        unsafe {
+            sigaction(Signal::SIGTERM, &action).map_err(|e| {
+                NucleusError::ExecError(format!("Failed to set SIGTERM handler: {}", e))
+            })?;
+
+            sigaction(Signal::SIGINT, &action).map_err(|e| {
+                NucleusError::ExecError(format!("Failed to set SIGINT handler: {}", e))
+            })?;
+        }
+
+        info!("Signal handlers configured");
+
+        Ok(())
+    }
+
     /// Wait for child process to exit
     fn wait_for_child(&self, child: Pid) -> Result<i32> {
         loop {
-            match waitpid(child, None)? {
-                WaitStatus::Exited(_, code) => {
+            match waitpid(child, None) {
+                Ok(WaitStatus::Exited(_, code)) => {
                     return Ok(code);
                 }
-                WaitStatus::Signaled(_, signal, _) => {
+                Ok(WaitStatus::Signaled(_, signal, _)) => {
                     info!("Child killed by signal: {:?}", signal);
                     return Ok(128 + signal as i32);
                 }
+                Err(nix::errno::Errno::EINTR) => {
+                    // Interrupted by signal, continue waiting
+                    continue;
+                }
+                Err(e) => {
+                    return Err(NucleusError::ExecError(format!(
+                        "Failed to wait for child: {}",
+                        e
+                    )));
+                }
                 _ => {
-                    // Continue waiting
+                    // Continue waiting for other status changes
                     continue;
                 }
             }

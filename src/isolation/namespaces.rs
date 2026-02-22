@@ -1,5 +1,6 @@
 use crate::error::{NucleusError, Result};
 use nix::sched::{unshare, CloneFlags};
+use nix::unistd::sethostname;
 use tracing::{debug, info};
 
 /// Namespace configuration
@@ -128,6 +129,26 @@ impl NamespaceManager {
     /// Get namespace configuration
     pub fn config(&self) -> &NamespaceConfig {
         &self.config
+    }
+
+    /// Set hostname in UTS namespace
+    ///
+    /// This only works if the UTS namespace is enabled in the config
+    pub fn set_hostname(&self, hostname: &str) -> Result<()> {
+        if !self.config.uts {
+            debug!("UTS namespace not enabled, skipping hostname setting");
+            return Ok(());
+        }
+
+        info!("Setting hostname to: {}", hostname);
+
+        sethostname(hostname).map_err(|e| {
+            NucleusError::NamespaceError(format!("Failed to set hostname: {}", e))
+        })?;
+
+        info!("Successfully set hostname to: {}", hostname);
+
+        Ok(())
     }
 }
 

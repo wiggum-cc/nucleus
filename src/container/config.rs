@@ -20,6 +20,9 @@ pub struct ContainerConfig {
     /// Namespace configuration
     pub namespaces: NamespaceConfig,
 
+    /// Hostname to set in UTS namespace (optional)
+    pub hostname: Option<String>,
+
     /// Whether to use gVisor runtime
     pub use_gvisor: bool,
 }
@@ -27,11 +30,12 @@ pub struct ContainerConfig {
 impl ContainerConfig {
     pub fn new(name: String, command: Vec<String>) -> Self {
         Self {
-            name,
+            name: name.clone(),
             command,
             context_dir: None,
             limits: ResourceLimits::default(),
             namespaces: NamespaceConfig::default(),
+            hostname: Some(name), // Default hostname to container name
             use_gvisor: false,
         }
     }
@@ -48,6 +52,11 @@ impl ContainerConfig {
 
     pub fn with_namespaces(mut self, namespaces: NamespaceConfig) -> Self {
         self.namespaces = namespaces;
+        self
+    }
+
+    pub fn with_hostname(mut self, hostname: Option<String>) -> Self {
+        self.hostname = hostname;
         self
     }
 

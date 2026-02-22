@@ -88,4 +88,114 @@ mod tests {
         assert!(minimal.pid && minimal.mnt && minimal.net);
         assert!(!minimal.uts && !minimal.ipc);
     }
+
+    #[test]
+    #[ignore] // Requires root privileges
+    fn test_container_with_device_nodes() {
+        // Test that device nodes are accessible in container
+        let config = ContainerConfig::new(
+            "test-dev".to_string(),
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "test -c /dev/null && test -c /dev/zero && test -c /dev/random".to_string(),
+            ],
+        )
+        .with_namespaces(NamespaceConfig::minimal());
+
+        let container = Container::new(config);
+        let result = container.run();
+
+        assert!(result.is_ok(), "Container should execute successfully");
+        let exit_code = result.unwrap();
+        assert_eq!(exit_code, 0, "Device nodes should be accessible");
+    }
+
+    #[test]
+    #[ignore] // Requires root privileges
+    fn test_container_with_hostname() {
+        // Test that hostname is set correctly in UTS namespace
+        let mut namespaces = NamespaceConfig::minimal();
+        namespaces.uts = true; // Enable UTS namespace
+
+        let config = ContainerConfig::new(
+            "test-hostname".to_string(),
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "test $(hostname) = 'custom-hostname'".to_string(),
+            ],
+        )
+        .with_namespaces(namespaces)
+        .with_hostname(Some("custom-hostname".to_string()));
+
+        let container = Container::new(config);
+        let result = container.run();
+
+        assert!(result.is_ok(), "Container should execute successfully");
+        let exit_code = result.unwrap();
+        assert_eq!(exit_code, 0, "Hostname should be set correctly");
+    }
+
+    #[test]
+    #[ignore] // Requires root privileges
+    fn test_container_full_isolation() {
+        // Test container with all isolation mechanisms enabled
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let context_path = temp_dir.path().to_path_buf();
+
+        // Create test script
+        std::fs::write(
+            context_path.join("test.sh"),
+            "#!/bin/sh\necho 'Testing full isolation'\nexit 0\n",
+        )
+        .expect("Failed to write test script");
+
+        let limits = ResourceLimits::unlimited()
+            .with_memory("256M").expect("Failed to set memory")
+            .with_cpu_cores(1.0).expect("Failed to set CPU")
+            .with_pids(50).expect("Failed to set PIDs");
+
+        let mut namespaces = NamespaceConfig::all();
+        namespaces.uts = true;
+
+        let config = ContainerConfig::new(
+            "test-full".to_string(),
+            vec!["/bin/sh".to_string(), "/context/test.sh".to_string()],
+        )
+        .with_context(context_path)
+        .with_limits(limits)
+        .with_namespaces(namespaces)
+        .with_hostname(Some("nucleus-test".to_string()));
+
+        let container = Container::new(config);
+        let result = container.run();
+
+        assert!(result.is_ok(), "Container should execute successfully");
+        let exit_code = result.unwrap();
+        assert_eq!(exit_code, 0, "Container should complete successfully");
+    }
+
+    #[test]
+    fn test_container_with_custom_hostname() {
+        // Test hostname configuration
+        let config = ContainerConfig::new(
+            "test".to_string(),
+            vec!["/bin/sh".to_string()],
+        )
+        .with_hostname(Some("custom-host".to_string()));
+
+        assert_eq!(config.hostname, Some("custom-host".to_string()));
+    }
+
+    #[test]
+    fn test_container_default_hostname() {
+        // Test that default hostname is set to container name
+        let config = ContainerConfig::new(
+            "my-container".to_string(),
+            vec!["/bin/sh".to_string()],
+        );
+
+        assert_eq!(config.hostname, Some("my-container".to_string()));
+    }
 }
