@@ -1,339 +1,71 @@
 // Reusable patterns for nucleus system design
 
+// ResourceLifecycle - Generic lifecycle for system resources
 pattern ResourceLifecycle<R> {
-    description "Generic lifecycle for system resources (cgroups, namespaces, mounts)"
+    behavior Lifecycle {
+        states {
+            nonexistent { initial: true }
+            allocated
+            configured
+            active
+            released { terminal: true }
+        }
 
-    states {
-        nonexistent { initial: true }
-        allocated
-        configured
-        active
-        released { terminal: true }
-    }
+        transitions {
+            nonexistent -> allocated on allocate
+            allocated -> configured on configure
+            configured -> active on activate
+            active -> released on release
+            allocated -> released on cleanup_failed
+            configured -> released on cleanup_failed
+        }
 
-    transitions {
-        nonexistent -> allocated on allocate
-        allocated -> configured on configure
-        configured -> active on activate
-        active -> released on release
+        property eventual_cleanup {
+            always(allocated => eventually(released))
+        }
 
-        // Error handling
-        allocated -> released on cleanup_failed
-        configured -> released on cleanup_failed
-    }
-
-    property eventual_cleanup {
-        // All allocated resources are eventually released
-        always(allocated => eventually(released))
-    }
-
-    property no_double_free {
-        // Cannot release twice
-        always(released => next(released))
-    }
-
-    property configuration_before_activation {
-        // Must configure before activating
-        always(active => check was_configured)
+        property no_double_free {
+            always(released => next(released))
+        }
     }
 }
 
+// IsolationBoundary - Isolation enforcement pattern
 pattern IsolationBoundary<T> {
-    description "Isolation boundary enforcement pattern"
+    behavior Isolation {
+        states {
+            unsecured { initial: true }
+            isolated { terminal: true }
+        }
 
-    states {
-        unsecured { initial: true }
-        isolated { terminal: true }
-    }
+        transitions {
+            unsecured -> isolated on apply_isolation
+        }
 
-    transitions {
-        unsecured -> isolated on apply_isolation
-    }
-
-    property irreversible {
-        // Once isolated, cannot go back
-        always(isolated => next(isolated))
-    }
-
-    property no_leakage {
-        // Isolated state prevents access to external resources
-        always(isolated => !can_access_external)
+        property irreversible {
+            always(isolated => next(isolated))
+        }
     }
 }
 
+// FailClosed - Fail-closed security pattern
 pattern FailClosed<S> {
-    description "Fail-closed security pattern"
+    behavior FailClosedSecurity {
+        states {
+            initial_state { initial: true }
+            security_applied
+            operational
+            failed { terminal: true }
+        }
 
-    states {
-        initial_state { initial: true }
-        security_applied
-        operational
-        failed { terminal: true }
+        transitions {
+            initial_state -> security_applied on apply_security
+            security_applied -> operational on start
+            security_applied -> failed on security_failure
+        }
+
+        property must_secure_before_operate {
+            always(operational => security_applied)
+        }
     }
-
-    transitions {
-        initial_state -> security_applied on apply_security
-        security_applied -> operational on start
-        security_applied -> failed on security_failure
-
-        // No transition from initial to operational
-    }
-
-    property must_secure_before_operate {
-        // Cannot operate without security
-        always(operational => check security_applied)
-    }
-
-    property security_failure_stops_execution {
-        // Security failures prevent operation
-        always(failed => !operational)
-    }
-}
-
-pattern MemoryBackedFilesystem<F> {
-    description "Ephemeral memory-backed filesystem pattern"
-
-    states {
-        unmounted { initial: true }
-        mounted_empty
-        populated
-        in_use
-        unmounted_final { terminal: true }
-    }
-
-    transitions {
-        unmounted -> mounted_empty on mount_tmpfs
-        mounted_empty -> populated on copy_context
-        populated -> in_use on pivot_root
-        in_use -> unmounted_final on unmount
-    }
-
-    property ephemeral {
-        // All data is lost after unmount
-        always(unmounted_final => count(persisted_files) == 0)
-    }
-
-    property population_before_use {
-        // Must populate before using
-        always(in_use => check was_populated)
-    }
-
-    property mount_ordering {
-        // Mount before populate
-        always(populated => check was_mounted)
-    }
-}
-
-pattern CapabilityDropping<C> {
-    description "Irreversible capability dropping pattern"
-
-    states {
-        full_caps { initial: true }
-        reduced_caps
-        minimal_caps { terminal: true }
-    }
-
-    transitions {
-        full_caps -> reduced_caps on drop_dangerous_caps
-        reduced_caps -> minimal_caps on drop_remaining_caps
-        full_caps -> minimal_caps on drop_all_caps
-    }
-
-    property monotonic {
-        // Capabilities only decrease, never increase
-        always(count(capabilities) >= next(count(capabilities)))
-    }
-
-    property irreversible {
-        // Cannot regain capabilities
-        always(minimal_caps => next(minimal_caps))
-    }
-
-    property no_dangerous_caps {
-        // Dangerous capabilities are never present after initial state
-        always(!full_caps => !(
-            has_cap("CAP_SYS_ADMIN") ||
-            has_cap("CAP_SYS_MODULE") ||
-            has_cap("CAP_SYS_PTRACE")
-        ))
-    }
-}
-
-pattern SeccompWhitelist<S> {
-    description "Whitelist-based syscall filtering pattern"
-
-    states {
-        unfiltered { initial: true }
-        whitelist_active { terminal: true }
-    }
-
-    transitions {
-        unfiltered -> whitelist_active on install_filter
-    }
-
-    property irreversible {
-        // Cannot remove seccomp filter once applied
-        always(whitelist_active => next(whitelist_active))
-    }
-
-    property deny_by_default {
-        // All syscalls denied unless explicitly allowed
-        forall syscall in syscalls:
-            check (whitelist_active => !syscall.allowed || syscall.in_whitelist)
-    }
-
-    property essential_allowed {
-        // Essential syscalls must be in whitelist
-        always(whitelist_active => (
-            can_call("read") &&
-            can_call("write") &&
-            can_call("exit") &&
-            can_call("exit_group")
-        ))
-    }
-}
-
-pattern CgroupResourceLimit<R> {
-    description "cgroup-based resource limiting pattern"
-
-    states {
-        unlimited { initial: true }
-        soft_limited
-        hard_limited
-        throttled
-        killed { terminal: true }
-    }
-
-    transitions {
-        unlimited -> soft_limited on set_soft_limit
-        soft_limited -> hard_limited on set_hard_limit
-        hard_limited -> throttled on exceed_soft_limit
-        throttled -> hard_limited on usage_decreases
-        hard_limited -> killed on exceed_hard_limit
-    }
-
-    property bounded {
-        // Resource usage is always bounded
-        always(hard_limited => usage <= hard_limit)
-    }
-
-    property soft_before_hard {
-        // Soft limit warning before hard limit enforcement
-        always(throttled => check soft_limit_exceeded)
-    }
-
-    property oom_protection {
-        // OOM killer prevents unbounded growth
-        always(usage > hard_limit => eventually(killed))
-    }
-}
-
-pattern ContextPopulation<C> {
-    description "Safe context directory population pattern"
-
-    states {
-        empty_fs { initial: true }
-        populating
-        populated { terminal: true }
-    }
-
-    transitions {
-        empty_fs -> populating on start_copy
-        populating -> populated on copy_complete
-    }
-
-    property no_symlink_escape {
-        // Symlinks cannot point outside context
-        forall file in copied_files:
-            check (!file.is_symlink || file.target_within_context)
-    }
-
-    property preserve_permissions {
-        // File permissions are preserved
-        forall file in copied_files:
-            check (file.mode == original_file.mode)
-    }
-
-    property atomic_population {
-        // Context is fully populated before use
-        always(populated => count(copied_files) == count(source_files))
-    }
-}
-
-pattern DefenseInDepth<D> {
-    description "Multiple independent security layers pattern"
-
-    states {
-        unsecured { initial: true }
-        layer1_applied
-        layer2_applied
-        layer3_applied
-        fully_secured { terminal: true }
-    }
-
-    transitions {
-        unsecured -> layer1_applied on apply_layer1
-        layer1_applied -> layer2_applied on apply_layer2
-        layer2_applied -> layer3_applied on apply_layer3
-        layer3_applied -> fully_secured on finalize
-    }
-
-    property all_layers_required {
-        // All security layers must be applied
-        always(fully_secured => (
-            layer1_active &&
-            layer2_active &&
-            layer3_active
-        ))
-    }
-
-    property independent_layers {
-        // Each layer provides independent protection
-        always(layer1_active => protects_against(threat_class_1))
-        always(layer2_active => protects_against(threat_class_2))
-        always(layer3_active => protects_against(threat_class_3))
-    }
-}
-
-// ========================================
-// Pattern Applications
-// ========================================
-
-apply ResourceLifecycle to [Cgroups, Namespaces, Filesystems] {
-    // All system resources follow lifecycle pattern
-}
-
-apply IsolationBoundary to [PIDNamespace, MountNamespace, NetworkNamespace] {
-    // All namespaces provide isolation boundaries
-}
-
-apply FailClosed to [Security, Capabilities, Seccomp] {
-    // All security mechanisms fail closed
-}
-
-apply MemoryBackedFilesystem to [TmpfsRoot, RamfsRoot] {
-    // All container roots are memory-backed
-}
-
-apply CapabilityDropping to [ContainerInit] {
-    // Container init process drops capabilities
-}
-
-apply SeccompWhitelist to [ContainerProcess] {
-    // All container processes have seccomp filter
-}
-
-apply CgroupResourceLimit to [Memory, CPU, IO, PIDs] {
-    // All resources are cgroup-limited
-}
-
-apply ContextPopulation to [ContainerFilesystem] {
-    // Context is safely populated into container
-}
-
-apply DefenseInDepth to [ContainerSecurity] {
-    layer1: Namespaces
-    layer2: Capabilities
-    layer3: Seccomp
-    // Optional layer4: gVisor
 }

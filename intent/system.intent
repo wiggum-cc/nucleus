@@ -3,34 +3,12 @@ system Nucleus {
 
     components [CLI, Isolation, Resources, Filesystem, Security]
 
-    // ========================================
-    // Component: CLI
-    // ========================================
-
     component CLI {
-        description "Command-line interface and argument parsing"
         implements "src/cli.rs"
         depends_only [Isolation, Resources, Filesystem, Security]
-
-        rationale CLIDesign {
-            decided because {
-                "Single binary with no daemon reduces complexity and attack surface."
-                "Direct kernel interaction avoids IPC overhead."
-                "clap provides type-safe argument parsing with minimal boilerplate."
-            }
-            rejected {
-                daemon_model: "Daemon (like dockerd) adds complexity and persistent attack surface."
-                json_config: "Config files add indirection; CLI flags are simpler for agent workloads."
-            }
-        }
     }
 
-    // ========================================
-    // Component: Isolation
-    // ========================================
-
     component Isolation {
-        description "Linux namespace management for process isolation"
         implements "src/isolation/*.rs"
         depends_only [Security]
 
@@ -49,32 +27,16 @@ system Nucleus {
             }
 
             property isolation_integrity {
-                // Once namespaces are entered, they cannot be escaped
                 always(entered => next(entered | cleaned))
             }
 
             property cleanup_happens {
-                // Namespaces are always cleaned up after entry
                 always(entered => eventually(cleaned))
             }
         }
-
-        constraint namespace_isolation {
-            // Isolation layer must not depend on CLI
-            !Isolation.depends([CLI])
-
-            // All namespace operations must go through Security layer
-            forall ns in [PID, Mount, Network, UTS, IPC, User]:
-                ns.references([Security])
-        }
     }
 
-    // ========================================
-    // Component: Resources
-    // ========================================
-
     component Resources {
-        description "cgroup v2 resource control and limiting"
         implements "src/resources/*.rs"
         depends_only []
 
@@ -94,45 +56,25 @@ system Nucleus {
                 configured -> attached on attach_process
                 attached -> monitoring on start_monitoring
                 monitoring -> removed on cleanup
-                // Error paths
                 created -> removed on cleanup_failed_cgroup
                 configured -> removed on cleanup_failed_cgroup
             }
 
             property resource_limits_enforced {
-                // Once configured, limits are always active
                 always(configured => next(attached | monitoring | removed))
             }
 
             property cleanup_guaranteed {
-                // All created cgroups are eventually removed
                 always(created => eventually(removed))
             }
 
             property no_resource_leak {
-                // No processes remain after cleanup
                 always(removed => count(processes_in_cgroup) == 0)
             }
         }
-
-        constraint resource_independence {
-            // Resource control must not depend on other components
-            !Resources.depends([CLI, Isolation, Filesystem, Security])
-        }
-
-        constraint limit_enforcement {
-            // Memory limits must be set before process attachment
-            forall c in containers:
-                check c.memory_limit_set before c.process_attached
-        }
     }
 
-    // ========================================
-    // Component: Filesystem
-    // ========================================
-
     component Filesystem {
-        description "tmpfs/ramfs management and context population"
         implements "src/filesystem/*.rs"
         depends_only []
 
@@ -153,39 +95,20 @@ system Nucleus {
             }
 
             property context_isolation {
-                // Context is populated before pivot_root
-                always(pivoted => check context_populated)
+                always(pivoted => context_populated)
             }
 
             property ephemeral_guarantee {
-                // All data is lost after unmount
                 always(unmounted_final => count(persisted_files) == 0)
             }
 
             property mount_ordering {
-                // tmpfs must be mounted before population
-                always(populated => check tmpfs_mounted)
+                always(populated => tmpfs_mounted)
             }
-        }
-
-        constraint filesystem_independence {
-            // Filesystem layer must not depend on other components
-            !Filesystem.depends([CLI, Isolation, Resources, Security])
-        }
-
-        constraint context_safety {
-            // Context population must not follow symlinks outside context dir
-            forall file in context_files:
-                check !file.is_symlink_to_host
         }
     }
 
-    // ========================================
-    // Component: Security
-    // ========================================
-
     component Security {
-        description "Capabilities, seccomp, and security enforcement"
         implements "src/security/*.rs"
         depends_only []
 
@@ -204,77 +127,74 @@ system Nucleus {
             }
 
             property irreversible_lockdown {
-                // Once seccomp is applied, cannot go back to privileged
                 always(seccomp_applied => next(seccomp_applied | locked))
             }
 
             property defense_in_depth {
-                // Both capabilities and seccomp must be applied before lock
-                always(locked => check (capabilities_dropped && seccomp_applied))
+                always(locked => (capabilities_dropped & seccomp_applied))
             }
 
             property no_privilege_escalation {
-                // Capabilities are always dropped, never gained
                 always(capabilities_dropped => next(!privileged))
             }
         }
-
-        constraint security_independence {
-            // Security layer must not depend on other components
-            !Security.depends([CLI, Isolation, Resources, Filesystem])
-        }
-
-        constraint fail_closed {
-            // If security setup fails, container must not start
-            forall container in containers:
-                check (container.security_applied || !container.running)
-        }
-
-        constraint minimal_capabilities {
-            // No capabilities by default
-            forall container in containers:
-                check count(container.capabilities) <= 2
-        }
     }
 
-    // ========================================
     // System-level Constraints
-    // ========================================
-
     constraint layering {
-        // CLI is the only entry point
         forall c in [Isolation, Resources, Filesystem, Security]:
             !c.depends([CLI])
 
-        // Core components must not have circular dependencies
         !Isolation.depends([Resources, Filesystem])
         !Resources.depends([Isolation, Filesystem, Security])
         !Filesystem.depends([Isolation, Resources, Security])
         !Security.depends([Isolation, Resources, Filesystem])
     }
 
+    constraint namespace_isolation {
+        !Isolation.depends([CLI])
+        forall ns in [PID, Mount, Network, UTS, IPC, User]:
+            ns.references([Security])
+    }
+
+    constraint resource_independence {
+        !Resources.depends([CLI, Isolation, Filesystem, Security])
+    }
+
+    constraint filesystem_independence {
+        !Filesystem.depends([CLI, Isolation, Resources, Security])
+    }
+
+    constraint security_independence {
+        !Security.depends([CLI, Isolation, Resources, Filesystem])
+    }
+
+    constraint fail_closed {
+        forall container in containers:
+            container.security_applied | !container.running
+    }
+
+    constraint minimal_capabilities {
+        forall container in containers:
+            check count(container.capabilities) <= 2
+    }
+
     constraint error_handling {
-        // All public functions must return Result<T>
         forall func in public_functions:
             check func.returns_result
     }
 
     constraint no_unsafe_except_ffi {
-        // unsafe blocks only allowed for FFI wrappers
         forall unsafe_block in unsafe_blocks:
             check unsafe_block.in_module("ffi") || unsafe_block.in_module("syscall")
     }
 
     constraint linux_only {
-        // All kernel-specific code must be cfg(target_os = "linux")
         forall module in [Isolation, Resources, Filesystem, Security]:
             check module.has_cfg("target_os = linux")
     }
 
-    // ========================================
     // Rationale
-    // ========================================
-
     rationale ArchitecturalDecisions {
         decided because {
             "No daemon: Reduces complexity, attack surface, and resource overhead."
@@ -283,18 +203,11 @@ system Nucleus {
             "Defense in depth: Namespaces + cgroups + capabilities + seccomp."
             "Linux-only: Leverage kernel primitives without portability layer."
         }
-
         rejected {
             docker_compat: "OCI/Docker compatibility adds complexity we don't need."
             persistent_storage: "Agents need ephemeral environments with pre-seeded context."
             networking: "Most agent workloads don't need network access."
             image_layers: "Image layering adds startup latency; direct copy is faster."
-        }
-
-        revisit when {
-            "Agent workloads require persistent storage across runs."
-            "Networking becomes essential for agent communication."
-            "Windows/macOS support is needed (unlikely given kernel dependencies)."
         }
     }
 
@@ -305,16 +218,10 @@ system Nucleus {
             "We don't need OCI compatibility or container registries."
             "Direct kernel interaction is simpler and faster than Docker API."
         }
-
         rejected {
             use_docker: "Overhead and complexity don't justify compatibility benefits."
             use_podman: "Still designed for general containers, not agent-specific."
             use_systemd_nspawn: "Less flexible, requires systemd."
-        }
-
-        revisit when {
-            "Need to run existing Docker images for compatibility."
-            "Orchestration across multiple hosts is required."
         }
     }
 }
