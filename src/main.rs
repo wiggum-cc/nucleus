@@ -1,5 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
+use nucleus::container::{Container, ContainerConfig};
+use nucleus::isolation::NamespaceConfig;
+use nucleus::resources::ResourceLimits;
+use std::path::PathBuf;
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -24,7 +28,7 @@ enum Commands {
 
         /// CPU limit (number of cores)
         #[arg(long)]
-        cpus: Option<u32>,
+        cpus: Option<f64>,
 
         /// Container runtime (default: native, or gvisor)
         #[arg(long, default_value = "native")]
@@ -54,25 +58,45 @@ fn main() -> Result<()> {
             runtime,
             command,
         } => {
-            info!("Starting nucleus container");
-            info!("Context: {:?}", context);
-            info!("Memory: {:?}", memory);
-            info!("CPUs: {:?}", cpus);
-            info!("Runtime: {}", runtime);
-            info!("Command: {:?}", command);
+            if command.is_empty() {
+                eprintln!("Error: No command specified");
+                std::process::exit(1);
+            }
 
-            // TODO: Implement container isolation using:
-            // - namespaces (unshare syscall)
-            // - cgroups v2
-            // - chroot/pivot_root
-            // - capabilities (cap_set)
-            // - seccomp filters
-            // - mount tmpfs/ramfs for container root
-            // - pre-populate with context files
-            // - optional gvisor integration
+            // Generate container ID
+            let container_id = format!("{}", std::process::id());
 
-            println!("nucleus: container runtime not yet implemented");
-            Ok(())
+            // Build resource limits
+            let mut limits = ResourceLimits::unlimited();
+
+            if let Some(mem_str) = memory {
+                limits = limits.with_memory(&mem_str)?;
+                info!("Memory limit: {}", mem_str);
+            }
+
+            if let Some(cores) = cpus {
+                limits = limits.with_cpu_cores(cores)?;
+                info!("CPU limit: {} cores", cores);
+            }
+
+            // Build configuration
+            let mut config = ContainerConfig::new(container_id, command)
+                .with_limits(limits)
+                .with_namespaces(NamespaceConfig::all());
+
+            if let Some(ctx) = context {
+                config = config.with_context(PathBuf::from(ctx));
+            }
+
+            if runtime == "gvisor" {
+                config = config.with_gvisor(true);
+            }
+
+            // Run container
+            let container = Container::new(config);
+            let exit_code = container.run()?;
+
+            std::process::exit(exit_code);
         }
     }
 }

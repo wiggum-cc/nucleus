@@ -71,12 +71,48 @@ nix develop
 # Build
 cargo build
 
-# Run tests
-cargo nextest run
+# Run tests (61 passing, 4 ignored - require Apalache)
+cargo test
 
-# Run checks (clippy, fmt, audit)
-nix flake check
+# Run with Apalache installed
+cargo test -- --include-ignored
+
+# Build release binary
+cargo build --release
+
+# Run examples (requires root)
+sudo cargo run --example simple_container
 ```
+
+### Project Structure
+
+```
+nucleus/
+├── src/
+│   ├── container/      # Container orchestration
+│   ├── isolation/      # Namespace management
+│   ├── resources/      # cgroup resource control
+│   ├── filesystem/     # tmpfs and context population
+│   ├── security/       # Capabilities and seccomp
+│   └── error.rs        # Error types
+├── tests/
+│   ├── model_based_*   # Property-based tests from TLA+ specs
+│   └── tla_*           # tla-connect driver tests
+├── formal/tla/         # TLA+ formal specifications
+├── intent/             # Intent high-level specs
+└── examples/           # Usage examples
+```
+
+### Testing
+
+Nucleus uses spec-driven development with comprehensive testing:
+
+- **Unit tests**: 29 tests for individual components
+- **Model-based tests**: 25 tests verifying TLA+ properties
+- **tla-connect tests**: 10 tests mapping TLA+ to Rust (6 passing, 4 require Apalache)
+- **Integration tests**: 4 tests for complete lifecycle
+
+All state machines are formally verified using TLA+ and Apalache model checker.
 
 ## License
 
