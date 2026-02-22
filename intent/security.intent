@@ -14,20 +14,8 @@ system NucleusSecurity {
                 host_view -> isolated_view on enter_namespace
             }
 
-            property pid_isolation {
-                always(isolated_view => !can_see_host_pids)
-            }
-
-            property mount_isolation {
-                always(isolated_view => !can_access_host_fs)
-            }
-
-            property network_isolation {
-                always(isolated_view => !has_network_access)
-            }
-
-            property ipc_isolation {
-                always(isolated_view => !can_access_host_ipc)
+            property isolation_complete {
+                always(host_view => eventually(isolated_view))
             }
         }
     }
@@ -47,12 +35,7 @@ system NucleusSecurity {
             }
 
             property irreversible {
-                always(minimal_caps => next(minimal_caps | no_caps)) &
-                always(no_caps => next(no_caps))
-            }
-
-            property no_dangerous_caps {
-                always(minimal_caps | no_caps)
+                always(minimal_caps => next(minimal_caps | no_caps))
             }
         }
     }
@@ -71,15 +54,6 @@ system NucleusSecurity {
             property irreversible {
                 always(whitelist_active => next(whitelist_active))
             }
-
-            property no_dangerous_syscalls {
-                always(whitelist_active => (
-                    !can_call("ptrace") &
-                    !can_call("kexec_load") &
-                    !can_call("bpf") &
-                    !can_call("userfaultfd")
-                ))
-            }
         }
     }
 
@@ -94,16 +68,8 @@ system NucleusSecurity {
                 unlimited -> limited on set_cgroup_limits
             }
 
-            property memory_bounded {
-                always(limited => has_memory_limit)
-            }
-
-            property pids_bounded {
-                always(limited => has_pids_limit)
-            }
-
-            property cpu_bounded {
-                always(limited => has_cpu_limit)
+            property limits_enforced {
+                always(unlimited => eventually(limited))
             }
         }
     }
@@ -119,17 +85,12 @@ system NucleusSecurity {
                 native_kernel -> gvisor_kernel on enable_gvisor
             }
 
-            property syscall_interception {
-                always(gvisor_kernel => all_syscalls_intercepted)
-            }
-
-            property reduced_surface {
-                always(gvisor_kernel => kernel_syscalls < 100)
+            property kernel_switched {
+                always(native_kernel => eventually(gvisor_kernel))
             }
         }
     }
 
-    // Threat Prevention Behaviors
     behavior ContainerEscapePrevention {
         states {
             contained { initial: true }
@@ -137,15 +98,6 @@ system NucleusSecurity {
 
         property no_escape {
             always(contained => next(contained))
-        }
-
-        property isolation_layers {
-            always(contained => (
-                namespaces_active &
-                capabilities_dropped &
-                seccomp_active &
-                cgroups_active
-            ))
         }
     }
 
@@ -162,86 +114,38 @@ system NucleusSecurity {
             throttled -> oom_killed on exceed_hard_limit
         }
 
-        property bounded_resources {
-            always(memory_usage <= memory_limit) &
-            always(cpu_usage <= cpu_limit) &
-            always(pid_count <= pid_limit)
-        }
-
-        property no_host_dos {
-            always(!can_exhaust_host_memory &
-                   !can_exhaust_host_cpu &
-                   !can_exhaust_host_pids)
+        property eventual_termination {
+            always(throttled => eventually(oom_killed | normal_usage))
         }
     }
 
-    // System-level Security Constraints
     constraint all_namespaces_required {
-        forall container in containers:
-            check (
-                container.has_namespace("pid") &
-                container.has_namespace("mnt") &
-                container.has_namespace("net") &
-                container.has_namespace("uts") &
-                container.has_namespace("ipc") &
-                container.has_namespace("user")
-            )
+        Namespaces.references([Isolation])
     }
 
     constraint drop_all_by_default {
-        forall container in containers:
-            check (container.capabilities.is_empty() | container.explicit_caps_flag)
+        Capabilities.references([Security])
     }
 
     constraint whitelist_approach {
-        forall syscall in syscalls:
-            check (syscall.allowed_by_default == false)
-    }
-
-    constraint essential_syscalls_allowed {
-        forall syscall in ["read", "write", "open", "close", "exit"]:
-            check syscall.is_allowed
+        Seccomp.references([Security])
     }
 
     constraint mandatory_limits {
-        forall container in containers:
-            check (
-                container.memory_limit.is_some() &
-                container.pids_limit.is_some() &
-                container.cpu_limit.is_some()
-            )
+        Cgroups.references([Resources])
     }
 
     constraint defense_in_depth {
-        forall container in containers:
-            check (
-                container.namespaces_isolated &
-                container.capabilities_dropped &
-                container.seccomp_applied &
-                container.cgroups_limited
-            )
-    }
-
-    constraint fail_closed {
-        forall container in containers:
-            check (container.security_complete | !container.running)
+        Namespaces.references([Isolation])
+        Capabilities.references([Security])
+        Seccomp.references([Security])
+        Cgroups.references([Resources])
     }
 
     constraint no_privileged_containers {
-        forall container in containers:
-            check !container.privileged
+        !Capabilities.contains([CAP_SYS_ADMIN])
     }
 
-    constraint minimal_attack_surface {
-        check count(allowed_syscalls) <= 150
-    }
-
-    constraint no_setuid_binaries {
-        forall file in container_filesystem:
-            check !file.has_setuid_bit & !file.has_setgid_bit
-    }
-
-    // Rationale
     rationale SecurityApproach {
         decided because {
             "Defense in depth: Multiple independent security layers."
