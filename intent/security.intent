@@ -1,0 +1,371 @@
+system NucleusSecurity {
+    description "Security model and threat mitigation for nucleus container runtime"
+
+    components [Namespaces, Capabilities, Seccomp, Cgroups, GVisor]
+
+    // ========================================
+    // Security Properties
+    // ========================================
+
+    component Namespaces {
+        description "Linux namespace isolation"
+
+        behavior NamespaceIsolation {
+            states {
+                host_view { initial: true }
+                isolated_view
+            }
+
+            transitions {
+                host_view -> isolated_view on enter_namespace
+            }
+
+            property pid_isolation {
+                // Container cannot see host PIDs
+                always(isolated_view => !can_see_host_pids)
+            }
+
+            property mount_isolation {
+                // Container cannot access host filesystem
+                always(isolated_view => !can_access_host_fs)
+            }
+
+            property network_isolation {
+                // Container has no network access by default
+                always(isolated_view => !has_network_access)
+            }
+
+            property ipc_isolation {
+                // Container cannot access host IPC
+                always(isolated_view => !can_access_host_ipc)
+            }
+        }
+
+        constraint all_namespaces_required {
+            // All 6 namespaces must be enabled
+            forall container in containers:
+                check (
+                    container.has_namespace("pid") &&
+                    container.has_namespace("mnt") &&
+                    container.has_namespace("net") &&
+                    container.has_namespace("uts") &&
+                    container.has_namespace("ipc") &&
+                    container.has_namespace("user")
+                )
+        }
+    }
+
+    component Capabilities {
+        description "Linux capabilities (privilege reduction)"
+
+        behavior CapabilityDropping {
+            states {
+                all_caps { initial: true }
+                minimal_caps
+                no_caps { terminal: true }
+            }
+
+            transitions {
+                all_caps -> minimal_caps on drop_most_capabilities
+                all_caps -> no_caps on drop_all_capabilities
+                minimal_caps -> no_caps on drop_remaining_capabilities
+            }
+
+            property irreversible {
+                // Cannot gain capabilities after dropping
+                always(minimal_caps => next(minimal_caps | no_caps))
+                always(no_caps => next(no_caps))
+            }
+
+            property no_dangerous_caps {
+                // Dangerous capabilities are never allowed
+                always(!has_cap("CAP_SYS_ADMIN") &&
+                       !has_cap("CAP_SYS_MODULE") &&
+                       !has_cap("CAP_SYS_RAWIO") &&
+                       !has_cap("CAP_SYS_BOOT") &&
+                       !has_cap("CAP_SYS_PTRACE"))
+            }
+        }
+
+        constraint drop_all_by_default {
+            // Default: drop all capabilities
+            forall container in containers:
+                check (container.capabilities.is_empty() || container.explicit_caps_flag)
+        }
+
+        constraint allowlist_only {
+            // Only specific capabilities can be added
+            forall cap in allowed_capabilities:
+                check cap in ["CAP_NET_BIND_SERVICE", "CAP_SETUID", "CAP_SETGID"]
+        }
+    }
+
+    component Seccomp {
+        description "Syscall filtering via seccomp-bpf"
+
+        behavior SeccompEnforcement {
+            states {
+                no_filter { initial: true }
+                whitelist_active { terminal: true }
+            }
+
+            transitions {
+                no_filter -> whitelist_active on apply_seccomp_filter
+            }
+
+            property irreversible {
+                // Cannot disable seccomp once applied
+                always(whitelist_active => next(whitelist_active))
+            }
+
+            property no_dangerous_syscalls {
+                // Dangerous syscalls are blocked
+                always(whitelist_active => (
+                    !can_call("ptrace") &&
+                    !can_call("kexec_load") &&
+                    !can_call("add_key") &&
+                    !can_call("request_key") &&
+                    !can_call("keyctl") &&
+                    !can_call("bpf") &&
+                    !can_call("perf_event_open") &&
+                    !can_call("userfaultfd") &&
+                    !can_call("io_uring_setup")
+                ))
+            }
+        }
+
+        constraint whitelist_approach {
+            // Only explicitly allowed syscalls are permitted
+            forall syscall in syscalls:
+                check (syscall.allowed_by_default == false)
+        }
+
+        constraint essential_syscalls_allowed {
+            // Essential syscalls must be whitelisted
+            forall syscall in ["read", "write", "open", "close", "exit"]:
+                check syscall.is_allowed
+        }
+    }
+
+    component Cgroups {
+        description "Resource-based attack mitigation"
+
+        behavior ResourceLimiting {
+            states {
+                unlimited { initial: true }
+                limited
+            }
+
+            transitions {
+                unlimited -> limited on set_cgroup_limits
+            }
+
+            property memory_bounded {
+                // Memory is always limited (prevents DoS)
+                always(limited => has_memory_limit)
+            }
+
+            property pids_bounded {
+                // PIDs are limited (prevents fork bombs)
+                always(limited => has_pids_limit)
+            }
+
+            property cpu_bounded {
+                // CPU usage is throttled (prevents resource monopolization)
+                always(limited => has_cpu_limit)
+            }
+        }
+
+        constraint mandatory_limits {
+            // All containers must have resource limits
+            forall container in containers:
+                check (
+                    container.memory_limit.is_some() &&
+                    container.pids_limit.is_some() &&
+                    container.cpu_limit.is_some()
+                )
+        }
+
+        constraint reasonable_defaults {
+            // Default limits are conservative
+            forall container in containers_with_defaults:
+                check (
+                    container.memory_limit <= 512 * 1024 * 1024 &&  // 512MB
+                    container.pids_limit <= 1024 &&
+                    container.cpu_cores <= 2.0
+                )
+        }
+    }
+
+    component GVisor {
+        description "Optional application kernel for reduced attack surface"
+
+        behavior GVisorRuntime {
+            states {
+                native_kernel { initial: true }
+                gvisor_kernel
+            }
+
+            transitions {
+                native_kernel -> gvisor_kernel on enable_gvisor
+            }
+
+            property syscall_interception {
+                // gVisor intercepts all syscalls
+                always(gvisor_kernel => all_syscalls_intercepted)
+            }
+
+            property reduced_surface {
+                // gVisor reduces kernel attack surface
+                always(gvisor_kernel => kernel_syscalls < 100)
+            }
+        }
+
+        constraint optional_enhancement {
+            // gVisor is opt-in via --runtime gvisor
+            forall container in containers:
+                check (container.gvisor_enabled == container.runtime_flag_set)
+        }
+    }
+
+    // ========================================
+    // Threat Model Properties
+    // ========================================
+
+    behavior ContainerEscapePrevention {
+        states {
+            contained { initial: true }
+            escaped { terminal: true }
+        }
+
+        transitions {
+            // No valid transition to escaped state
+            // Any escape is a security violation
+        }
+
+        property no_escape {
+            // Container can never escape to host
+            always(contained => next(contained))
+        }
+
+        property isolation_layers {
+            // Multiple isolation mechanisms must be active
+            always(contained => (
+                namespaces_active &&
+                capabilities_dropped &&
+                seccomp_active &&
+                cgroups_active
+            ))
+        }
+    }
+
+    behavior ResourceExhaustionPrevention {
+        states {
+            normal_usage { initial: true }
+            throttled
+            oom_killed { terminal: true }
+        }
+
+        transitions {
+            normal_usage -> throttled on exceed_soft_limit
+            throttled -> normal_usage on reduce_usage
+            throttled -> oom_killed on exceed_hard_limit
+        }
+
+        property bounded_resources {
+            // Resources are always bounded
+            always(memory_usage <= memory_limit)
+            always(cpu_usage <= cpu_limit)
+            always(pid_count <= pid_limit)
+        }
+
+        property no_host_dos {
+            // Container cannot DoS host
+            always(!can_exhaust_host_memory &&
+                   !can_exhaust_host_cpu &&
+                   !can_exhaust_host_pids)
+        }
+    }
+
+    // ========================================
+    // System-level Security Constraints
+    // ========================================
+
+    constraint defense_in_depth {
+        // All security layers must be applied
+        forall container in containers:
+            check (
+                container.namespaces_isolated &&
+                container.capabilities_dropped &&
+                container.seccomp_applied &&
+                container.cgroups_limited
+            )
+    }
+
+    constraint fail_closed {
+        // If any security setup fails, container must not start
+        forall container in containers:
+            check (container.security_complete || !container.running)
+    }
+
+    constraint no_privileged_containers {
+        // Privileged mode is not supported
+        forall container in containers:
+            check !container.privileged
+    }
+
+    constraint minimal_attack_surface {
+        // Only essential syscalls are allowed
+        check count(allowed_syscalls) <= 150
+    }
+
+    constraint no_setuid_binaries {
+        // No setuid/setgid binaries in container filesystem
+        forall file in container_filesystem:
+            check !file.has_setuid_bit && !file.has_setgid_bit
+    }
+
+    // ========================================
+    // Rationale
+    // ========================================
+
+    rationale SecurityApproach {
+        decided because {
+            "Defense in depth: Multiple independent security layers."
+            "Fail closed: Security failures prevent execution, not degradation."
+            "Minimal attack surface: Whitelist approach for syscalls and capabilities."
+            "No privileged mode: Reduces risk of misconfiguration."
+            "Ephemeral filesystem: No persistence means no persistent compromise."
+        }
+
+        rejected {
+            blacklist_syscalls: "Blacklists have gaps; whitelists are safer."
+            optional_security: "Security must be mandatory, not opt-in."
+            privileged_mode: "Defeats the purpose of isolation."
+            apparmor_selinux: "Additional complexity; focus on core primitives first."
+        }
+
+        revisit when {
+            "AppArmor/SELinux provides measurable additional security."
+            "User namespaces are stable enough for production rootless mode."
+        }
+    }
+
+    rationale GVisorOptional {
+        decided because {
+            "gVisor provides stronger isolation but adds overhead."
+            "Most workloads don't need application kernel."
+            "Opt-in allows users to choose security vs performance tradeoff."
+        }
+
+        rejected {
+            gvisor_default: "Performance overhead (~10-30%) is too high for default."
+            no_gvisor: "Some workloads justify the stronger isolation."
+        }
+
+        revisit when {
+            "gVisor performance improves significantly."
+            "Threat model justifies default application kernel."
+        }
+    }
+}

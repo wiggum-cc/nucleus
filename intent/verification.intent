@@ -1,0 +1,301 @@
+system NucleusVerification {
+    description "Verification strategy and testing requirements for nucleus"
+
+    components [UnitTests, IntegrationTests, FormalVerification, SecurityAudits]
+
+    // ========================================
+    // Unit Testing Requirements
+    // ========================================
+
+    component UnitTests {
+        description "Unit tests for individual components"
+
+        constraint complete_coverage {
+            // All public functions must have unit tests
+            forall func in public_functions:
+                check has_unit_test(func)
+        }
+
+        constraint error_path_coverage {
+            // All error paths must be tested
+            forall error_variant in error_types:
+                check has_test_case(error_variant)
+        }
+
+        constraint edge_case_testing {
+            // Edge cases must be tested
+            forall component in [CLI, Filesystem, Isolation, Resources, Security]:
+                check has_edge_case_tests(component)
+        }
+    }
+
+    // ========================================
+    // Integration Testing Requirements
+    // ========================================
+
+    component IntegrationTests {
+        description "End-to-end integration tests"
+
+        behavior ContainerLifecycleTest {
+            states {
+                test_start { initial: true }
+                container_created
+                container_running
+                container_exited
+                cleanup_done { terminal: true }
+            }
+
+            transitions {
+                test_start -> container_created on create_container
+                container_created -> container_running on start_container
+                container_running -> container_exited on wait_exit
+                container_exited -> cleanup_done on verify_cleanup
+            }
+
+            property resources_cleaned {
+                // All resources cleaned up after test
+                always(cleanup_done => (
+                    count(cgroups) == 0 &&
+                    count(namespaces) == 0 &&
+                    count(tmpfs_mounts) == 0
+                ))
+            }
+        }
+
+        constraint isolation_verification {
+            // Must verify all isolation mechanisms
+            forall test in integration_tests:
+                check (
+                    test.verifies_pid_isolation &&
+                    test.verifies_mount_isolation &&
+                    test.verifies_network_isolation
+                )
+        }
+
+        constraint resource_limit_verification {
+            // Must verify resource limits are enforced
+            forall test in integration_tests:
+                check (
+                    test.verifies_memory_limit ||
+                    test.verifies_cpu_limit ||
+                    test.verifies_pids_limit
+                )
+        }
+
+        constraint security_verification {
+            // Must verify security mechanisms
+            forall test in integration_tests:
+                check (
+                    test.verifies_capabilities_dropped ||
+                    test.verifies_seccomp_active
+                )
+        }
+    }
+
+    // ========================================
+    // Formal Verification (TLA+)
+    // ========================================
+
+    component FormalVerification {
+        description "TLA+ specifications and model checking"
+
+        behavior NamespaceIsolationSpec {
+            description "Formal spec for namespace isolation"
+
+            // TLA+ specification to verify:
+            // 1. Namespaces are unshared before pivot_root
+            // 2. Once isolated, cannot escape
+            // 3. Cleanup always happens
+
+            property unshare_before_pivot {
+                // Verified by Apalache
+                check tla_property("UnshareBeforePivot")
+            }
+
+            property no_escape_possible {
+                // Verified by Apalache
+                check tla_property("NoEscapePossible")
+            }
+        }
+
+        behavior ResourceLimitSpec {
+            description "Formal spec for resource limits"
+
+            // TLA+ specification to verify:
+            // 1. Limits are set before process attachment
+            // 2. Usage never exceeds hard limits
+            // 3. OOM killer invoked when limit exceeded
+
+            property limits_before_attach {
+                check tla_property("LimitsBeforeAttach")
+            }
+
+            property bounded_usage {
+                check tla_property("UsageBounded")
+            }
+        }
+
+        constraint all_specs_verified {
+            // All TLA+ specs must be model-checked
+            forall spec in tla_specs:
+                check apalache_verified(spec)
+        }
+    }
+
+    // ========================================
+    // Security Audits
+    // ========================================
+
+    component SecurityAudits {
+        description "Security testing and audit requirements"
+
+        constraint no_unsafe_blocks {
+            // unsafe blocks only in FFI wrappers
+            forall unsafe_block in codebase:
+                check (
+                    unsafe_block.in_module("syscall") ||
+                    unsafe_block.in_module("ffi") ||
+                    unsafe_block.has_safety_comment
+                )
+        }
+
+        constraint dependency_audit {
+            // All dependencies must be audited
+            check cargo_audit_clean()
+            check cargo_deny_passes()
+        }
+
+        constraint fuzzing_coverage {
+            // Critical parsers must be fuzzed
+            forall parser in [cli_parser, resource_parser]:
+                check has_fuzz_tests(parser)
+        }
+
+        constraint privilege_escalation_tests {
+            // Must test against privilege escalation
+            check has_test("cannot_gain_capabilities")
+            check has_test("cannot_disable_seccomp")
+            check has_test("cannot_escape_namespace")
+        }
+
+        constraint resource_exhaustion_tests {
+            // Must test resource exhaustion prevention
+            check has_test("memory_limit_enforced")
+            check has_test("fork_bomb_prevented")
+            check has_test("cpu_throttling_works")
+        }
+    }
+
+    // ========================================
+    // Performance Testing
+    // ========================================
+
+    behavior PerformanceBenchmarks {
+        description "Performance benchmarks and targets"
+
+        constraint startup_latency {
+            // Container startup must be fast
+            check startup_time_p50 < 10ms
+            check startup_time_p99 < 50ms
+        }
+
+        constraint memory_overhead {
+            // Memory overhead must be minimal
+            check runtime_memory_overhead < 2MB
+        }
+
+        constraint context_population_speed {
+            // Context population must be fast
+            check context_copy_10mb < 10ms
+            check context_copy_100mb < 100ms
+        }
+
+        constraint cleanup_speed {
+            // Cleanup must be fast
+            check cleanup_time < 5ms
+        }
+    }
+
+    // ========================================
+    // Regression Testing
+    // ========================================
+
+    constraint no_regressions {
+        // All tests must pass before merge
+        forall pr in pull_requests:
+            check (
+                all_unit_tests_pass(pr) &&
+                all_integration_tests_pass(pr) &&
+                no_performance_regression(pr)
+            )
+    }
+
+    constraint ci_enforcement {
+        // CI must enforce all checks
+        check ci_runs_tests
+        check ci_runs_clippy
+        check ci_runs_audit
+        check ci_checks_formatting
+    }
+
+    // ========================================
+    // Test Organization
+    // ========================================
+
+    constraint test_structure {
+        // Tests must be organized clearly
+        check has_directory("tests/unit")
+        check has_directory("tests/integration")
+        check has_directory("tests/security")
+        check has_directory("tests/performance")
+    }
+
+    constraint test_documentation {
+        // All tests must be documented
+        forall test in tests:
+            check test.has_doc_comment
+    }
+
+    // ========================================
+    // Testing Rationale
+    // ========================================
+
+    rationale TestingStrategy {
+        decided because {
+            "Unit tests catch component-level bugs early."
+            "Integration tests verify system-level behavior."
+            "Formal verification proves critical safety properties."
+            "Security audits prevent vulnerabilities."
+            "Performance benchmarks prevent regressions."
+        }
+
+        rejected {
+            manual_testing_only: "Insufficient coverage, not reproducible."
+            no_formal_verification: "Critical security properties need proof."
+            no_fuzzing: "Parsers are attack surface, need fuzz testing."
+        }
+
+        revisit when {
+            "Test suite execution time becomes too long."
+            "Formal verification tools improve (faster model checking)."
+        }
+    }
+
+    rationale WhyTLAPlus {
+        decided because {
+            "TLA+ can prove temporal safety properties (always, eventually)."
+            "Apalache provides bounded model checking for TLA+."
+            "Critical isolation properties are temporal (once isolated, always isolated)."
+            "Resource lifecycle properties are temporal (allocated => eventually released)."
+        }
+
+        rejected {
+            no_formal_verification: "Security-critical system needs formal proofs."
+            other_tools: "TLA+ is mature and well-suited for concurrency/lifecycle verification."
+        }
+
+        revisit when {
+            "Better verification tools emerge (e.g., Prusti, Verus for Rust)."
+        }
+    }
+}
