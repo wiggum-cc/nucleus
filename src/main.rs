@@ -47,7 +47,7 @@ enum Commands {
         oci: bool,
 
         /// Command to run in container
-        #[arg(last = true)]
+        #[arg(last = true, required = true)]
         command: Vec<String>,
     },
 

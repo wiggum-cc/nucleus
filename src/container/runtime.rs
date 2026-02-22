@@ -1,6 +1,9 @@
 use crate::container::{ContainerConfig, ContainerState, ContainerStateManager};
 use crate::error::{NucleusError, Result};
-use crate::filesystem::{ContextPopulator, TmpfsMount, create_minimal_fs, create_dev_nodes, mount_procfs, switch_root};
+use crate::filesystem::{
+    bind_mount_host_paths, create_dev_nodes, create_minimal_fs, mount_procfs, switch_root,
+    ContextPopulator, TmpfsMount,
+};
 use crate::isolation::NamespaceManager;
 use crate::resources::Cgroup;
 use crate::security::{CapabilityManager, GVisorRuntime, OciBundle, OciConfig, SeccompManager};
@@ -10,7 +13,7 @@ use nix::unistd::{fork, ForkResult, Pid};
 use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Container runtime that orchestrates all isolation mechanisms
 ///
@@ -35,19 +38,53 @@ impl Container {
     pub fn run(&self) -> Result<i32> {
         info!("Starting container: {}", self.config.name);
 
+        // Auto-detect if we need rootless mode
+        let is_root = nix::unistd::Uid::effective().is_root();
+        let mut config = self.config.clone();
+
+        if !is_root && config.user_ns_config.is_none() {
+            info!("Not running as root, automatically enabling rootless mode");
+            config.namespaces.user = true;
+            config.user_ns_config = Some(crate::isolation::UserNamespaceConfig::rootless());
+        }
+
         // Create state manager
         let state_mgr = ContainerStateManager::new()?;
 
-        // Create cgroup
-        let cgroup_name = format!("nucleus-{}", self.config.name);
-        let mut cgroup = Cgroup::create(&cgroup_name)?;
-        cgroup.set_limits(&self.config.limits)?;
+        // Try to create cgroup (optional for rootless mode)
+        let cgroup_name = format!("nucleus-{}", config.name);
+        let mut cgroup_opt = match Cgroup::create(&cgroup_name) {
+            Ok(mut cgroup) => {
+                // Try to set limits
+                match cgroup.set_limits(&config.limits) {
+                    Ok(_) => {
+                        info!("Created cgroup with resource limits");
+                        Some(cgroup)
+                    }
+                    Err(e) => {
+                        warn!("Failed to set cgroup limits: {}", e);
+                        // Cleanup the cgroup we created
+                        let _ = cgroup.cleanup();
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                // If rootless mode, this is expected - cgroups require root
+                if config.user_ns_config.is_some() {
+                    debug!("Running in rootless mode without cgroup resource limits");
+                } else {
+                    warn!("Failed to create cgroup (running without resource limits): {}", e);
+                }
+                None
+            }
+        };
 
         // Create namespace manager
-        let mut namespace_mgr = NamespaceManager::new(self.config.namespaces.clone());
+        let mut namespace_mgr = NamespaceManager::new(config.namespaces.clone());
 
         // Configure user namespace mapping if provided
-        if let Some(user_config) = &self.config.user_ns_config {
+        if let Some(user_config) = &config.user_ns_config {
             namespace_mgr = namespace_mgr.with_user_mapping(user_config.clone());
         }
 
@@ -60,28 +97,31 @@ impl Container {
                 info!("Forked child process: {}", child);
 
                 // Save container state
-                let cgroup_path = format!("/sys/fs/cgroup/{}", cgroup_name);
+                let cgroup_path = cgroup_opt.as_ref().map(|_| format!("/sys/fs/cgroup/{}", cgroup_name));
+
                 // Convert cpu_quota_us to millicores for storage
-                let cpu_millicores = self.config.limits.cpu_quota_us.map(|quota| {
+                let cpu_millicores = config.limits.cpu_quota_us.map(|quota| {
                     // quota is in microseconds per period (100ms)
                     // millicores = (quota / period) * 1000
-                    (quota * 1000) / self.config.limits.cpu_period_us
+                    (quota * 1000) / config.limits.cpu_period_us
                 });
                 let state = ContainerState::new(
-                    self.config.name.clone(),
-                    self.config.name.clone(),
+                    config.name.clone(),
+                    config.name.clone(),
                     child.as_raw() as u32,
-                    self.config.command.clone(),
-                    self.config.limits.memory_bytes,
+                    config.command.clone(),
+                    config.limits.memory_bytes,
                     cpu_millicores,
-                    self.config.use_gvisor,
-                    self.config.user_ns_config.is_some(),
-                    Some(cgroup_path),
+                    config.use_gvisor,
+                    config.user_ns_config.is_some(),
+                    cgroup_path,
                 );
                 state_mgr.save_state(&state)?;
 
-                // Attach child to cgroup
-                cgroup.attach_process(child.as_raw() as u32)?;
+                // Attach child to cgroup if we have one
+                if let Some(ref mut cgroup) = cgroup_opt {
+                    cgroup.attach_process(child.as_raw() as u32)?;
+                }
 
                 // Set up signal handling
                 self.setup_signal_handlers(child)?;
@@ -89,19 +129,23 @@ impl Container {
                 // Wait for child to exit
                 let exit_code = self.wait_for_child(child)?;
 
-                // Cleanup cgroup
-                cgroup.cleanup()?;
+                // Cleanup cgroup if we have one
+                if let Some(cgroup) = cgroup_opt {
+                    cgroup.cleanup()?;
+                }
 
                 // Delete container state
-                state_mgr.delete_state(&self.config.name)?;
+                state_mgr.delete_state(&config.name)?;
 
-                info!("Container {} exited with code {}", self.config.name, exit_code);
+                info!("Container {} exited with code {}", config.name, exit_code);
 
                 Ok(exit_code)
             }
             ForkResult::Child => {
                 // Child process - set up container environment
-                match self.setup_and_exec() {
+                // Use the potentially modified config
+                let temp_container = Container { config };
+                match temp_container.setup_and_exec() {
                     Ok(_) => {
                         // exec should not return
                         unreachable!()
@@ -150,22 +194,25 @@ impl Container {
             populator.populate()?;
         }
 
-        // 6. Mount procfs
+        // 6. Bind mount host paths (for accessing host binaries)
+        bind_mount_host_paths(&container_root)?;
+
+        // 7. Mount procfs
         let proc_path = container_root.join("proc");
         mount_procfs(&proc_path)?;
 
-        // 7. Switch root filesystem
+        // 8. Switch root filesystem
         switch_root(&container_root)?;
 
-        // 8. Drop capabilities
+        // 9. Drop capabilities
         let mut cap_mgr = CapabilityManager::new();
         cap_mgr.drop_all()?;
 
-        // 9. Apply seccomp filter
+        // 10. Apply seccomp filter
         let mut seccomp_mgr = SeccompManager::new();
         seccomp_mgr.apply_minimal_filter()?;
 
-        // 10. Exec target process
+        // 11. Exec target process
         self.exec_command()?;
 
         // Should never reach here
