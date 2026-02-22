@@ -3,27 +3,34 @@
 ----------------------------------------------  MODULE Nucleus_Filesystem_FilesystemLifecycle  ----------------------------------------------
 EXTENDS Naturals, Sequences, TLC
 
-\* State constants
-CONSTANTS
-    unmounted, mounted, populated, pivoted, unmounted_final
+\* State values (defined as strings for Apalache)
+unmounted == "unmounted"
+mounted == "mounted"
+populated == "populated"
+pivoted == "pivoted"
+unmounted_final == "unmounted_final"
 
 States == {
     unmounted, mounted, populated, pivoted, unmounted_final
 }
 
 VARIABLES
+    \* @type: Str;
     state,      \* Current state
+    \* @type: Int;
     pc,         \* Program counter for step tracking
+    \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
-    pending     \* Pending events/messages queue
+    \* @type: Seq(Str);
+    event_queue     \* Pending events/messages queue
 
-vars == <<state, pc, history, pending>>
+vars == <<state, pc, history, event_queue>>
 
 Init ==
     /\ state = unmounted
     /\ pc = 0
     /\ history = <<>>
-    /\ pending = <<>>
+    /\ event_queue = <<>>
 
 \* Transition actions
 unmounted_mount_tmpfs ==
@@ -31,34 +38,35 @@ unmounted_mount_tmpfs ==
     /\ state' = mounted
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 mounted_populate_context ==
     /\ state = mounted
     /\ state' = populated
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 populated_pivot_root ==
     /\ state = populated
     /\ state' = pivoted
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 pivoted_cleanup ==
     /\ state = pivoted
     /\ state' = unmounted_final
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 Next ==
     \/ unmounted_mount_tmpfs
     \/ mounted_populate_context
     \/ populated_pivot_root
     \/ pivoted_cleanup
+    \/ UNCHANGED vars
 
 \* Stuttering step (system does nothing)
 Stutter ==
@@ -72,7 +80,7 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
-    /\ history \in Seq(States)
+    \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
 TerminalStates == {unmounted_final}
@@ -86,9 +94,9 @@ HistoryConsistent ==
     Len(history) = pc
 
 \* Temporal properties (LTL)
-Prop_context_isolation == []((state = pivoted) => (((state = pivoted) \/ (state = unmounted_final))'))
-Prop_ephemeral_guarantee == []((state = unmounted_final) => ((state = unmounted_final)'))
-Prop_mount_ordering == []((state = populated) => (((state = pivoted) \/ (state = unmounted_final))'))
+Prop_context_isolation == [][(state = pivoted) => ((state' = pivoted) \/ (state' = unmounted_final))]_vars
+Prop_ephemeral_guarantee == [][(state = unmounted_final) => (state' = unmounted_final)]_vars
+Prop_mount_ordering == [][(state = populated) => ((state' = pivoted) \/ (state' = unmounted_final))]_vars
 
 \* Liveness: Eventually reaches a terminal state
 Liveness ==

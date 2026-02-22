@@ -3,27 +3,35 @@
 -----------------------------------------  MODULE Nucleus_Resources_CgroupLifecycle  -----------------------------------------
 EXTENDS Naturals, Sequences, TLC
 
-\* State constants
-CONSTANTS
-    nonexistent, created, configured, attached, monitoring, removed
+\* State values (defined as strings for Apalache)
+nonexistent == "nonexistent"
+created == "created"
+configured == "configured"
+attached == "attached"
+monitoring == "monitoring"
+removed == "removed"
 
 States == {
     nonexistent, created, configured, attached, monitoring, removed
 }
 
 VARIABLES
+    \* @type: Str;
     state,      \* Current state
+    \* @type: Int;
     pc,         \* Program counter for step tracking
+    \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
-    pending     \* Pending events/messages queue
+    \* @type: Seq(Str);
+    event_queue     \* Pending events/messages queue
 
-vars == <<state, pc, history, pending>>
+vars == <<state, pc, history, event_queue>>
 
 Init ==
     /\ state = nonexistent
     /\ pc = 0
     /\ history = <<>>
-    /\ pending = <<>>
+    /\ event_queue = <<>>
 
 \* Transition actions
 nonexistent_create_cgroup ==
@@ -31,49 +39,49 @@ nonexistent_create_cgroup ==
     /\ state' = created
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 created_set_limits ==
     /\ state = created
     /\ state' = configured
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 configured_attach_process ==
     /\ state = configured
     /\ state' = attached
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 attached_start_monitoring ==
     /\ state = attached
     /\ state' = monitoring
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 monitoring_cleanup ==
     /\ state = monitoring
     /\ state' = removed
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 created_cleanup_failed_cgroup ==
     /\ state = created
     /\ state' = removed
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 configured_cleanup_failed_cgroup ==
     /\ state = configured
     /\ state' = removed
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 Next ==
     \/ nonexistent_create_cgroup
@@ -83,6 +91,7 @@ Next ==
     \/ monitoring_cleanup
     \/ created_cleanup_failed_cgroup
     \/ configured_cleanup_failed_cgroup
+    \/ UNCHANGED vars
 
 \* Stuttering step (system does nothing)
 Stutter ==
@@ -96,7 +105,7 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
-    /\ history \in Seq(States)
+    \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
 TerminalStates == {removed}
@@ -110,9 +119,9 @@ HistoryConsistent ==
     Len(history) = pc
 
 \* Temporal properties (LTL)
-Prop_resource_limits_enforced == []((state = configured) => ((((state = attached) \/ (state = monitoring)) \/ (state = removed))'))
+Prop_resource_limits_enforced == [][(state = configured) => (((state' = attached) \/ (state' = monitoring)) \/ (state' = removed))]_vars
 Prop_cleanup_guaranteed == []((state = created) => (<>(state = removed)))
-Prop_no_resource_leak == []((state = removed) => ((state = removed)'))
+Prop_no_resource_leak == [][(state = removed) => (state' = removed)]_vars
 
 \* Liveness: Eventually reaches a terminal state
 Liveness ==

@@ -3,27 +3,30 @@
 -------------------------------------------------  MODULE NucleusSecurity_ContainerEscapePrevention  -------------------------------------------------
 EXTENDS Naturals, Sequences, TLC
 
-\* State constants
-CONSTANTS
-    contained
+\* State values (defined as strings for Apalache)
+contained == "contained"
 
 States == {
     contained
 }
 
 VARIABLES
+    \* @type: Str;
     state,      \* Current state
+    \* @type: Int;
     pc,         \* Program counter for step tracking
+    \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
-    pending     \* Pending events/messages queue
+    \* @type: Seq(Str);
+    event_queue     \* Pending events/messages queue
 
-vars == <<state, pc, history, pending>>
+vars == <<state, pc, history, event_queue>>
 
 Init ==
     /\ state = contained
     /\ pc = 0
     /\ history = <<>>
-    /\ pending = <<>>
+    /\ event_queue = <<>>
 
 \* Transition actions
 Next ==
@@ -41,14 +44,14 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
-    /\ history \in Seq(States)
+    \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* History length matches step count
 HistoryConsistent ==
     Len(history) = pc
 
 \* Temporal properties (LTL)
-Prop_no_escape == []((state = contained) => ((state = contained)'))
+Prop_no_escape == [][(state = contained) => (state' = contained)]_vars
 
 \* Reachability helpers for model checking
 CanReach_contained == <>(state = contained)

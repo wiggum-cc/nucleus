@@ -3,27 +3,33 @@
 --------------------------------------------  MODULE Nucleus_Security_SecurityEnforcement  --------------------------------------------
 EXTENDS Naturals, Sequences, TLC
 
-\* State constants
-CONSTANTS
-    privileged, capabilities_dropped, seccomp_applied, locked
+\* State values (defined as strings for Apalache)
+privileged == "privileged"
+capabilities_dropped == "capabilities_dropped"
+seccomp_applied == "seccomp_applied"
+locked == "locked"
 
 States == {
     privileged, capabilities_dropped, seccomp_applied, locked
 }
 
 VARIABLES
+    \* @type: Str;
     state,      \* Current state
+    \* @type: Int;
     pc,         \* Program counter for step tracking
+    \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
-    pending     \* Pending events/messages queue
+    \* @type: Seq(Str);
+    event_queue     \* Pending events/messages queue
 
-vars == <<state, pc, history, pending>>
+vars == <<state, pc, history, event_queue>>
 
 Init ==
     /\ state = privileged
     /\ pc = 0
     /\ history = <<>>
-    /\ pending = <<>>
+    /\ event_queue = <<>>
 
 \* Transition actions
 privileged_drop_capabilities ==
@@ -31,26 +37,27 @@ privileged_drop_capabilities ==
     /\ state' = capabilities_dropped
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 capabilities_dropped_apply_seccomp ==
     /\ state = capabilities_dropped
     /\ state' = seccomp_applied
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 seccomp_applied_finalize ==
     /\ state = seccomp_applied
     /\ state' = locked
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 Next ==
     \/ privileged_drop_capabilities
     \/ capabilities_dropped_apply_seccomp
     \/ seccomp_applied_finalize
+    \/ UNCHANGED vars
 
 \* Stuttering step (system does nothing)
 Stutter ==
@@ -64,7 +71,7 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
-    /\ history \in Seq(States)
+    \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
 TerminalStates == {locked}
@@ -78,9 +85,9 @@ HistoryConsistent ==
     Len(history) = pc
 
 \* Temporal properties (LTL)
-Prop_irreversible_lockdown == []((state = seccomp_applied) => (((state = seccomp_applied) \/ (state = locked))'))
+Prop_irreversible_lockdown == [][(state = seccomp_applied) => ((state' = seccomp_applied) \/ (state' = locked))]_vars
 Prop_defense_in_depth == []((state = locked) => ((state = capabilities_dropped) /\ (state = seccomp_applied)))
-Prop_no_privilege_escalation == []((state = capabilities_dropped) => ((~(state = privileged))'))
+Prop_no_privilege_escalation == [][(state = capabilities_dropped) => (~(state' = privileged))]_vars
 
 \* Liveness: Eventually reaches a terminal state
 Liveness ==

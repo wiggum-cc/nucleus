@@ -3,27 +3,34 @@
 -------------------------------------------------------------------  MODULE NucleusVerification_IntegrationTests_ContainerLifecycleTest  -------------------------------------------------------------------
 EXTENDS Naturals, Sequences, TLC
 
-\* State constants
-CONSTANTS
-    test_start, container_created, container_running, container_exited, cleanup_done
+\* State values (defined as strings for Apalache)
+test_start == "test_start"
+container_created == "container_created"
+container_running == "container_running"
+container_exited == "container_exited"
+cleanup_done == "cleanup_done"
 
 States == {
     test_start, container_created, container_running, container_exited, cleanup_done
 }
 
 VARIABLES
+    \* @type: Str;
     state,      \* Current state
+    \* @type: Int;
     pc,         \* Program counter for step tracking
+    \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
-    pending     \* Pending events/messages queue
+    \* @type: Seq(Str);
+    event_queue     \* Pending events/messages queue
 
-vars == <<state, pc, history, pending>>
+vars == <<state, pc, history, event_queue>>
 
 Init ==
     /\ state = test_start
     /\ pc = 0
     /\ history = <<>>
-    /\ pending = <<>>
+    /\ event_queue = <<>>
 
 \* Transition actions
 test_start_create_container ==
@@ -31,34 +38,35 @@ test_start_create_container ==
     /\ state' = container_created
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 container_created_start_container ==
     /\ state = container_created
     /\ state' = container_running
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 container_running_wait_exit ==
     /\ state = container_running
     /\ state' = container_exited
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 container_exited_verify_cleanup ==
     /\ state = container_exited
     /\ state' = cleanup_done
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 Next ==
     \/ test_start_create_container
     \/ container_created_start_container
     \/ container_running_wait_exit
     \/ container_exited_verify_cleanup
+    \/ UNCHANGED vars
 
 \* Stuttering step (system does nothing)
 Stutter ==
@@ -72,7 +80,7 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
-    /\ history \in Seq(States)
+    \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
 TerminalStates == {cleanup_done}

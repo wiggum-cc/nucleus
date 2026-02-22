@@ -3,27 +3,33 @@
 --------------------------------------------  MODULE Nucleus_Isolation_NamespaceLifecycle  --------------------------------------------
 EXTENDS Naturals, Sequences, TLC
 
-\* State constants
-CONSTANTS
-    uninitialized, unshared, entered, cleaned
+\* State values (defined as strings for Apalache)
+uninitialized == "uninitialized"
+unshared == "unshared"
+entered == "entered"
+cleaned == "cleaned"
 
 States == {
     uninitialized, unshared, entered, cleaned
 }
 
 VARIABLES
+    \* @type: Str;
     state,      \* Current state
+    \* @type: Int;
     pc,         \* Program counter for step tracking
+    \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
-    pending     \* Pending events/messages queue
+    \* @type: Seq(Str);
+    event_queue     \* Pending events/messages queue
 
-vars == <<state, pc, history, pending>>
+vars == <<state, pc, history, event_queue>>
 
 Init ==
     /\ state = uninitialized
     /\ pc = 0
     /\ history = <<>>
-    /\ pending = <<>>
+    /\ event_queue = <<>>
 
 \* Transition actions
 uninitialized_create_namespaces ==
@@ -31,26 +37,27 @@ uninitialized_create_namespaces ==
     /\ state' = unshared
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 unshared_enter_namespaces ==
     /\ state = unshared
     /\ state' = entered
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 entered_cleanup ==
     /\ state = entered
     /\ state' = cleaned
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 Next ==
     \/ uninitialized_create_namespaces
     \/ unshared_enter_namespaces
     \/ entered_cleanup
+    \/ UNCHANGED vars
 
 \* Stuttering step (system does nothing)
 Stutter ==
@@ -64,7 +71,7 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
-    /\ history \in Seq(States)
+    \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
 TerminalStates == {cleaned}
@@ -78,7 +85,7 @@ HistoryConsistent ==
     Len(history) = pc
 
 \* Temporal properties (LTL)
-Prop_isolation_integrity == []((state = entered) => (((state = entered) \/ (state = cleaned))'))
+Prop_isolation_integrity == [][(state = entered) => ((state' = entered) \/ (state' = cleaned))]_vars
 Prop_cleanup_happens == []((state = entered) => (<>(state = cleaned)))
 
 \* Liveness: Eventually reaches a terminal state

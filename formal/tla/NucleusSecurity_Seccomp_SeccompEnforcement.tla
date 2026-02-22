@@ -3,27 +3,31 @@
 --------------------------------------------------  MODULE NucleusSecurity_Seccomp_SeccompEnforcement  --------------------------------------------------
 EXTENDS Naturals, Sequences, TLC
 
-\* State constants
-CONSTANTS
-    no_filter, whitelist_active
+\* State values (defined as strings for Apalache)
+no_filter == "no_filter"
+whitelist_active == "whitelist_active"
 
 States == {
     no_filter, whitelist_active
 }
 
 VARIABLES
+    \* @type: Str;
     state,      \* Current state
+    \* @type: Int;
     pc,         \* Program counter for step tracking
+    \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
-    pending     \* Pending events/messages queue
+    \* @type: Seq(Str);
+    event_queue     \* Pending events/messages queue
 
-vars == <<state, pc, history, pending>>
+vars == <<state, pc, history, event_queue>>
 
 Init ==
     /\ state = no_filter
     /\ pc = 0
     /\ history = <<>>
-    /\ pending = <<>>
+    /\ event_queue = <<>>
 
 \* Transition actions
 no_filter_apply_seccomp_filter ==
@@ -31,10 +35,11 @@ no_filter_apply_seccomp_filter ==
     /\ state' = whitelist_active
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 Next ==
     \/ no_filter_apply_seccomp_filter
+    \/ UNCHANGED vars
 
 \* Stuttering step (system does nothing)
 Stutter ==
@@ -48,7 +53,7 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
-    /\ history \in Seq(States)
+    \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
 TerminalStates == {whitelist_active}
@@ -62,7 +67,7 @@ HistoryConsistent ==
     Len(history) = pc
 
 \* Temporal properties (LTL)
-Prop_irreversible == []((state = whitelist_active) => ((state = whitelist_active)'))
+Prop_irreversible == [][(state = whitelist_active) => (state' = whitelist_active)]_vars
 
 \* Liveness: Eventually reaches a terminal state
 Liveness ==

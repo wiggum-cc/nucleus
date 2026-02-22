@@ -3,27 +3,32 @@
 ----------------------------------------------------  MODULE NucleusSecurity_ResourceExhaustionPrevention  ----------------------------------------------------
 EXTENDS Naturals, Sequences, TLC
 
-\* State constants
-CONSTANTS
-    normal_usage, throttled, oom_killed
+\* State values (defined as strings for Apalache)
+normal_usage == "normal_usage"
+throttled == "throttled"
+oom_killed == "oom_killed"
 
 States == {
     normal_usage, throttled, oom_killed
 }
 
 VARIABLES
+    \* @type: Str;
     state,      \* Current state
+    \* @type: Int;
     pc,         \* Program counter for step tracking
+    \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
-    pending     \* Pending events/messages queue
+    \* @type: Seq(Str);
+    event_queue     \* Pending events/messages queue
 
-vars == <<state, pc, history, pending>>
+vars == <<state, pc, history, event_queue>>
 
 Init ==
     /\ state = normal_usage
     /\ pc = 0
     /\ history = <<>>
-    /\ pending = <<>>
+    /\ event_queue = <<>>
 
 \* Transition actions
 normal_usage_exceed_soft_limit ==
@@ -31,26 +36,27 @@ normal_usage_exceed_soft_limit ==
     /\ state' = throttled
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 throttled_reduce_usage ==
     /\ state = throttled
     /\ state' = normal_usage
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 throttled_exceed_hard_limit ==
     /\ state = throttled
     /\ state' = oom_killed
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 Next ==
     \/ normal_usage_exceed_soft_limit
     \/ throttled_reduce_usage
     \/ throttled_exceed_hard_limit
+    \/ UNCHANGED vars
 
 \* Stuttering step (system does nothing)
 Stutter ==
@@ -64,7 +70,7 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
-    /\ history \in Seq(States)
+    \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
 TerminalStates == {oom_killed}

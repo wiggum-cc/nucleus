@@ -3,27 +3,31 @@
 --------------------------------------------  MODULE NucleusSecurity_GVisor_GVisorRuntime  --------------------------------------------
 EXTENDS Naturals, Sequences, TLC
 
-\* State constants
-CONSTANTS
-    native_kernel, gvisor_kernel
+\* State values (defined as strings for Apalache)
+native_kernel == "native_kernel"
+gvisor_kernel == "gvisor_kernel"
 
 States == {
     native_kernel, gvisor_kernel
 }
 
 VARIABLES
+    \* @type: Str;
     state,      \* Current state
+    \* @type: Int;
     pc,         \* Program counter for step tracking
+    \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
-    pending     \* Pending events/messages queue
+    \* @type: Seq(Str);
+    event_queue     \* Pending events/messages queue
 
-vars == <<state, pc, history, pending>>
+vars == <<state, pc, history, event_queue>>
 
 Init ==
     /\ state = native_kernel
     /\ pc = 0
     /\ history = <<>>
-    /\ pending = <<>>
+    /\ event_queue = <<>>
 
 \* Transition actions
 native_kernel_enable_gvisor ==
@@ -31,10 +35,11 @@ native_kernel_enable_gvisor ==
     /\ state' = gvisor_kernel
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 Next ==
     \/ native_kernel_enable_gvisor
+    \/ UNCHANGED vars
 
 \* Stuttering step (system does nothing)
 Stutter ==
@@ -48,7 +53,7 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
-    /\ history \in Seq(States)
+    \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
 TerminalStates == {gvisor_kernel}

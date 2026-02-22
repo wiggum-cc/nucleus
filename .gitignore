@@ -1,3 +1,7 @@
+# Claude
+.claude/settings.local.json
+
+# Rust
 /target
 
 # direnv
@@ -9,3 +13,6 @@ result-*
 
 # sccache
 .cache/sccache/
+
+# Apalache
+_apalache-out/

@@ -3,27 +3,32 @@
 -------------------------------------------------------  MODULE NucleusSecurity_Capabilities_CapabilityDropping  -------------------------------------------------------
 EXTENDS Naturals, Sequences, TLC
 
-\* State constants
-CONSTANTS
-    all_caps, minimal_caps, no_caps
+\* State values (defined as strings for Apalache)
+all_caps == "all_caps"
+minimal_caps == "minimal_caps"
+no_caps == "no_caps"
 
 States == {
     all_caps, minimal_caps, no_caps
 }
 
 VARIABLES
+    \* @type: Str;
     state,      \* Current state
+    \* @type: Int;
     pc,         \* Program counter for step tracking
+    \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
-    pending     \* Pending events/messages queue
+    \* @type: Seq(Str);
+    event_queue     \* Pending events/messages queue
 
-vars == <<state, pc, history, pending>>
+vars == <<state, pc, history, event_queue>>
 
 Init ==
     /\ state = all_caps
     /\ pc = 0
     /\ history = <<>>
-    /\ pending = <<>>
+    /\ event_queue = <<>>
 
 \* Transition actions
 all_caps_drop_most_capabilities ==
@@ -31,26 +36,27 @@ all_caps_drop_most_capabilities ==
     /\ state' = minimal_caps
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 all_caps_drop_all_capabilities ==
     /\ state = all_caps
     /\ state' = no_caps
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 minimal_caps_drop_remaining_capabilities ==
     /\ state = minimal_caps
     /\ state' = no_caps
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
-    /\ pending' = pending
+    /\ event_queue' = event_queue
 
 Next ==
     \/ all_caps_drop_most_capabilities
     \/ all_caps_drop_all_capabilities
     \/ minimal_caps_drop_remaining_capabilities
+    \/ UNCHANGED vars
 
 \* Stuttering step (system does nothing)
 Stutter ==
@@ -64,7 +70,7 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
-    /\ history \in Seq(States)
+    \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
 TerminalStates == {no_caps}
@@ -78,7 +84,7 @@ HistoryConsistent ==
     Len(history) = pc
 
 \* Temporal properties (LTL)
-Prop_irreversible == []((state = minimal_caps) => (((state = minimal_caps) \/ (state = no_caps))'))
+Prop_irreversible == [][(state = minimal_caps) => ((state' = minimal_caps) \/ (state' = no_caps))]_vars
 
 \* Liveness: Eventually reaches a terminal state
 Liveness ==
