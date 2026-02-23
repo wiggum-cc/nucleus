@@ -41,6 +41,7 @@ pub struct ContainerState {
 
 impl ContainerState {
     /// Create a new container state
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
         name: String,
@@ -231,12 +232,6 @@ impl ContainerStateManager {
         }
 
         Ok(())
-    }
-}
-
-impl Default for ContainerStateManager {
-    fn default() -> Self {
-        Self::new().expect("Failed to create container state manager")
     }
 }
 

@@ -70,9 +70,19 @@ impl Container {
                 }
             }
             Err(e) => {
-                // If rootless mode, this is expected - cgroups require root
                 if config.user_ns_config.is_some() {
-                    debug!("Running in rootless mode without cgroup resource limits");
+                    if config.limits.memory_bytes.is_some()
+                        || config.limits.cpu_quota_us.is_some()
+                        || config.limits.pids_max.is_some()
+                    {
+                        warn!(
+                            "Running in rootless mode: requested resource limits cannot be \
+                             enforced — cgroup creation requires root ({})",
+                            e
+                        );
+                    } else {
+                        debug!("Running in rootless mode without cgroup resource limits");
+                    }
                 } else {
                     warn!("Failed to create cgroup (running without resource limits): {}", e);
                 }
@@ -226,10 +236,8 @@ impl Container {
         info!("Using gVisor runtime");
 
         // Create gVisor runtime
-        let gvisor = GVisorRuntime::new().map_err(|e| {
-            warn!("Failed to initialize gVisor, falling back to native: {}", e);
-            e
-        })?;
+        let gvisor = GVisorRuntime::new()
+            .map_err(|e| NucleusError::GVisorError(format!("Failed to initialize gVisor runtime: {}", e)))?;
 
         // Check if we should use OCI bundle format
         if self.config.use_oci_bundle {
@@ -354,15 +362,20 @@ impl Container {
         let handler = SigHandler::Handler(forward_signal);
         let action = SigAction::new(handler, SaFlags::empty(), SigSet::empty());
 
-        // Set up handlers for SIGTERM and SIGINT
+        // Set up handlers for common termination and control signals
         unsafe {
-            sigaction(Signal::SIGTERM, &action).map_err(|e| {
-                NucleusError::ExecError(format!("Failed to set SIGTERM handler: {}", e))
-            })?;
-
-            sigaction(Signal::SIGINT, &action).map_err(|e| {
-                NucleusError::ExecError(format!("Failed to set SIGINT handler: {}", e))
-            })?;
+            for (signal, name) in [
+                (Signal::SIGTERM,  "SIGTERM"),
+                (Signal::SIGINT,   "SIGINT"),
+                (Signal::SIGHUP,   "SIGHUP"),
+                (Signal::SIGQUIT,  "SIGQUIT"),
+                (Signal::SIGUSR1,  "SIGUSR1"),
+                (Signal::SIGUSR2,  "SIGUSR2"),
+            ] {
+                sigaction(signal, &action).map_err(|e| {
+                    NucleusError::ExecError(format!("Failed to set {} handler: {}", name, e))
+                })?;
+            }
         }
 
         info!("Signal handlers configured");

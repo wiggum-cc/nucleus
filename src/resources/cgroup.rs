@@ -11,7 +11,6 @@ const CGROUP_V2_ROOT: &str = "/sys/fs/cgroup";
 /// Implements the cgroup lifecycle state machine from
 /// Nucleus_Resources_CgroupLifecycle.tla
 pub struct Cgroup {
-    name: String,
     path: PathBuf,
     created: bool,
     configured: bool,
@@ -32,7 +31,6 @@ impl Cgroup {
         })?;
 
         Ok(Self {
-            name: name.to_string(),
             path,
             created: true,
             configured: false,

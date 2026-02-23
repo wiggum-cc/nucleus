@@ -198,4 +198,46 @@ mod tests {
 
         assert_eq!(config.hostname, Some("my-container".to_string()));
     }
+
+    #[test]
+    fn test_container_rootless_config() {
+        let config = ContainerConfig::new(
+            "test".to_string(),
+            vec!["/bin/sh".to_string()],
+        )
+        .with_rootless();
+
+        assert!(config.namespaces.user, "User namespace should be enabled in rootless mode");
+        assert!(config.user_ns_config.is_some(), "User namespace config should be set in rootless mode");
+    }
+
+    #[test]
+    fn test_gvisor_unavailable_returns_error() {
+        use nucleus::security::GVisorRuntime;
+
+        if GVisorRuntime::is_available() {
+            // runsc is present on this machine; skip
+            return;
+        }
+        let result = GVisorRuntime::new();
+        assert!(result.is_err(), "GVisorRuntime::new() should fail when runsc is not available");
+    }
+
+    #[test]
+    fn test_resource_stats_parsing() {
+        use nucleus::resources::ResourceStats;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let p = temp.path();
+        std::fs::write(p.join("memory.current"), "1048576\n").unwrap();
+        std::fs::write(p.join("memory.max"),     "536870912\n").unwrap();
+        std::fs::write(p.join("cpu.stat"),       "usage_usec 1000000\nother 0\n").unwrap();
+        std::fs::write(p.join("pids.current"),   "5\n").unwrap();
+
+        let stats = ResourceStats::from_cgroup(p.to_str().unwrap()).unwrap();
+        assert_eq!(stats.memory_usage,  1_048_576);
+        assert_eq!(stats.memory_limit,  536_870_912);
+        assert_eq!(stats.cpu_usage_ns,  1_000_000_000); // 1_000_000 µs → ns
+        assert_eq!(stats.pid_count,     5);
+    }
 }

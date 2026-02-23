@@ -92,8 +92,8 @@ fn main() -> Result<()> {
 
             // Print header
             println!(
-                "{:<15} {:<10} {:<10} {:<10} {:<10} {}",
-                "CONTAINER ID", "PID", "STATUS", "RUNTIME", "ROOTLESS", "COMMAND"
+                "{:<15} {:<10} {:<10} {:<10} {:<10} COMMAND",
+                "CONTAINER ID", "PID", "STATUS", "RUNTIME", "ROOTLESS"
             );
 
             // Print each container
