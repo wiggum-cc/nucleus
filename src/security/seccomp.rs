@@ -1,7 +1,5 @@
 use crate::error::{NucleusError, Result};
-use seccompiler::{
-    BpfProgram, SeccompAction, SeccompFilter, SeccompRule, SeccompCondition,
-};
+use seccompiler::{BpfProgram, SeccompAction, SeccompCondition, SeccompFilter, SeccompRule};
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
@@ -206,9 +204,12 @@ impl SeccompManager {
                         seccompiler::SeccompCmpOp::Ge,
                         0,
                     )
-                    .map_err(|e| NucleusError::SeccompError(format!("Failed to create condition: {}", e)))?;
-                    let rule = SeccompRule::new(vec![condition])
-                        .map_err(|e| NucleusError::SeccompError(format!("Failed to create rule: {}", e)))?;
+                    .map_err(|e| {
+                        NucleusError::SeccompError(format!("Failed to create condition: {}", e))
+                    })?;
+                    let rule = SeccompRule::new(vec![condition]).map_err(|e| {
+                        NucleusError::SeccompError(format!("Failed to create rule: {}", e))
+                    })?;
                     rules.insert(syscall, vec![rule]);
                 }
             }
@@ -231,7 +232,9 @@ impl SeccompManager {
                 NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
             })?,
         )
-        .map_err(|e| NucleusError::SeccompError(format!("Failed to create seccomp filter: {}", e)))?;
+        .map_err(|e| {
+            NucleusError::SeccompError(format!("Failed to create seccomp filter: {}", e))
+        })?;
 
         let bpf_prog: BpfProgram = filter.try_into().map_err(|e| {
             NucleusError::SeccompError(format!("Failed to compile BPF program: {}", e))
@@ -248,6 +251,14 @@ impl SeccompManager {
     /// Once applied, the filter cannot be removed (irreversible property)
     /// In rootless mode or if seccomp setup fails, this will warn and continue
     pub fn apply_minimal_filter(&mut self) -> Result<()> {
+        self.apply_minimal_filter_with_mode(false)
+    }
+
+    /// Apply seccomp filter with configurable failure behavior
+    ///
+    /// When `best_effort` is true, failures are logged and execution continues.
+    /// When false, seccomp setup is fail-closed.
+    pub fn apply_minimal_filter_with_mode(&mut self, best_effort: bool) -> Result<()> {
         if self.applied {
             debug!("Seccomp filter already applied, skipping");
             return Ok(());
@@ -258,31 +269,55 @@ impl SeccompManager {
         let rules = match Self::minimal_filter() {
             Ok(r) => r,
             Err(e) => {
-                warn!("Failed to create seccomp rules: {} (continuing without seccomp)", e);
-                return Ok(());
+                if best_effort {
+                    warn!(
+                        "Failed to create seccomp rules: {} (continuing without seccomp)",
+                        e
+                    );
+                    return Ok(());
+                }
+                return Err(e);
             }
         };
 
         let filter = match SeccompFilter::new(
             rules,
             SeccompAction::Errno(libc::EPERM as u32), // Default: deny with EPERM
-            SeccompAction::Allow,                      // Match action: allow
+            SeccompAction::Allow,                     // Match action: allow
             std::env::consts::ARCH.try_into().map_err(|e| {
                 NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
             })?,
         ) {
             Ok(f) => f,
             Err(e) => {
-                warn!("Failed to create seccomp filter: {} (continuing without seccomp)", e);
-                return Ok(());
+                if best_effort {
+                    warn!(
+                        "Failed to create seccomp filter: {} (continuing without seccomp)",
+                        e
+                    );
+                    return Ok(());
+                }
+                return Err(NucleusError::SeccompError(format!(
+                    "Failed to create seccomp filter: {}",
+                    e
+                )));
             }
         };
 
         let bpf_prog: BpfProgram = match filter.try_into() {
             Ok(p) => p,
             Err(e) => {
-                warn!("Failed to compile BPF program: {} (continuing without seccomp)", e);
-                return Ok(());
+                if best_effort {
+                    warn!(
+                        "Failed to compile BPF program: {} (continuing without seccomp)",
+                        e
+                    );
+                    return Ok(());
+                }
+                return Err(NucleusError::SeccompError(format!(
+                    "Failed to compile BPF program: {}",
+                    e
+                )));
             }
         };
 
@@ -293,7 +328,17 @@ impl SeccompManager {
                 info!("Successfully applied seccomp filter");
             }
             Err(e) => {
-                warn!("Failed to apply seccomp filter: {} (continuing without seccomp)", e);
+                if best_effort {
+                    warn!(
+                        "Failed to apply seccomp filter: {} (continuing without seccomp)",
+                        e
+                    );
+                } else {
+                    return Err(NucleusError::SeccompError(format!(
+                        "Failed to apply seccomp filter: {}",
+                        e
+                    )));
+                }
             }
         }
 

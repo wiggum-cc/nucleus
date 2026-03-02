@@ -1,7 +1,6 @@
 /// Model-based testing for isolation module using tla-connect
 ///
 /// Replays traces from Nucleus_Isolation_NamespaceLifecycle.tla
-
 use anyhow::Result;
 use nucleus::isolation::NamespaceState;
 use serde::Deserialize;

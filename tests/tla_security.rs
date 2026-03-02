@@ -6,7 +6,6 @@
 /// 3. Verify that Rust state matches TLA+ state after each step
 ///
 /// This ensures the Rust implementation matches the formally verified TLA+ specification.
-
 use anyhow::Result;
 use nucleus::security::SecurityState;
 use serde::Deserialize;

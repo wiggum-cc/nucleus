@@ -7,7 +7,6 @@
 /// - resource_limits_enforced: Once configured, can only move to attached, monitoring, or removed
 /// - cleanup_guaranteed: Eventually reaches removed state
 /// - no_resource_leak: Removed state is terminal and stable
-
 use nucleus::resources::CgroupState;
 
 #[test]
@@ -84,7 +83,11 @@ fn test_cgroup_property_cleanup_guaranteed() {
     ];
 
     for initial in states {
-        assert!(!initial.is_terminal(), "{:?} should not be terminal", initial);
+        assert!(
+            !initial.is_terminal(),
+            "{:?} should not be terminal",
+            initial
+        );
 
         // Verify there's a path to terminal
         let mut current = initial;
@@ -102,7 +105,11 @@ fn test_cgroup_property_cleanup_guaranteed() {
             steps += 1;
         }
 
-        assert!(current.is_terminal(), "Should reach terminal from {:?}", initial);
+        assert!(
+            current.is_terminal(),
+            "Should reach terminal from {:?}",
+            initial
+        );
     }
 }
 

@@ -27,8 +27,10 @@ mod tests {
 
         // Configure container with minimal resources
         let limits = ResourceLimits::unlimited()
-            .with_memory("128M").expect("Failed to set memory")
-            .with_cpu_cores(1.0).expect("Failed to set CPU");
+            .with_memory("128M")
+            .expect("Failed to set memory")
+            .with_cpu_cores(1.0)
+            .expect("Failed to set CPU");
 
         let config = ContainerConfig::new(
             "test-echo".to_string(),
@@ -53,7 +55,11 @@ mod tests {
         // Test the configuration builder pattern
         let config = ContainerConfig::new(
             "test".to_string(),
-            vec!["/bin/sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "exit 0".to_string(),
+            ],
         )
         .with_context(PathBuf::from("/tmp/test"))
         .with_namespaces(NamespaceConfig::minimal())
@@ -69,9 +75,12 @@ mod tests {
     fn test_resource_limits_configuration() {
         // Test resource limit parsing and configuration
         let limits = ResourceLimits::unlimited()
-            .with_memory("512M").expect("Failed to set memory")
-            .with_cpu_cores(2.0).expect("Failed to set CPU")
-            .with_pids(100).expect("Failed to set PIDs");
+            .with_memory("512M")
+            .expect("Failed to set memory")
+            .with_cpu_cores(2.0)
+            .expect("Failed to set CPU")
+            .with_pids(100)
+            .expect("Failed to set PIDs");
 
         assert_eq!(limits.memory_bytes, Some(512 * 1024 * 1024));
         assert_eq!(limits.cpu_quota_us, Some(200_000)); // 2.0 * 100_000
@@ -152,9 +161,12 @@ mod tests {
         .expect("Failed to write test script");
 
         let limits = ResourceLimits::unlimited()
-            .with_memory("256M").expect("Failed to set memory")
-            .with_cpu_cores(1.0).expect("Failed to set CPU")
-            .with_pids(50).expect("Failed to set PIDs");
+            .with_memory("256M")
+            .expect("Failed to set memory")
+            .with_cpu_cores(1.0)
+            .expect("Failed to set CPU")
+            .with_pids(50)
+            .expect("Failed to set PIDs");
 
         let mut namespaces = NamespaceConfig::all();
         namespaces.uts = true;
@@ -179,11 +191,8 @@ mod tests {
     #[test]
     fn test_container_with_custom_hostname() {
         // Test hostname configuration
-        let config = ContainerConfig::new(
-            "test".to_string(),
-            vec!["/bin/sh".to_string()],
-        )
-        .with_hostname(Some("custom-host".to_string()));
+        let config = ContainerConfig::new("test".to_string(), vec!["/bin/sh".to_string()])
+            .with_hostname(Some("custom-host".to_string()));
 
         assert_eq!(config.hostname, Some("custom-host".to_string()));
     }
@@ -191,24 +200,24 @@ mod tests {
     #[test]
     fn test_container_default_hostname() {
         // Test that default hostname is set to container name
-        let config = ContainerConfig::new(
-            "my-container".to_string(),
-            vec!["/bin/sh".to_string()],
-        );
+        let config = ContainerConfig::new("my-container".to_string(), vec!["/bin/sh".to_string()]);
 
         assert_eq!(config.hostname, Some("my-container".to_string()));
     }
 
     #[test]
     fn test_container_rootless_config() {
-        let config = ContainerConfig::new(
-            "test".to_string(),
-            vec!["/bin/sh".to_string()],
-        )
-        .with_rootless();
+        let config =
+            ContainerConfig::new("test".to_string(), vec!["/bin/sh".to_string()]).with_rootless();
 
-        assert!(config.namespaces.user, "User namespace should be enabled in rootless mode");
-        assert!(config.user_ns_config.is_some(), "User namespace config should be set in rootless mode");
+        assert!(
+            config.namespaces.user,
+            "User namespace should be enabled in rootless mode"
+        );
+        assert!(
+            config.user_ns_config.is_some(),
+            "User namespace config should be set in rootless mode"
+        );
     }
 
     #[test]
@@ -220,7 +229,10 @@ mod tests {
             return;
         }
         let result = GVisorRuntime::new();
-        assert!(result.is_err(), "GVisorRuntime::new() should fail when runsc is not available");
+        assert!(
+            result.is_err(),
+            "GVisorRuntime::new() should fail when runsc is not available"
+        );
     }
 
     #[test]
@@ -230,14 +242,14 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let p = temp.path();
         std::fs::write(p.join("memory.current"), "1048576\n").unwrap();
-        std::fs::write(p.join("memory.max"),     "536870912\n").unwrap();
-        std::fs::write(p.join("cpu.stat"),       "usage_usec 1000000\nother 0\n").unwrap();
-        std::fs::write(p.join("pids.current"),   "5\n").unwrap();
+        std::fs::write(p.join("memory.max"), "536870912\n").unwrap();
+        std::fs::write(p.join("cpu.stat"), "usage_usec 1000000\nother 0\n").unwrap();
+        std::fs::write(p.join("pids.current"), "5\n").unwrap();
 
         let stats = ResourceStats::from_cgroup(p.to_str().unwrap()).unwrap();
-        assert_eq!(stats.memory_usage,  1_048_576);
-        assert_eq!(stats.memory_limit,  536_870_912);
-        assert_eq!(stats.cpu_usage_ns,  1_000_000_000); // 1_000_000 µs → ns
-        assert_eq!(stats.pid_count,     5);
+        assert_eq!(stats.memory_usage, 1_048_576);
+        assert_eq!(stats.memory_limit, 536_870_912);
+        assert_eq!(stats.cpu_usage_ns, 1_000_000_000); // 1_000_000 µs → ns
+        assert_eq!(stats.pid_count, 5);
     }
 }

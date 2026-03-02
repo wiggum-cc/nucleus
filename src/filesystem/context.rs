@@ -1,7 +1,7 @@
 use crate::error::{NucleusError, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Context populator - copies files from source to destination
 pub struct ContextPopulator {
@@ -21,7 +21,10 @@ impl ContextPopulator {
     ///
     /// This implements the transition: mounted -> populated
     pub fn populate(&self) -> Result<()> {
-        info!("Populating context from {:?} to {:?}", self.source, self.dest);
+        info!(
+            "Populating context from {:?} to {:?}",
+            self.source, self.dest
+        );
 
         if !self.source.exists() {
             return Err(NucleusError::ContextError(format!(
@@ -76,7 +79,7 @@ impl ContextPopulator {
                 continue;
             }
 
-            let metadata = entry.metadata().map_err(|e| {
+            let metadata = fs::symlink_metadata(&src_path).map_err(|e| {
                 NucleusError::ContextError(format!(
                     "Failed to get metadata for {:?}: {}",
                     src_path, e
@@ -85,7 +88,7 @@ impl ContextPopulator {
 
             if metadata.is_dir() {
                 // Create directory and recurse
-                fs::create_dir(&dst_path).map_err(|e| {
+                fs::create_dir_all(&dst_path).map_err(|e| {
                     NucleusError::ContextError(format!(
                         "Failed to create directory {:?}: {}",
                         dst_path, e
@@ -101,19 +104,8 @@ impl ContextPopulator {
                     ))
                 })?;
             } else if metadata.is_symlink() {
-                // Copy symlink
-                let target = fs::read_link(&src_path).map_err(|e| {
-                    NucleusError::ContextError(format!(
-                        "Failed to read symlink {:?}: {}",
-                        src_path, e
-                    ))
-                })?;
-                std::os::unix::fs::symlink(&target, &dst_path).map_err(|e| {
-                    NucleusError::ContextError(format!(
-                        "Failed to create symlink {:?}: {}",
-                        dst_path, e
-                    ))
-                })?;
+                // Skip symlinks entirely to prevent link-based escapes or host path leakage.
+                warn!("Skipping symlink in context: {:?}", src_path);
             }
         }
 

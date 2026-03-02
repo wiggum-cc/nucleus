@@ -124,9 +124,10 @@ impl ResourceStats {
             NucleusError::ResourceError(format!("Failed to read {:?}: {}", path, e))
         })?;
 
-        content.trim().parse().map_err(|e| {
-            NucleusError::ResourceError(format!("Failed to parse {:?}: {}", path, e))
-        })
+        content
+            .trim()
+            .parse()
+            .map_err(|e| NucleusError::ResourceError(format!("Failed to parse {:?}: {}", path, e)))
     }
 
     /// Format memory size in human-readable format
@@ -163,10 +164,7 @@ mod tests {
         assert_eq!(ResourceStats::format_memory(1024), "1.00K");
         assert_eq!(ResourceStats::format_memory(1024 * 1024), "1.00M");
         assert_eq!(ResourceStats::format_memory(1024 * 1024 * 1024), "1.00G");
-        assert_eq!(
-            ResourceStats::format_memory(512 * 1024 * 1024),
-            "512.00M"
-        );
+        assert_eq!(ResourceStats::format_memory(512 * 1024 * 1024), "512.00M");
     }
 
     #[test]

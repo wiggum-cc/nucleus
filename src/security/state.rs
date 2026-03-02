@@ -62,7 +62,9 @@ mod tests {
         // Cannot go backwards (no privilege escalation)
         assert!(!SecurityState::CapabilitiesDropped.can_transition_to(SecurityState::Privileged));
         assert!(!SecurityState::SeccompApplied.can_transition_to(SecurityState::Privileged));
-        assert!(!SecurityState::SeccompApplied.can_transition_to(SecurityState::CapabilitiesDropped));
+        assert!(
+            !SecurityState::SeccompApplied.can_transition_to(SecurityState::CapabilitiesDropped)
+        );
         assert!(!SecurityState::Locked.can_transition_to(SecurityState::SeccompApplied));
     }
 

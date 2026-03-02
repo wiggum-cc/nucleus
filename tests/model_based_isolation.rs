@@ -7,7 +7,6 @@
 /// - isolation_integrity: Once entered, can only move to entered or cleaned
 /// - cleanup_happens: If entered, eventually cleaned
 /// - Terminal state stability: Cleaned state is terminal
-
 use nucleus::isolation::NamespaceState;
 
 #[test]
@@ -75,7 +74,11 @@ fn test_namespace_property_liveness() {
     ];
 
     for initial in states {
-        assert!(!initial.is_terminal(), "{:?} should not be terminal", initial);
+        assert!(
+            !initial.is_terminal(),
+            "{:?} should not be terminal",
+            initial
+        );
 
         // Verify there's a path to terminal
         let mut current = initial;
@@ -93,7 +96,11 @@ fn test_namespace_property_liveness() {
             };
         }
 
-        assert!(current.is_terminal(), "Should reach terminal from {:?}", initial);
+        assert!(
+            current.is_terminal(),
+            "Should reach terminal from {:?}",
+            initial
+        );
     }
 }
 

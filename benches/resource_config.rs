@@ -92,7 +92,11 @@ fn oci_config_build_and_serialize(c: &mut Criterion) {
                 .with_pids(1024)
                 .unwrap();
             OciConfig::new(
-                vec!["/bin/sh".to_string(), "-c".to_string(), "echo hello".to_string()],
+                vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "echo hello".to_string(),
+                ],
                 Some("bench-container".to_string()),
             )
             .with_resources(&limits)
@@ -108,7 +112,11 @@ fn oci_config_build_and_serialize(c: &mut Criterion) {
             .with_pids(1024)
             .unwrap();
         let config = OciConfig::new(
-            vec!["/bin/sh".to_string(), "-c".to_string(), "echo hello".to_string()],
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo hello".to_string(),
+            ],
             Some("bench-container".to_string()),
         )
         .with_resources(&limits);
@@ -125,7 +133,11 @@ fn container_state_serde(c: &mut Criterion) {
             "bench-container-001".to_string(),
             "bench-container-001".to_string(),
             12345,
-            vec!["/bin/sh".to_string(), "-c".to_string(), "echo hello".to_string()],
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo hello".to_string(),
+            ],
             Some(512 * 1024 * 1024),
             Some(2000),
             false,

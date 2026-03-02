@@ -25,17 +25,21 @@ impl CapabilityManager {
         info!("Dropping all capabilities");
 
         // Clear all capability sets
-        caps::clear(None, CapSet::Permitted)
-            .map_err(|e| NucleusError::CapabilityError(format!("Failed to clear permitted caps: {}", e)))?;
+        caps::clear(None, CapSet::Permitted).map_err(|e| {
+            NucleusError::CapabilityError(format!("Failed to clear permitted caps: {}", e))
+        })?;
 
-        caps::clear(None, CapSet::Effective)
-            .map_err(|e| NucleusError::CapabilityError(format!("Failed to clear effective caps: {}", e)))?;
+        caps::clear(None, CapSet::Effective).map_err(|e| {
+            NucleusError::CapabilityError(format!("Failed to clear effective caps: {}", e))
+        })?;
 
-        caps::clear(None, CapSet::Inheritable)
-            .map_err(|e| NucleusError::CapabilityError(format!("Failed to clear inheritable caps: {}", e)))?;
+        caps::clear(None, CapSet::Inheritable).map_err(|e| {
+            NucleusError::CapabilityError(format!("Failed to clear inheritable caps: {}", e))
+        })?;
 
-        caps::clear(None, CapSet::Ambient)
-            .map_err(|e| NucleusError::CapabilityError(format!("Failed to clear ambient caps: {}", e)))?;
+        caps::clear(None, CapSet::Ambient).map_err(|e| {
+            NucleusError::CapabilityError(format!("Failed to clear ambient caps: {}", e))
+        })?;
 
         self.dropped = true;
         info!("Successfully dropped all capabilities");
@@ -61,20 +65,24 @@ impl CapabilityManager {
         // Drop each capability that's not in the keep list
         for cap in all_caps {
             if !keep.contains(&cap) {
-                caps::drop(None, CapSet::Permitted, cap)
-                    .map_err(|e| NucleusError::CapabilityError(format!("Failed to drop {cap:?}: {e}")))?;
+                caps::drop(None, CapSet::Permitted, cap).map_err(|e| {
+                    NucleusError::CapabilityError(format!("Failed to drop {cap:?}: {e}"))
+                })?;
 
-                caps::drop(None, CapSet::Effective, cap)
-                    .map_err(|e| NucleusError::CapabilityError(format!("Failed to drop {cap:?}: {e}")))?;
+                caps::drop(None, CapSet::Effective, cap).map_err(|e| {
+                    NucleusError::CapabilityError(format!("Failed to drop {cap:?}: {e}"))
+                })?;
 
-                caps::drop(None, CapSet::Inheritable, cap)
-                    .map_err(|e| NucleusError::CapabilityError(format!("Failed to drop {cap:?}: {e}")))?;
+                caps::drop(None, CapSet::Inheritable, cap).map_err(|e| {
+                    NucleusError::CapabilityError(format!("Failed to drop {cap:?}: {e}"))
+                })?;
             }
         }
 
         // Always clear ambient capabilities
-        caps::clear(None, CapSet::Ambient)
-            .map_err(|e| NucleusError::CapabilityError(format!("Failed to clear ambient caps: {}", e)))?;
+        caps::clear(None, CapSet::Ambient).map_err(|e| {
+            NucleusError::CapabilityError(format!("Failed to clear ambient caps: {}", e))
+        })?;
 
         self.dropped = true;
         info!("Successfully dropped capabilities");

@@ -1,6 +1,7 @@
 use crate::error::{NucleusError, Result};
 use crate::security::OciBundle;
 use std::ffi::CString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use tracing::{debug, info};
@@ -33,19 +34,17 @@ impl GVisorRuntime {
         ];
 
         for path in &paths {
-            if Path::new(path).exists() {
-                return Ok(path.to_string());
+            if let Some(validated) = Self::validate_runsc_path(Path::new(path))? {
+                return Ok(validated);
             }
         }
 
-        // Try to find in PATH
-        if let Ok(output) = Command::new("which").arg("runsc").output() {
-            if output.status.success() {
-                if let Ok(path) = String::from_utf8(output.stdout) {
-                    let path = path.trim();
-                    if !path.is_empty() {
-                        return Ok(path.to_string());
-                    }
+        // Try to find in PATH without invoking a shell command.
+        if let Some(path_var) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                let candidate = dir.join("runsc");
+                if let Some(validated) = Self::validate_runsc_path(&candidate)? {
+                    return Ok(validated);
                 }
             }
         }
@@ -53,6 +52,38 @@ impl GVisorRuntime {
         Err(NucleusError::GVisorError(
             "runsc binary not found. Please install gVisor.".to_string(),
         ))
+    }
+
+    fn validate_runsc_path(path: &Path) -> Result<Option<String>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        if !path.is_file() {
+            return Ok(None);
+        }
+
+        let canonical = std::fs::canonicalize(path).map_err(|e| {
+            NucleusError::GVisorError(format!(
+                "Failed to canonicalize runsc path {:?}: {}",
+                path, e
+            ))
+        })?;
+        let metadata = std::fs::metadata(&canonical).map_err(|e| {
+            NucleusError::GVisorError(format!("Failed to stat runsc path {:?}: {}", canonical, e))
+        })?;
+
+        let mode = metadata.permissions().mode();
+        if mode & 0o022 != 0 {
+            return Err(NucleusError::GVisorError(format!(
+                "Refusing insecure runsc binary permissions at {:?} (mode {:o})",
+                canonical, mode
+            )));
+        }
+        if mode & 0o111 == 0 {
+            return Ok(None);
+        }
+
+        Ok(Some(canonical.to_string_lossy().to_string()))
     }
 
     /// Execute a command using gVisor (runsc) - legacy non-OCI mode

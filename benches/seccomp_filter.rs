@@ -10,17 +10,13 @@ fn seccomp_compile_minimal_filter(c: &mut Criterion) {
 fn seccomp_compile_repeated(c: &mut Criterion) {
     let mut group = c.benchmark_group("seccomp_compile_repeated");
     for count in [1, 5, 10, 50] {
-        group.bench_with_input(
-            BenchmarkId::from_parameter(count),
-            &count,
-            |b, &count| {
-                b.iter(|| {
-                    for _ in 0..count {
-                        let _ = SeccompManager::compile_minimal_filter().unwrap();
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
+            b.iter(|| {
+                for _ in 0..count {
+                    let _ = SeccompManager::compile_minimal_filter().unwrap();
+                }
+            });
+        });
     }
     group.finish();
 }

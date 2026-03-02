@@ -233,7 +233,10 @@ mod tests {
     fn test_parse_memory() {
         assert_eq!(ResourceLimits::parse_memory("1024").unwrap(), 1024);
         assert_eq!(ResourceLimits::parse_memory("512K").unwrap(), 512 * 1024);
-        assert_eq!(ResourceLimits::parse_memory("512M").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(
+            ResourceLimits::parse_memory("512M").unwrap(),
+            512 * 1024 * 1024
+        );
         assert_eq!(
             ResourceLimits::parse_memory("2G").unwrap(),
             2 * 1024 * 1024 * 1024
@@ -274,7 +277,10 @@ mod tests {
         let expected_bytes = 1024 * 1024 * 1024u64;
         assert_eq!(limits.memory_bytes, Some(expected_bytes));
         // memory_high should be 90% of hard limit
-        assert_eq!(limits.memory_high, Some((expected_bytes as f64 * 0.9) as u64));
+        assert_eq!(
+            limits.memory_high,
+            Some((expected_bytes as f64 * 0.9) as u64)
+        );
     }
 
     #[test]

@@ -64,7 +64,10 @@ impl TmpfsMount {
             options_cstr,
         )
         .map_err(|e| {
-            NucleusError::FilesystemError(format!("Failed to mount tmpfs at {:?}: {}", self.path, e))
+            NucleusError::FilesystemError(format!(
+                "Failed to mount tmpfs at {:?}: {}",
+                self.path, e
+            ))
         })?;
 
         self.mounted = true;

@@ -7,7 +7,6 @@
 /// - context_isolation: Once pivoted, can only move to pivoted or unmounted_final
 /// - ephemeral_guarantee: unmounted_final is terminal and stable
 /// - mount_ordering: populated can only transition to pivoted or unmounted_final
-
 use nucleus::filesystem::FilesystemState;
 
 #[test]
@@ -115,7 +114,11 @@ fn test_filesystem_liveness() {
     ];
 
     for initial in states {
-        assert!(!initial.is_terminal(), "{:?} should not be terminal", initial);
+        assert!(
+            !initial.is_terminal(),
+            "{:?} should not be terminal",
+            initial
+        );
 
         let mut current = initial;
         let mut steps = 0;
@@ -131,6 +134,10 @@ fn test_filesystem_liveness() {
             steps += 1;
         }
 
-        assert!(current.is_terminal(), "Should reach terminal from {:?}", initial);
+        assert!(
+            current.is_terminal(),
+            "Should reach terminal from {:?}",
+            initial
+        );
     }
 }

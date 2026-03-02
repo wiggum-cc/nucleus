@@ -1,6 +1,9 @@
 use crate::error::{NucleusError, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
@@ -111,6 +114,12 @@ impl ContainerStateManager {
                 ))
             })?;
         }
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            NucleusError::ConfigError(format!(
+                "Failed to secure state directory permissions {:?}: {}",
+                state_dir, e
+            ))
+        })?;
 
         Ok(Self { state_dir })
     }
@@ -128,19 +137,64 @@ impl ContainerStateManager {
     }
 
     /// Get path for a container state file
-    fn state_file_path(&self, container_id: &str) -> PathBuf {
-        self.state_dir.join(format!("{}.json", container_id))
+    fn validate_container_id(container_id: &str) -> Result<()> {
+        if container_id.is_empty() {
+            return Err(NucleusError::ConfigError(
+                "Container ID cannot be empty".to_string(),
+            ));
+        }
+
+        if !container_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return Err(NucleusError::ConfigError(format!(
+                "Invalid container ID (allowed: a-zA-Z0-9._-): {}",
+                container_id
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn state_file_path(&self, container_id: &str) -> Result<PathBuf> {
+        Self::validate_container_id(container_id)?;
+        Ok(self.state_dir.join(format!("{}.json", container_id)))
     }
 
     /// Save container state
     pub fn save_state(&self, state: &ContainerState) -> Result<()> {
-        let path = self.state_file_path(&state.id);
+        let path = self.state_file_path(&state.id)?;
+        let tmp_path = self.state_dir.join(format!("{}.json.tmp", state.id));
         let json = serde_json::to_string_pretty(state).map_err(|e| {
             NucleusError::ConfigError(format!("Failed to serialize container state: {}", e))
         })?;
 
-        fs::write(&path, json).map_err(|e| {
-            NucleusError::ConfigError(format!("Failed to write state file {:?}: {}", path, e))
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| {
+                NucleusError::ConfigError(format!(
+                    "Failed to open temp state file {:?}: {}",
+                    tmp_path, e
+                ))
+            })?;
+
+        file.write_all(json.as_bytes()).map_err(|e| {
+            NucleusError::ConfigError(format!("Failed to write state file {:?}: {}", tmp_path, e))
+        })?;
+        file.sync_all().map_err(|e| {
+            NucleusError::ConfigError(format!("Failed to sync state file {:?}: {}", tmp_path, e))
+        })?;
+
+        fs::rename(&tmp_path, &path).map_err(|e| {
+            NucleusError::ConfigError(format!(
+                "Failed to atomically replace state file {:?}: {}",
+                path, e
+            ))
         })?;
 
         debug!("Saved container state: {}", state.id);
@@ -149,7 +203,7 @@ impl ContainerStateManager {
 
     /// Load container state
     pub fn load_state(&self, container_id: &str) -> Result<ContainerState> {
-        let path = self.state_file_path(container_id);
+        let path = self.state_file_path(container_id)?;
 
         let json = fs::read_to_string(&path).map_err(|e| {
             NucleusError::ConfigError(format!("Failed to read state file {:?}: {}", path, e))
@@ -164,7 +218,7 @@ impl ContainerStateManager {
 
     /// Delete container state
     pub fn delete_state(&self, container_id: &str) -> Result<()> {
-        let path = self.state_file_path(container_id);
+        let path = self.state_file_path(container_id)?;
 
         if path.exists() {
             fs::remove_file(&path).map_err(|e| {

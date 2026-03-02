@@ -125,18 +125,23 @@ fn context_exclusion_overhead(c: &mut Criterion) {
                 }
                 // 100 excludable files (various excluded patterns)
                 let excludable_names = [
-                    ".git", "target", "node_modules", "__pycache__", ".DS_Store",
-                    ".svn", ".env", ".ssh", ".gnupg", ".aws",
+                    ".git",
+                    "target",
+                    "node_modules",
+                    "__pycache__",
+                    ".DS_Store",
+                    ".svn",
+                    ".env",
+                    ".ssh",
+                    ".gnupg",
+                    ".aws",
                 ];
                 for (i, name) in excludable_names.iter().enumerate() {
                     fs::create_dir(src.path().join(name)).unwrap();
                     for j in 0..9 {
                         // Fill each excluded dir with files
-                        fs::write(
-                            src.path().join(name).join(format!("inner_{j}.dat")),
-                            &data,
-                        )
-                        .unwrap();
+                        fs::write(src.path().join(name).join(format!("inner_{j}.dat")), &data)
+                            .unwrap();
                     }
                     let _ = i; // suppress unused warning
                 }

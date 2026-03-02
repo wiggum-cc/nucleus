@@ -269,6 +269,10 @@ fn main() -> Result<()> {
 
             if runtime == "gvisor" {
                 config = config.with_gvisor(true);
+                if !oci {
+                    info!("Security hardening: enabling OCI bundle mode for gVisor runtime");
+                    config = config.with_oci_bundle();
+                }
             }
 
             // Enable rootless mode if requested

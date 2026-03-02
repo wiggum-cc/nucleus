@@ -2,6 +2,9 @@ use crate::error::{NucleusError, Result};
 use crate::resources::ResourceLimits;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
@@ -34,6 +37,8 @@ pub struct OciProcess {
     pub args: Vec<String>,
     pub env: Vec<String>,
     pub cwd: String,
+    #[serde(rename = "noNewPrivileges")]
+    pub no_new_privileges: bool,
     pub capabilities: Option<OciCapabilities>,
 }
 
@@ -69,6 +74,14 @@ pub struct OciLinux {
     pub namespaces: Option<Vec<OciNamespace>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<OciResources>,
+    #[serde(rename = "maskedPaths", skip_serializing_if = "Vec::is_empty", default)]
+    pub masked_paths: Vec<String>,
+    #[serde(
+        rename = "readonlyPaths",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
+    pub readonly_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,7 +126,7 @@ impl OciConfig {
             oci_version: "1.0.2".to_string(),
             root: OciRoot {
                 path: "rootfs".to_string(),
-                readonly: false,
+                readonly: true,
             },
             process: OciProcess {
                 terminal: false,
@@ -124,10 +137,10 @@ impl OciConfig {
                 },
                 args: command,
                 env: vec![
-                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-                        .to_string(),
+                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
                 ],
                 cwd: "/".to_string(),
+                no_new_privileges: true,
                 capabilities: Some(OciCapabilities {
                     bounding: vec![],
                     effective: vec![],
@@ -142,7 +155,11 @@ impl OciConfig {
                     destination: "/proc".to_string(),
                     source: "proc".to_string(),
                     mount_type: "proc".to_string(),
-                    options: vec!["nosuid".to_string(), "noexec".to_string(), "nodev".to_string()],
+                    options: vec![
+                        "nosuid".to_string(),
+                        "noexec".to_string(),
+                        "nodev".to_string(),
+                    ],
                 },
                 OciMount {
                     destination: "/dev".to_string(),
@@ -150,8 +167,21 @@ impl OciConfig {
                     mount_type: "tmpfs".to_string(),
                     options: vec![
                         "nosuid".to_string(),
+                        "noexec".to_string(),
                         "strictatime".to_string(),
                         "mode=755".to_string(),
+                        "size=65536k".to_string(),
+                    ],
+                },
+                OciMount {
+                    destination: "/tmp".to_string(),
+                    source: "tmpfs".to_string(),
+                    mount_type: "tmpfs".to_string(),
+                    options: vec![
+                        "nosuid".to_string(),
+                        "nodev".to_string(),
+                        "noexec".to_string(),
+                        "mode=1777".to_string(),
                         "size=65536k".to_string(),
                     ],
                 },
@@ -186,6 +216,25 @@ impl OciConfig {
                     },
                 ]),
                 resources: None,
+                masked_paths: vec![
+                    "/proc/acpi".to_string(),
+                    "/proc/asound".to_string(),
+                    "/proc/kcore".to_string(),
+                    "/proc/keys".to_string(),
+                    "/proc/latency_stats".to_string(),
+                    "/proc/sched_debug".to_string(),
+                    "/proc/scsi".to_string(),
+                    "/proc/timer_list".to_string(),
+                    "/proc/timer_stats".to_string(),
+                    "/sys/firmware".to_string(),
+                ],
+                readonly_paths: vec![
+                    "/proc/bus".to_string(),
+                    "/proc/fs".to_string(),
+                    "/proc/irq".to_string(),
+                    "/proc/sys".to_string(),
+                    "/proc/sysrq-trigger".to_string(),
+                ],
             }),
         }
     }
@@ -265,11 +314,23 @@ impl OciBundle {
                 self.bundle_path, e
             ))
         })?;
+        fs::set_permissions(&self.bundle_path, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            NucleusError::GVisorError(format!(
+                "Failed to secure bundle directory permissions {:?}: {}",
+                self.bundle_path, e
+            ))
+        })?;
 
         // Create rootfs directory
         let rootfs = self.bundle_path.join("rootfs");
         fs::create_dir_all(&rootfs).map_err(|e| {
             NucleusError::GVisorError(format!("Failed to create rootfs directory: {}", e))
+        })?;
+        fs::set_permissions(&rootfs, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            NucleusError::GVisorError(format!(
+                "Failed to secure rootfs directory permissions {:?}: {}",
+                rootfs, e
+            ))
         })?;
 
         // Write config.json
@@ -278,9 +339,18 @@ impl OciBundle {
             NucleusError::GVisorError(format!("Failed to serialize OCI config: {}", e))
         })?;
 
-        fs::write(&config_path, config_json).map_err(|e| {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&config_path)
+            .map_err(|e| NucleusError::GVisorError(format!("Failed to open config.json: {}", e)))?;
+        file.write_all(config_json.as_bytes()).map_err(|e| {
             NucleusError::GVisorError(format!("Failed to write config.json: {}", e))
         })?;
+        file.sync_all()
+            .map_err(|e| NucleusError::GVisorError(format!("Failed to sync config.json: {}", e)))?;
 
         debug!("Created OCI bundle structure at {:?}", self.bundle_path);
 

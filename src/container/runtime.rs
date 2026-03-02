@@ -11,8 +11,8 @@ use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, ForkResult, Pid};
 use std::ffi::CString;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
+use tempfile::Builder;
 use tracing::{debug, error, info, warn};
 
 /// Container runtime that orchestrates all isolation mechanisms
@@ -84,7 +84,10 @@ impl Container {
                         debug!("Running in rootless mode without cgroup resource limits");
                     }
                 } else {
-                    warn!("Failed to create cgroup (running without resource limits): {}", e);
+                    warn!(
+                        "Failed to create cgroup (running without resource limits): {}",
+                        e
+                    );
                 }
                 None
             }
@@ -107,7 +110,9 @@ impl Container {
                 info!("Forked child process: {}", child);
 
                 // Save container state
-                let cgroup_path = cgroup_opt.as_ref().map(|_| format!("/sys/fs/cgroup/{}", cgroup_name));
+                let cgroup_path = cgroup_opt
+                    .as_ref()
+                    .map(|_| format!("/sys/fs/cgroup/{}", cgroup_name));
 
                 // Convert cpu_quota_us to millicores for storage
                 let cpu_millicores = config.limits.cpu_quota_us.map(|quota| {
@@ -177,6 +182,7 @@ impl Container {
         if self.config.use_gvisor {
             return self.setup_and_exec_gvisor();
         }
+        let is_rootless = self.config.user_ns_config.is_some();
 
         // Native execution path
         // 1. Set hostname if UTS namespace is enabled
@@ -186,7 +192,13 @@ impl Container {
         }
 
         // 2. Mount tmpfs as container root
-        let container_root = PathBuf::from("/tmp").join(format!("nucleus-{}", self.config.name));
+        let runtime_dir = Builder::new()
+            .prefix("nucleus-runtime-")
+            .tempdir_in("/tmp")
+            .map_err(|e| {
+                NucleusError::FilesystemError(format!("Failed to create runtime dir: {}", e))
+            })?;
+        let container_root = runtime_dir.path().to_path_buf();
         let mut tmpfs = TmpfsMount::new(&container_root, Some(1024 * 1024 * 1024)); // 1GB default
         tmpfs.mount()?;
 
@@ -205,14 +217,14 @@ impl Container {
         }
 
         // 6. Bind mount host paths (for accessing host binaries)
-        bind_mount_host_paths(&container_root)?;
+        bind_mount_host_paths(&container_root, is_rootless)?;
 
         // 7. Mount procfs
         let proc_path = container_root.join("proc");
-        mount_procfs(&proc_path)?;
+        mount_procfs(&proc_path, is_rootless)?;
 
         // 8. Switch root filesystem
-        switch_root(&container_root)?;
+        switch_root(&container_root, is_rootless)?;
 
         // 9. Drop capabilities
         let mut cap_mgr = CapabilityManager::new();
@@ -220,7 +232,7 @@ impl Container {
 
         // 10. Apply seccomp filter
         let mut seccomp_mgr = SeccompManager::new();
-        seccomp_mgr.apply_minimal_filter()?;
+        seccomp_mgr.apply_minimal_filter_with_mode(is_rootless)?;
 
         // 11. Exec target process
         self.exec_command()?;
@@ -236,35 +248,15 @@ impl Container {
         info!("Using gVisor runtime");
 
         // Create gVisor runtime
-        let gvisor = GVisorRuntime::new()
-            .map_err(|e| NucleusError::GVisorError(format!("Failed to initialize gVisor runtime: {}", e)))?;
+        let gvisor = GVisorRuntime::new().map_err(|e| {
+            NucleusError::GVisorError(format!("Failed to initialize gVisor runtime: {}", e))
+        })?;
 
-        // Check if we should use OCI bundle format
-        if self.config.use_oci_bundle {
-            return self.setup_and_exec_gvisor_oci(&gvisor);
+        // Security hardening: always use OCI mode with explicit sandbox configuration.
+        if !self.config.use_oci_bundle {
+            info!("Security hardening enabled: forcing gVisor OCI bundle mode");
         }
-
-        // Legacy non-OCI mode
-        // Create root directory for runsc
-        let container_root = PathBuf::from("/tmp").join(format!("nucleus-gvisor-{}", self.config.name));
-
-        // For gVisor, we prepare a simpler environment
-        // runsc handles most of the isolation internally
-        std::fs::create_dir_all(&container_root)?;
-
-        // Populate context if provided
-        if let Some(context_dir) = &self.config.context_dir {
-            let context_dest = container_root.join("context");
-            let populator = ContextPopulator::new(context_dir, &context_dest);
-            populator.populate()?;
-        }
-
-        // Execute with gVisor
-        // This will replace the current process with runsc
-        gvisor.exec_with_gvisor(&self.config.name, &container_root, &self.config.command)?;
-
-        // Should never reach here
-        Ok(())
+        self.setup_and_exec_gvisor_oci(&gvisor)
     }
 
     /// Set up container with gVisor using OCI bundle format
@@ -272,7 +264,8 @@ impl Container {
         info!("Using gVisor with OCI bundle format");
 
         // Create OCI config
-        let mut oci_config = OciConfig::new(self.config.command.clone(), self.config.hostname.clone());
+        let mut oci_config =
+            OciConfig::new(self.config.command.clone(), self.config.hostname.clone());
 
         // Add resource limits
         oci_config = oci_config.with_resources(&self.config.limits);
@@ -283,7 +276,13 @@ impl Container {
         }
 
         // Create OCI bundle
-        let bundle_path = PathBuf::from("/tmp").join(format!("nucleus-oci-{}", self.config.name));
+        let bundle_dir = Builder::new()
+            .prefix("nucleus-oci-")
+            .tempdir_in("/tmp")
+            .map_err(|e| {
+                NucleusError::FilesystemError(format!("Failed to create OCI bundle dir: {}", e))
+            })?;
+        let bundle_path = bundle_dir.path().to_path_buf();
         let bundle = OciBundle::new(bundle_path, oci_config);
         bundle.create()?;
 
@@ -365,12 +364,12 @@ impl Container {
         // Set up handlers for common termination and control signals
         unsafe {
             for (signal, name) in [
-                (Signal::SIGTERM,  "SIGTERM"),
-                (Signal::SIGINT,   "SIGINT"),
-                (Signal::SIGHUP,   "SIGHUP"),
-                (Signal::SIGQUIT,  "SIGQUIT"),
-                (Signal::SIGUSR1,  "SIGUSR1"),
-                (Signal::SIGUSR2,  "SIGUSR2"),
+                (Signal::SIGTERM, "SIGTERM"),
+                (Signal::SIGINT, "SIGINT"),
+                (Signal::SIGHUP, "SIGHUP"),
+                (Signal::SIGQUIT, "SIGQUIT"),
+                (Signal::SIGUSR1, "SIGUSR1"),
+                (Signal::SIGUSR2, "SIGUSR2"),
             ] {
                 sigaction(signal, &action).map_err(|e| {
                     NucleusError::ExecError(format!("Failed to set {} handler: {}", name, e))

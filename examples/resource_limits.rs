@@ -12,13 +12,16 @@ use nucleus::resources::ResourceLimits;
 fn main() -> Result<()> {
     // Configure resource limits
     let limits = ResourceLimits::unlimited()
-        .with_memory("128M")?      // 128 MB memory limit
-        .with_cpu_cores(0.5)?      // 0.5 CPU cores (50% of one core)
-        .with_pids(50)?;           // Maximum 50 processes
+        .with_memory("128M")? // 128 MB memory limit
+        .with_cpu_cores(0.5)? // 0.5 CPU cores (50% of one core)
+        .with_pids(50)?; // Maximum 50 processes
 
     println!("Resource limits configured:");
     println!("  Memory: {:?} bytes", limits.memory_bytes);
-    println!("  CPU quota: {:?} µs / {:?} µs", limits.cpu_quota_us, limits.cpu_period_us);
+    println!(
+        "  CPU quota: {:?} µs / {:?} µs",
+        limits.cpu_quota_us, limits.cpu_period_us
+    );
     println!("  PIDs: {:?}", limits.pids_max);
 
     let config = ContainerConfig::new(

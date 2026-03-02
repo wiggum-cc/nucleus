@@ -1,6 +1,6 @@
 use crate::error::{NucleusError, Result};
 use nix::mount::{mount, MsFlags};
-use nix::sys::stat::{mknod, makedev, Mode, SFlag};
+use nix::sys::stat::{makedev, mknod, Mode, SFlag};
 use nix::unistd::chroot;
 use std::path::Path;
 use tracing::{debug, info, warn};
@@ -15,10 +15,7 @@ pub fn create_minimal_fs(root: &Path) -> Result<()> {
     for dir in dirs {
         let path = root.join(dir);
         std::fs::create_dir_all(&path).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to create directory {:?}: {}",
-                path, e
-            ))
+            NucleusError::FilesystemError(format!("Failed to create directory {:?}: {}", path, e))
         })?;
     }
 
@@ -59,7 +56,10 @@ pub fn create_dev_nodes(dev_path: &Path) -> Result<()> {
             }
             Err(e) => {
                 // In rootless mode, mknod fails - this is expected
-                warn!("Failed to create device node {:?}: {} (this is normal in rootless mode)", path, e);
+                warn!(
+                    "Failed to create device node {:?}: {} (this is normal in rootless mode)",
+                    path, e
+                );
                 failed_count += 1;
             }
         }
@@ -78,16 +78,12 @@ pub fn create_dev_nodes(dev_path: &Path) -> Result<()> {
 /// Bind mount essential host directories into container
 ///
 /// This allows host binaries to be accessible inside the container
-pub fn bind_mount_host_paths(root: &Path) -> Result<()> {
+pub fn bind_mount_host_paths(root: &Path, best_effort: bool) -> Result<()> {
     info!("Bind mounting host paths into container");
 
     // Essential paths to bind mount (read-only)
     let host_paths = vec![
-        "/bin",
-        "/usr",
-        "/lib",
-        "/lib64",
-        "/nix",  // For NixOS
+        "/bin", "/usr", "/lib", "/lib64", "/nix", // For NixOS
     ];
 
     for host_path in host_paths {
@@ -103,8 +99,14 @@ pub fn bind_mount_host_paths(root: &Path) -> Result<()> {
 
         // Create mount point
         if let Err(e) = std::fs::create_dir_all(&container_path) {
-            warn!("Failed to create mount point {:?}: {}", container_path, e);
-            continue;
+            if best_effort {
+                warn!("Failed to create mount point {:?}: {}", container_path, e);
+                continue;
+            }
+            return Err(NucleusError::FilesystemError(format!(
+                "Failed to create mount point {:?}: {}",
+                container_path, e
+            )));
         }
 
         // Attempt bind mount
@@ -119,7 +121,17 @@ pub fn bind_mount_host_paths(root: &Path) -> Result<()> {
                 info!("Bind mounted {} to {:?}", host_path, container_path);
             }
             Err(e) => {
-                warn!("Failed to bind mount {}: {} (continuing anyway)", host_path, e);
+                if best_effort {
+                    warn!(
+                        "Failed to bind mount {}: {} (continuing anyway)",
+                        host_path, e
+                    );
+                } else {
+                    return Err(NucleusError::FilesystemError(format!(
+                        "Failed to bind mount {}: {}",
+                        host_path, e
+                    )));
+                }
             }
         }
     }
@@ -130,7 +142,7 @@ pub fn bind_mount_host_paths(root: &Path) -> Result<()> {
 /// Mount procfs at the given path
 ///
 /// In rootless mode, procfs mounting should work due to user namespace capabilities
-pub fn mount_procfs(proc_path: &Path) -> Result<()> {
+pub fn mount_procfs(proc_path: &Path, best_effort: bool) -> Result<()> {
     info!("Mounting procfs at {:?}", proc_path);
 
     match mount(
@@ -145,9 +157,15 @@ pub fn mount_procfs(proc_path: &Path) -> Result<()> {
             Ok(())
         }
         Err(e) => {
-            warn!("Failed to mount procfs: {} (continuing anyway)", e);
-            // Don't fail - continue without procfs
-            Ok(())
+            if best_effort {
+                warn!("Failed to mount procfs: {} (continuing anyway)", e);
+                Ok(())
+            } else {
+                Err(NucleusError::FilesystemError(format!(
+                    "Failed to mount procfs: {}",
+                    e
+                )))
+            }
         }
     }
 }
@@ -156,7 +174,7 @@ pub fn mount_procfs(proc_path: &Path) -> Result<()> {
 ///
 /// This implements the transition: populated -> pivoted
 /// In rootless mode, this may fail - we'll just chdir instead
-pub fn switch_root(new_root: &Path) -> Result<()> {
+pub fn switch_root(new_root: &Path, allow_chdir_fallback: bool) -> Result<()> {
     info!("Switching root to {:?}", new_root);
 
     // Try pivot_root first (preferred method)
@@ -173,13 +191,20 @@ pub fn switch_root(new_root: &Path) -> Result<()> {
             match chroot_impl(new_root) {
                 Ok(()) => Ok(()),
                 Err(e2) => {
-                    warn!("chroot also failed ({}), using chdir only (rootless mode)", e2);
-                    // Just change directory - works in rootless
-                    std::env::set_current_dir(new_root).map_err(|e| {
-                        NucleusError::PivotRootError(format!("Failed to chdir: {}", e))
-                    })?;
-                    info!("Changed directory to {:?} (rootless mode)", new_root);
-                    Ok(())
+                    if allow_chdir_fallback {
+                        warn!(
+                            "chroot also failed ({}), using chdir only (rootless mode)",
+                            e2
+                        );
+                        // Just change directory - works in rootless
+                        std::env::set_current_dir(new_root).map_err(|e| {
+                            NucleusError::PivotRootError(format!("Failed to chdir: {}", e))
+                        })?;
+                        info!("Changed directory to {:?} (rootless mode)", new_root);
+                        Ok(())
+                    } else {
+                        Err(e2)
+                    }
                 }
             }
         }
@@ -203,19 +228,16 @@ fn pivot_root_impl(new_root: &Path) -> Result<()> {
     })?;
 
     // Perform pivot_root
-    pivot_root(new_root, &old_root).map_err(|e| {
-        NucleusError::PivotRootError(format!("pivot_root syscall failed: {}", e))
-    })?;
+    pivot_root(new_root, &old_root)
+        .map_err(|e| NucleusError::PivotRootError(format!("pivot_root syscall failed: {}", e)))?;
 
     // Change to new root
-    std::env::set_current_dir("/").map_err(|e| {
-        NucleusError::PivotRootError(format!("Failed to chdir to /: {}", e))
-    })?;
+    std::env::set_current_dir("/")
+        .map_err(|e| NucleusError::PivotRootError(format!("Failed to chdir to /: {}", e)))?;
 
     // Unmount old root
-    nix::mount::umount2("/.old_root", nix::mount::MntFlags::MNT_DETACH).map_err(|e| {
-        NucleusError::PivotRootError(format!("Failed to unmount old root: {}", e))
-    })?;
+    nix::mount::umount2("/.old_root", nix::mount::MntFlags::MNT_DETACH)
+        .map_err(|e| NucleusError::PivotRootError(format!("Failed to unmount old root: {}", e)))?;
 
     // Remove old root directory
     let _ = std::fs::remove_dir("/.old_root");
@@ -227,14 +249,12 @@ fn pivot_root_impl(new_root: &Path) -> Result<()> {
 ///
 /// chroot is less secure than pivot_root but works in more situations
 fn chroot_impl(new_root: &Path) -> Result<()> {
-    chroot(new_root).map_err(|e| {
-        NucleusError::PivotRootError(format!("chroot syscall failed: {}", e))
-    })?;
+    chroot(new_root)
+        .map_err(|e| NucleusError::PivotRootError(format!("chroot syscall failed: {}", e)))?;
 
     // Change to new root
-    std::env::set_current_dir("/").map_err(|e| {
-        NucleusError::PivotRootError(format!("Failed to chdir to /: {}", e))
-    })?;
+    std::env::set_current_dir("/")
+        .map_err(|e| NucleusError::PivotRootError(format!("Failed to chdir to /: {}", e)))?;
 
     info!("Successfully switched root using chroot");
 

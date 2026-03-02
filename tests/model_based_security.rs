@@ -7,7 +7,6 @@
 /// - irreversible_lockdown: Once seccomp is applied, can only move to locked
 /// - no_privilege_escalation: Cannot return to privileged state after dropping capabilities
 /// - Terminal state stability: Locked state is terminal
-
 use nucleus::security::SecurityState;
 
 #[test]
@@ -92,7 +91,11 @@ fn test_security_property_liveness() {
 
     for initial in states {
         // For each non-terminal state, verify there's a path to terminal
-        assert!(!initial.is_terminal(), "{:?} should not be terminal", initial);
+        assert!(
+            !initial.is_terminal(),
+            "{:?} should not be terminal",
+            initial
+        );
 
         // Verify we can reach a terminal state
         // (This is a simplified check - full path finding would be more complex)
@@ -115,7 +118,11 @@ fn test_security_property_liveness() {
             };
         }
 
-        assert!(can_progress, "Should be able to reach terminal from {:?}", initial);
+        assert!(
+            can_progress,
+            "Should be able to reach terminal from {:?}",
+            initial
+        );
     }
 }
 
@@ -131,12 +138,21 @@ fn test_security_all_transitions() {
     ];
 
     let valid_transitions = [
-        (SecurityState::Privileged, SecurityState::CapabilitiesDropped),
-        (SecurityState::CapabilitiesDropped, SecurityState::SeccompApplied),
+        (
+            SecurityState::Privileged,
+            SecurityState::CapabilitiesDropped,
+        ),
+        (
+            SecurityState::CapabilitiesDropped,
+            SecurityState::SeccompApplied,
+        ),
         (SecurityState::SeccompApplied, SecurityState::Locked),
         // Stuttering
         (SecurityState::Privileged, SecurityState::Privileged),
-        (SecurityState::CapabilitiesDropped, SecurityState::CapabilitiesDropped),
+        (
+            SecurityState::CapabilitiesDropped,
+            SecurityState::CapabilitiesDropped,
+        ),
         (SecurityState::SeccompApplied, SecurityState::SeccompApplied),
         (SecurityState::Locked, SecurityState::Locked),
     ];

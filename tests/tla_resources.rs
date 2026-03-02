@@ -1,7 +1,6 @@
 /// Model-based testing for resources module using tla-connect
 ///
 /// Replays traces from Nucleus_Resources_CgroupLifecycle.tla
-
 use anyhow::Result;
 use nucleus::resources::CgroupState;
 use serde::Deserialize;

@@ -1,7 +1,6 @@
 /// Model-based testing for filesystem module using tla-connect
 ///
 /// Replays traces from Nucleus_Filesystem_FilesystemLifecycle.tla
-
 use anyhow::Result;
 use nucleus::filesystem::FilesystemState;
 use serde::Deserialize;
@@ -111,7 +110,10 @@ fn test_filesystem_property_context_isolation() {
     };
 
     let result = driver.step(&invalid_step);
-    assert!(result.is_err(), "Should reject backwards transition from pivoted");
+    assert!(
+        result.is_err(),
+        "Should reject backwards transition from pivoted"
+    );
 }
 
 #[test]

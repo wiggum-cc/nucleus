@@ -162,9 +162,8 @@ impl NamespaceManager {
 
         info!("Setting hostname to: {}", hostname);
 
-        sethostname(hostname).map_err(|e| {
-            NucleusError::NamespaceError(format!("Failed to set hostname: {}", e))
-        })?;
+        sethostname(hostname)
+            .map_err(|e| NucleusError::NamespaceError(format!("Failed to set hostname: {}", e)))?;
 
         info!("Successfully set hostname to: {}", hostname);
 
