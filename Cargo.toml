@@ -34,3 +34,16 @@ tempfile = "3"
 proptest = "1"
 tla-connect = "0.0.1"
 itf = "0.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "context_populator"
+harness = false
+
+[[bench]]
+name = "resource_config"
+harness = false
+
+[[bench]]
+name = "seccomp_filter"
+harness = false

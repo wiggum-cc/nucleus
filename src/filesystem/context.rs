@@ -123,12 +123,54 @@ impl ContextPopulator {
     /// Check if a file should be excluded from copying
     fn should_exclude(&self, name: &std::ffi::OsStr) -> bool {
         let name_str = name.to_string_lossy();
+        let lower = name_str.to_lowercase();
 
-        // Exclude common build/cache directories
-        matches!(
+        // Exact matches: build artifacts, caches, sensitive directories
+        if matches!(
             name_str.as_ref(),
-            ".git" | "target" | "node_modules" | ".DS_Store" | "__pycache__"
-        )
+            ".git"
+                | "target"
+                | "node_modules"
+                | ".DS_Store"
+                | "__pycache__"
+                | ".svn"
+                | ".env"
+                | ".ssh"
+                | ".gnupg"
+                | ".aws"
+                | ".docker"
+        ) {
+            return true;
+        }
+
+        // Prefix patterns: .env.* files (e.g., .env.local, .env.production)
+        if name_str.starts_with(".env.") {
+            return true;
+        }
+
+        // Suffix patterns: editor swap files
+        if name_str.ends_with(".swp") || name_str.ends_with(".swo") {
+            return true;
+        }
+
+        // Suffix patterns: crypto material
+        if name_str.ends_with(".pem")
+            || name_str.ends_with(".key")
+            || name_str.ends_with(".p12")
+            || name_str.ends_with(".crt")
+            || name_str.ends_with(".pfx")
+            || name_str.ends_with(".jks")
+        {
+            return true;
+        }
+
+        // Contains patterns (case-insensitive): secrets and credentials
+        if lower.contains("credential") || lower.contains("secret") || lower.contains("private_key")
+        {
+            return true;
+        }
+
+        false
     }
 }
 
@@ -137,13 +179,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_should_exclude() {
-        let populator = ContextPopulator::new("/tmp/src", "/tmp/dst");
+    fn test_should_exclude_exact_matches() {
+        let p = ContextPopulator::new("/tmp/src", "/tmp/dst");
 
-        assert!(populator.should_exclude(std::ffi::OsStr::new(".git")));
-        assert!(populator.should_exclude(std::ffi::OsStr::new("target")));
-        assert!(populator.should_exclude(std::ffi::OsStr::new("node_modules")));
-        assert!(!populator.should_exclude(std::ffi::OsStr::new("src")));
-        assert!(!populator.should_exclude(std::ffi::OsStr::new("README.md")));
+        // Original exact matches
+        assert!(p.should_exclude(std::ffi::OsStr::new(".git")));
+        assert!(p.should_exclude(std::ffi::OsStr::new("target")));
+        assert!(p.should_exclude(std::ffi::OsStr::new("node_modules")));
+        assert!(p.should_exclude(std::ffi::OsStr::new(".DS_Store")));
+        assert!(p.should_exclude(std::ffi::OsStr::new("__pycache__")));
+
+        // New exact matches
+        assert!(p.should_exclude(std::ffi::OsStr::new(".svn")));
+        assert!(p.should_exclude(std::ffi::OsStr::new(".env")));
+        assert!(p.should_exclude(std::ffi::OsStr::new(".ssh")));
+        assert!(p.should_exclude(std::ffi::OsStr::new(".gnupg")));
+        assert!(p.should_exclude(std::ffi::OsStr::new(".aws")));
+        assert!(p.should_exclude(std::ffi::OsStr::new(".docker")));
+    }
+
+    #[test]
+    fn test_should_exclude_env_variants() {
+        let p = ContextPopulator::new("/tmp/src", "/tmp/dst");
+
+        assert!(p.should_exclude(std::ffi::OsStr::new(".env.local")));
+        assert!(p.should_exclude(std::ffi::OsStr::new(".env.production")));
+        assert!(p.should_exclude(std::ffi::OsStr::new(".env.development")));
+    }
+
+    #[test]
+    fn test_should_exclude_editor_swap() {
+        let p = ContextPopulator::new("/tmp/src", "/tmp/dst");
+
+        assert!(p.should_exclude(std::ffi::OsStr::new("file.swp")));
+        assert!(p.should_exclude(std::ffi::OsStr::new("file.swo")));
+    }
+
+    #[test]
+    fn test_should_exclude_crypto_material() {
+        let p = ContextPopulator::new("/tmp/src", "/tmp/dst");
+
+        assert!(p.should_exclude(std::ffi::OsStr::new("server.pem")));
+        assert!(p.should_exclude(std::ffi::OsStr::new("private.key")));
+        assert!(p.should_exclude(std::ffi::OsStr::new("cert.p12")));
+        assert!(p.should_exclude(std::ffi::OsStr::new("ca.crt")));
+        assert!(p.should_exclude(std::ffi::OsStr::new("keystore.pfx")));
+        assert!(p.should_exclude(std::ffi::OsStr::new("app.jks")));
+    }
+
+    #[test]
+    fn test_should_exclude_secrets_patterns() {
+        let p = ContextPopulator::new("/tmp/src", "/tmp/dst");
+
+        assert!(p.should_exclude(std::ffi::OsStr::new("credentials.json")));
+        assert!(p.should_exclude(std::ffi::OsStr::new("my_secret.txt")));
+        assert!(p.should_exclude(std::ffi::OsStr::new("private_key.pem")));
+        assert!(p.should_exclude(std::ffi::OsStr::new("AWS_CREDENTIALS")));
+        assert!(p.should_exclude(std::ffi::OsStr::new("app-secret-config.yaml")));
+    }
+
+    #[test]
+    fn test_should_not_exclude_legitimate_files() {
+        let p = ContextPopulator::new("/tmp/src", "/tmp/dst");
+
+        assert!(!p.should_exclude(std::ffi::OsStr::new("src")));
+        assert!(!p.should_exclude(std::ffi::OsStr::new("README.md")));
+        assert!(!p.should_exclude(std::ffi::OsStr::new("main.rs")));
+        assert!(!p.should_exclude(std::ffi::OsStr::new("Cargo.toml")));
+        assert!(!p.should_exclude(std::ffi::OsStr::new("my_file.rs")));
+        assert!(!p.should_exclude(std::ffi::OsStr::new("config.yaml")));
     }
 }

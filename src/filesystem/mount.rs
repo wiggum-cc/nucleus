@@ -37,8 +37,11 @@ pub fn create_dev_nodes(dev_path: &Path) -> Result<()> {
     let devices = vec![
         ("null", SFlag::S_IFCHR, 1, 3),
         ("zero", SFlag::S_IFCHR, 1, 5),
+        ("full", SFlag::S_IFCHR, 1, 7),
         ("random", SFlag::S_IFCHR, 1, 8),
         ("urandom", SFlag::S_IFCHR, 1, 9),
+        ("tty", SFlag::S_IFCHR, 5, 0),
+        ("console", SFlag::S_IFCHR, 5, 1),
     ];
 
     let mut created_count = 0;

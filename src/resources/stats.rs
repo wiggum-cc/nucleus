@@ -11,6 +11,9 @@ pub struct ResourceStats {
     /// Memory limit in bytes (0 = unlimited)
     pub memory_limit: u64,
 
+    /// Swap usage in bytes
+    pub memory_swap_usage: u64,
+
     /// CPU usage in nanoseconds
     pub cpu_usage_ns: u64,
 
@@ -37,6 +40,9 @@ impl ResourceStats {
             0.0
         };
 
+        // Read swap usage
+        let memory_swap_usage = Self::read_memory_swap(cgroup_path).unwrap_or(0);
+
         // Read CPU stats
         let cpu_usage_ns = Self::read_cpu_usage(cgroup_path)?;
 
@@ -46,6 +52,7 @@ impl ResourceStats {
         Ok(Self {
             memory_usage,
             memory_limit,
+            memory_swap_usage,
             cpu_usage_ns,
             pid_count,
             memory_percent,
@@ -73,6 +80,12 @@ impl ResourceStats {
                 NucleusError::ResourceError(format!("Failed to parse memory.max: {}", e))
             })
         }
+    }
+
+    /// Read memory.swap.current (swap usage)
+    fn read_memory_swap(cgroup_path: &Path) -> Result<u64> {
+        let path = cgroup_path.join("memory.swap.current");
+        Self::read_u64_file(&path)
     }
 
     /// Read cpu.stat (CPU usage)

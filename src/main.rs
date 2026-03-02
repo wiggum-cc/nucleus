@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use nucleus::container::{Container, ContainerConfig, ContainerStateManager};
 use nucleus::isolation::NamespaceConfig;
-use nucleus::resources::{ResourceLimits, ResourceStats};
+use nucleus::resources::{IoDeviceLimit, ResourceLimits, ResourceStats};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -33,6 +33,18 @@ enum Commands {
         /// Hostname to set in container (requires UTS namespace)
         #[arg(long)]
         hostname: Option<String>,
+
+        /// CPU scheduling weight (1-10000)
+        #[arg(long)]
+        cpu_weight: Option<u64>,
+
+        /// I/O device limit (repeatable, format: "major:minor riops=N wbps=N")
+        #[arg(long = "io-limit")]
+        io_limits: Vec<String>,
+
+        /// Enable swap (by default swap is disabled when --memory is set)
+        #[arg(long)]
+        swap: bool,
 
         /// Container runtime (default: native, or gvisor)
         #[arg(long, default_value = "native")]
@@ -146,8 +158,8 @@ fn main() -> Result<()> {
 
             // Print header
             println!(
-                "{:<15} {:<10} {:<15} {:<15} {:<10} {:<10}",
-                "CONTAINER ID", "CPU TIME", "MEM USAGE", "MEM LIMIT", "MEM %", "PIDS"
+                "{:<15} {:<10} {:<15} {:<15} {:<10} {:<10} {:<10}",
+                "CONTAINER ID", "CPU TIME", "MEM USAGE", "MEM LIMIT", "MEM %", "SWAP", "PIDS"
             );
 
             // Print stats for each container
@@ -166,14 +178,16 @@ fn main() -> Result<()> {
                                 "unlimited".to_string()
                             };
                             let cpu_time = ResourceStats::format_cpu_time(stats.cpu_usage_ns);
+                            let swap_usage = ResourceStats::format_memory(stats.memory_swap_usage);
 
                             println!(
-                                "{:<15} {:<10} {:<15} {:<15} {:<10.2} {:<10}",
+                                "{:<15} {:<10} {:<15} {:<15} {:<10.2} {:<10} {:<10}",
                                 &state.id[..state.id.len().min(15)],
                                 cpu_time,
                                 mem_usage,
                                 mem_limit,
                                 stats.memory_percent,
+                                swap_usage,
                                 stats.pid_count
                             );
                         }
@@ -193,6 +207,9 @@ fn main() -> Result<()> {
             context,
             memory,
             cpus,
+            cpu_weight,
+            io_limits,
+            swap,
             hostname,
             runtime,
             rootless,
@@ -218,6 +235,22 @@ fn main() -> Result<()> {
             if let Some(cores) = cpus {
                 limits = limits.with_cpu_cores(cores)?;
                 info!("CPU limit: {} cores", cores);
+            }
+
+            if let Some(weight) = cpu_weight {
+                limits = limits.with_cpu_weight(weight)?;
+                info!("CPU weight: {}", weight);
+            }
+
+            for io_spec in &io_limits {
+                let io_limit = IoDeviceLimit::parse(io_spec)?;
+                limits = limits.with_io_limit(io_limit);
+                info!("I/O limit: {}", io_spec);
+            }
+
+            if swap {
+                limits = limits.with_swap_enabled();
+                info!("Swap enabled");
             }
 
             // Build configuration

@@ -217,6 +217,29 @@ impl SeccompManager {
         Ok(rules)
     }
 
+    /// Compile the minimal BPF filter without applying it
+    ///
+    /// This is useful for benchmarking filter compilation overhead
+    /// without the irreversible side effect of applying the filter.
+    pub fn compile_minimal_filter() -> Result<BpfProgram> {
+        let rules = Self::minimal_filter()?;
+        let filter = SeccompFilter::new(
+            rules,
+            SeccompAction::Errno(libc::EPERM as u32),
+            SeccompAction::Allow,
+            std::env::consts::ARCH.try_into().map_err(|e| {
+                NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
+            })?,
+        )
+        .map_err(|e| NucleusError::SeccompError(format!("Failed to create seccomp filter: {}", e)))?;
+
+        let bpf_prog: BpfProgram = filter.try_into().map_err(|e| {
+            NucleusError::SeccompError(format!("Failed to compile BPF program: {}", e))
+        })?;
+
+        Ok(bpf_prog)
+    }
+
     /// Apply seccomp filter
     ///
     /// This implements the transition: no_filter -> whitelist_active

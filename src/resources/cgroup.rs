@@ -55,6 +55,18 @@ impl Cgroup {
             debug!("Set memory.max = {}", memory_bytes);
         }
 
+        // Set memory soft limit (high watermark)
+        if let Some(memory_high) = limits.memory_high {
+            self.write_value("memory.high", &memory_high.to_string())?;
+            debug!("Set memory.high = {}", memory_high);
+        }
+
+        // Set swap limit
+        if let Some(swap_max) = limits.memory_swap_max {
+            self.write_value("memory.swap.max", &swap_max.to_string())?;
+            debug!("Set memory.swap.max = {}", swap_max);
+        }
+
         // Set CPU limit
         if let Some(cpu_quota_us) = limits.cpu_quota_us {
             let cpu_max = format!("{} {}", cpu_quota_us, limits.cpu_period_us);
@@ -62,10 +74,23 @@ impl Cgroup {
             debug!("Set cpu.max = {}", cpu_max);
         }
 
+        // Set CPU weight
+        if let Some(cpu_weight) = limits.cpu_weight {
+            self.write_value("cpu.weight", &cpu_weight.to_string())?;
+            debug!("Set cpu.weight = {}", cpu_weight);
+        }
+
         // Set PID limit
         if let Some(pids_max) = limits.pids_max {
             self.write_value("pids.max", &pids_max.to_string())?;
             debug!("Set pids.max = {}", pids_max);
+        }
+
+        // Set I/O limits
+        for io_limit in &limits.io_limits {
+            let line = io_limit.to_io_max_line();
+            self.write_value("io.max", &line)?;
+            debug!("Set io.max: {}", line);
         }
 
         self.configured = true;
@@ -162,8 +187,12 @@ mod tests {
     fn test_resource_limits_unlimited() {
         let limits = ResourceLimits::unlimited();
         assert!(limits.memory_bytes.is_none());
+        assert!(limits.memory_high.is_none());
+        assert!(limits.memory_swap_max.is_none());
         assert!(limits.cpu_quota_us.is_none());
+        assert!(limits.cpu_weight.is_none());
         assert!(limits.pids_max.is_none());
+        assert!(limits.io_limits.is_empty());
     }
 
     // Note: Testing actual cgroup operations requires root privileges
