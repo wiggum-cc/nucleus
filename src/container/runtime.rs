@@ -99,7 +99,7 @@ impl Container {
                     {
                         warn!(
                             "Running in rootless mode: requested resource limits cannot be \
-                             enforced — cgroup creation requires root ({})",
+                             enforced – cgroup creation requires root ({})",
                             e
                         );
                     } else {

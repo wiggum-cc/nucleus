@@ -85,12 +85,12 @@ Entry point that orchestrates all isolation mechanisms.
 Multi-container lifecycle operations.
 
 **Operations:**
-- **Stop** — SIGTERM → wait(timeout) → SIGKILL
-- **Kill** — Send arbitrary signal
-- **Remove** — Delete state file (verify stopped first)
-- **Attach** — Enter container namespaces via `setns(2)`, fork/exec
-- **Checkpoint** — CRIU dump to directory
-- **Restore** — CRIU restore from directory
+- **Stop** – SIGTERM → wait(timeout) → SIGKILL
+- **Kill** – Send arbitrary signal
+- **Remove** – Delete state file (verify stopped first)
+- **Attach** – Enter container namespaces via `setns(2)`, fork/exec
+- **Checkpoint** – CRIU dump to directory
+- **Restore** – CRIU restore from directory
 
 **Container Resolution:**
 - Exact ID match → exact name match → ID prefix match

@@ -42,7 +42,7 @@ impl Driver for IsolationDriver {
     type State = IsolationSpecState;
 
     fn step(&mut self, step: &Step) -> Result<()> {
-        // Skip stuttering steps (UNCHANGED vars — pc stays the same)
+        // Skip stuttering steps (UNCHANGED vars – pc stays the same)
         if let Some(p) = spec_pc(step) {
             if p == self.pc {
                 return Ok(());
@@ -51,7 +51,7 @@ impl Driver for IsolationDriver {
 
         switch!(step {
             "init" => {
-                // Initial state — already set by new()
+                // Initial state – already set by new()
             },
             "uninitialized_create_namespaces" => {
                 // TLA+ transition: uninitialized -> unshared

@@ -5,7 +5,7 @@ use landlock::{
 };
 use tracing::{debug, info, warn};
 
-/// Target ABI — covers up to Linux 6.12 features (Truncate, IoctlDev, Refer, etc.).
+/// Target ABI – covers up to Linux 6.12 features (Truncate, IoctlDev, Refer, etc.).
 /// The landlock crate gracefully degrades for older kernels.
 const TARGET_ABI: ABI = ABI::V5;
 

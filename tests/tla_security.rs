@@ -43,7 +43,7 @@ impl Driver for SecurityDriver {
     type State = SecuritySpecState;
 
     fn step(&mut self, step: &Step) -> Result<()> {
-        // Skip stuttering steps (UNCHANGED vars — pc stays the same)
+        // Skip stuttering steps (UNCHANGED vars – pc stays the same)
         if let Some(p) = spec_pc(step) {
             if p == self.pc {
                 return Ok(());

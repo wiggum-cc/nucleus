@@ -114,7 +114,7 @@ impl ContainerState {
         match std::fs::read_to_string(&stat_path) {
             Ok(content) => {
                 if self.start_ticks == 0 {
-                    // Legacy state without start_ticks — fall back to existence check
+                    // Legacy state without start_ticks – fall back to existence check
                     return true;
                 }
                 Self::parse_start_ticks(&content)

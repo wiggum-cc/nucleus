@@ -120,7 +120,7 @@ pub fn bind_mount_host_paths(root: &Path, best_effort: bool) -> Result<()> {
             None::<&str>,
         ) {
             Ok(_) => {
-                // Remount as read-only — required because MS_RDONLY is ignored on initial bind
+                // Remount as read-only – required because MS_RDONLY is ignored on initial bind
                 mount(
                     None::<&str>,
                     &container_path,
