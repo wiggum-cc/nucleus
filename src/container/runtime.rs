@@ -6,7 +6,9 @@ use crate::filesystem::{
 };
 use crate::isolation::NamespaceManager;
 use crate::resources::Cgroup;
-use crate::security::{CapabilityManager, GVisorRuntime, OciBundle, OciConfig, SeccompManager};
+use crate::security::{
+    CapabilityManager, GVisorRuntime, LandlockManager, OciBundle, OciConfig, SeccompManager,
+};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, ForkResult, Pid};
@@ -234,7 +236,11 @@ impl Container {
         let mut seccomp_mgr = SeccompManager::new();
         seccomp_mgr.apply_minimal_filter_with_mode(is_rootless)?;
 
-        // 11. Exec target process
+        // 11. Apply Landlock filesystem policy
+        let mut landlock_mgr = LandlockManager::new();
+        landlock_mgr.apply_container_policy_with_mode(is_rootless)?;
+
+        // 12. Exec target process
         self.exec_command()?;
 
         // Should never reach here

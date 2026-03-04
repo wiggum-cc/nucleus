@@ -50,8 +50,22 @@ impl Driver for SecurityDriver {
                 }
                 self.state = SecurityState::SeccompApplied;
             },
+            "seccomp_applied_apply_landlock" => {
+                // TLA+ transition: seccomp_applied -> landlock_applied
+                if self.state != SecurityState::SeccompApplied {
+                    anyhow::bail!("Invalid state for apply_landlock: {:?}", self.state);
+                }
+                self.state = SecurityState::LandlockApplied;
+            },
+            "landlock_applied_finalize" => {
+                // TLA+ transition: landlock_applied -> locked
+                if self.state != SecurityState::LandlockApplied {
+                    anyhow::bail!("Invalid state for finalize: {:?}", self.state);
+                }
+                self.state = SecurityState::Locked;
+            },
+            // Legacy: support old traces that go directly seccomp_applied -> locked
             "seccomp_applied_finalize" => {
-                // TLA+ transition: seccomp_applied -> locked
                 if self.state != SecurityState::SeccompApplied {
                     anyhow::bail!("Invalid state for finalize: {:?}", self.state);
                 }
@@ -67,6 +81,7 @@ impl State<SecurityDriver> for SecuritySpecState {
             SecurityState::Privileged => "privileged",
             SecurityState::CapabilitiesDropped => "capabilities_dropped",
             SecurityState::SeccompApplied => "seccomp_applied",
+            SecurityState::LandlockApplied => "landlock_applied",
             SecurityState::Locked => "locked",
         };
 

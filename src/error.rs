@@ -23,6 +23,9 @@ pub enum NucleusError {
     #[error("Failed to apply seccomp filter: {0}")]
     SeccompError(String),
 
+    #[error("Failed to apply Landlock policy: {0}")]
+    LandlockError(String),
+
     #[error("Invalid resource limit: {0}")]
     InvalidResourceLimit(String),
 

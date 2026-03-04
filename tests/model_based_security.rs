@@ -4,18 +4,19 @@
 /// defined in Nucleus_Security_SecurityEnforcement.tla
 ///
 /// Properties verified:
-/// - irreversible_lockdown: Once seccomp is applied, can only move to locked
+/// - irreversible_lockdown: Once security layers are applied, can only move forward to locked
 /// - no_privilege_escalation: Cannot return to privileged state after dropping capabilities
 /// - Terminal state stability: Locked state is terminal
 use nucleus::security::SecurityState;
 
 #[test]
 fn test_security_state_machine_valid_path() {
-    // Verify the happy path: privileged -> capabilities_dropped -> seccomp_applied -> locked
+    // Verify the happy path: privileged -> capabilities_dropped -> seccomp_applied -> landlock_applied -> locked
     let states = vec![
         SecurityState::Privileged,
         SecurityState::CapabilitiesDropped,
         SecurityState::SeccompApplied,
+        SecurityState::LandlockApplied,
         SecurityState::Locked,
     ];
 
@@ -38,11 +39,20 @@ fn test_security_property_irreversible_lockdown() {
 
     // Valid transitions
     assert!(state.can_transition_to(SecurityState::SeccompApplied));
-    assert!(state.can_transition_to(SecurityState::Locked));
+    assert!(state.can_transition_to(SecurityState::LandlockApplied));
 
-    // Invalid transitions
+    // Invalid transitions (cannot skip to locked, cannot go backwards)
+    assert!(!state.can_transition_to(SecurityState::Locked));
     assert!(!state.can_transition_to(SecurityState::Privileged));
     assert!(!state.can_transition_to(SecurityState::CapabilitiesDropped));
+
+    // Landlock also has irreversible lockdown property
+    let ll_state = SecurityState::LandlockApplied;
+    assert!(ll_state.can_transition_to(SecurityState::LandlockApplied));
+    assert!(ll_state.can_transition_to(SecurityState::Locked));
+    assert!(!ll_state.can_transition_to(SecurityState::Privileged));
+    assert!(!ll_state.can_transition_to(SecurityState::CapabilitiesDropped));
+    assert!(!ll_state.can_transition_to(SecurityState::SeccompApplied));
 }
 
 #[test]
@@ -72,6 +82,7 @@ fn test_security_property_terminal_stable() {
     assert!(!state.can_transition_to(SecurityState::Privileged));
     assert!(!state.can_transition_to(SecurityState::CapabilitiesDropped));
     assert!(!state.can_transition_to(SecurityState::SeccompApplied));
+    assert!(!state.can_transition_to(SecurityState::LandlockApplied));
 
     // Can stay in same state (stuttering)
     assert!(state.can_transition_to(SecurityState::Locked));
@@ -87,6 +98,7 @@ fn test_security_property_liveness() {
         SecurityState::Privileged,
         SecurityState::CapabilitiesDropped,
         SecurityState::SeccompApplied,
+        SecurityState::LandlockApplied,
     ];
 
     for initial in states {
@@ -113,7 +125,8 @@ fn test_security_property_liveness() {
             current = match current {
                 SecurityState::Privileged => SecurityState::CapabilitiesDropped,
                 SecurityState::CapabilitiesDropped => SecurityState::SeccompApplied,
-                SecurityState::SeccompApplied => SecurityState::Locked,
+                SecurityState::SeccompApplied => SecurityState::LandlockApplied,
+                SecurityState::LandlockApplied => SecurityState::Locked,
                 SecurityState::Locked => break,
             };
         }
@@ -134,6 +147,7 @@ fn test_security_all_transitions() {
         SecurityState::Privileged,
         SecurityState::CapabilitiesDropped,
         SecurityState::SeccompApplied,
+        SecurityState::LandlockApplied,
         SecurityState::Locked,
     ];
 
@@ -146,7 +160,11 @@ fn test_security_all_transitions() {
             SecurityState::CapabilitiesDropped,
             SecurityState::SeccompApplied,
         ),
-        (SecurityState::SeccompApplied, SecurityState::Locked),
+        (
+            SecurityState::SeccompApplied,
+            SecurityState::LandlockApplied,
+        ),
+        (SecurityState::LandlockApplied, SecurityState::Locked),
         // Stuttering
         (SecurityState::Privileged, SecurityState::Privileged),
         (
@@ -154,6 +172,10 @@ fn test_security_all_transitions() {
             SecurityState::CapabilitiesDropped,
         ),
         (SecurityState::SeccompApplied, SecurityState::SeccompApplied),
+        (
+            SecurityState::LandlockApplied,
+            SecurityState::LandlockApplied,
+        ),
         (SecurityState::Locked, SecurityState::Locked),
     ];
 
