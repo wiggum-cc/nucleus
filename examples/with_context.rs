@@ -8,7 +8,6 @@ use anyhow::Result;
 use nucleus::container::{Container, ContainerConfig};
 use nucleus::isolation::NamespaceConfig;
 use nucleus::resources::ResourceLimits;
-use std::path::PathBuf;
 use tempfile::TempDir;
 
 fn main() -> Result<()> {
@@ -27,7 +26,7 @@ fn main() -> Result<()> {
         .with_cpu_cores(2.0)?;
 
     let config = ContainerConfig::new(
-        "context-example".to_string(),
+        Some("context-example".to_string()),
         vec![
             "/bin/sh".to_string(),
             "-c".to_string(),

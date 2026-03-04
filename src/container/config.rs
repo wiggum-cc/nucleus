@@ -1,11 +1,25 @@
 use crate::isolation::{NamespaceConfig, UserNamespaceConfig};
 use crate::resources::ResourceLimits;
 use std::path::PathBuf;
+use std::time::SystemTime;
+
+/// Generate a unique 12-hex-char container ID from timestamp and PID
+pub fn generate_container_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let pid = std::process::id() as u64;
+    format!("{:012x}", (nanos ^ pid) & 0xFFFF_FFFF_FFFF)
+}
 
 /// Container configuration
 #[derive(Debug, Clone)]
 pub struct ContainerConfig {
-    /// Container name/ID
+    /// Unique container ID (auto-generated 12 hex chars)
+    pub id: String,
+
+    /// User-supplied container name (optional, defaults to ID)
     pub name: String,
 
     /// Command to execute in the container
@@ -31,31 +45,37 @@ pub struct ContainerConfig {
 
     /// Whether to use OCI bundle format (for gVisor)
     pub use_oci_bundle: bool,
+
+    /// Network mode
+    pub network: crate::network::NetworkMode,
+
+    /// Context mode (copy or bind mount)
+    pub context_mode: crate::filesystem::ContextMode,
 }
 
 impl ContainerConfig {
-    pub fn new(name: String, command: Vec<String>) -> Self {
+    pub fn new(name: Option<String>, command: Vec<String>) -> Self {
+        let id = generate_container_id();
+        let name = name.unwrap_or_else(|| id.clone());
         Self {
+            id,
             name: name.clone(),
             command,
             context_dir: None,
             limits: ResourceLimits::default(),
             namespaces: NamespaceConfig::default(),
             user_ns_config: None,
-            hostname: Some(name), // Default hostname to container name
+            hostname: Some(name),
             use_gvisor: false,
             use_oci_bundle: false,
+            network: crate::network::NetworkMode::None,
+            context_mode: crate::filesystem::ContextMode::Copy,
         }
     }
 
     /// Enable rootless mode with user namespace mapping
-    ///
-    /// This enables the user namespace and configures UID/GID mapping
-    /// to map container root (UID/GID 0) to the current user
     pub fn with_rootless(mut self) -> Self {
-        // Enable user namespace
         self.namespaces.user = true;
-        // Configure UID/GID mapping for rootless mode
         self.user_ns_config = Some(UserNamespaceConfig::rootless());
         self
     }
@@ -95,7 +115,17 @@ impl ContainerConfig {
     /// Enable OCI bundle format (automatically enables gVisor)
     pub fn with_oci_bundle(mut self) -> Self {
         self.use_oci_bundle = true;
-        self.use_gvisor = true; // OCI bundle requires gVisor
+        self.use_gvisor = true;
+        self
+    }
+
+    pub fn with_network(mut self, mode: crate::network::NetworkMode) -> Self {
+        self.network = mode;
+        self
+    }
+
+    pub fn with_context_mode(mut self, mode: crate::filesystem::ContextMode) -> Self {
+        self.context_mode = mode;
         self
     }
 }

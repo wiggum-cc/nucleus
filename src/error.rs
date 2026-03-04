@@ -44,6 +44,21 @@ pub enum NucleusError {
     #[error("gVisor runtime error: {0}")]
     GVisorError(String),
 
+    #[error("Container not found: {0}")]
+    ContainerNotFound(String),
+
+    #[error("Ambiguous container reference: {0}")]
+    AmbiguousContainer(String),
+
+    #[error("Checkpoint error: {0}")]
+    CheckpointError(String),
+
+    #[error("Network error: {0}")]
+    NetworkError(String),
+
+    #[error("Attach error: {0}")]
+    AttachError(String),
+
     #[error("Syscall error: {0}")]
     SyscallError(#[from] nix::Error),
 

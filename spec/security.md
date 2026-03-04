@@ -25,9 +25,9 @@ Nucleus employs multiple layers of security:
 - tmpfs root prevents persistence
 
 **Network Namespace:**
-- No network access by default
-- Cannot bind to host ports
-- Cannot sniff host traffic
+- No network access by default (None mode)
+- Optional host mode shares host network stack
+- Optional bridge mode with controlled NAT
 
 **UTS Namespace:**
 - Isolated hostname/domainname
@@ -84,7 +84,32 @@ userfaultfd     # User fault handling
 io_uring        # Async I/O (potential escape vector)
 ```
 
-### 4. cgroups (Resource Limits)
+### 4. Landlock (Filesystem Access Control)
+
+**Path-based access restrictions using Linux LSM (kernel 5.13+):**
+
+Applied after pivot_root, Landlock restricts what the container process can do with files it can see:
+
+| Path | Access |
+|------|--------|
+| `/bin`, `/usr`, `/sbin` | Read + Execute |
+| `/lib`, `/lib64`, `/lib32` | Read |
+| `/etc`, `/dev`, `/proc` | Read |
+| `/tmp` | Full (read, write, create, remove) |
+| `/context` | Read-only |
+| `/` | Directory traversal only (ReadDir) |
+| Everything else | **Denied** |
+
+**Properties:**
+- Irreversible once applied (kernel-enforced)
+- Stackable with seccomp and capabilities (independent enforcement)
+- Unprivileged (works in rootless mode)
+- Graceful degradation on kernels without Landlock support
+
+**Why this matters:**
+Even if an attacker escapes the mount namespace (e.g., via a kernel bug), Landlock's LSM-level enforcement remains as an independent barrier. Namespaces control what you *see*; Landlock controls what you can *do* with what you see.
+
+### 5. cgroups (Resource Limits)
 
 **Memory limits:**
 - `memory.max` - Hard limit, OOM kill if exceeded
@@ -101,7 +126,7 @@ io_uring        # Async I/O (potential escape vector)
 **PID limits:**
 - `pids.max` - Maximum number of processes (prevent fork bombs)
 
-### 5. gVisor Integration (Optional)
+### 6. gVisor Integration (Optional)
 
 When `--runtime gvisor`:
 - Use runsc (gVisor runtime)
@@ -110,10 +135,40 @@ When `--runtime gvisor`:
 - Reduced kernel attack surface (~70 syscalls → ~200 gVisor syscalls)
 
 **Trade-offs:**
-- ✓ Stronger isolation
-- ✓ Smaller kernel attack surface
-- ✗ Performance overhead (~10-30%)
-- ✗ Some syscalls unsupported
+- Stronger isolation
+- Smaller kernel attack surface
+- Performance overhead (~10-30%)
+- Some syscalls unsupported
+
+### 7. Container Ownership
+
+**Access control for multi-container management:**
+- `creator_uid` stored in container state
+- Attach requires root or same `creator_uid`
+- Prevents unprivileged users from accessing others' containers
+
+### 8. Checkpoint Security
+
+**CRIU checkpoint/restore security considerations:**
+- Output directory created with mode 0o700 (process memory may contain secrets)
+- Requires root (`CAP_SYS_PTRACE`)
+- Rootless mode returns error (not silently degraded)
+
+### 9. Networking Security
+
+**None mode (default):**
+- Complete network isolation
+- No egress or ingress traffic possible
+
+**Host mode:**
+- Full host network access (explicit opt-in)
+- No additional isolation
+
+**Bridge mode:**
+- Controlled NAT via iptables
+- Port forwarding limited to explicitly published ports
+- Requires root (degrades to None in rootless with warning)
+- Container IP in private subnet (10.0.42.0/24)
 
 ## Attack Scenarios
 
@@ -124,6 +179,7 @@ When `--runtime gvisor`:
 **Mitigations:**
 - Seccomp blocks dangerous syscalls
 - Capabilities prevent privileged operations
+- Landlock restricts filesystem access at LSM level (independent of namespaces)
 - gVisor reduces kernel attack surface
 - User namespaces (rootless mode)
 
@@ -148,6 +204,8 @@ When `--runtime gvisor`:
 - Mount namespace isolation
 - tmpfs root (no host filesystem access)
 - No bind mounts by default
+- Landlock restricts file operations even within visible paths
+- Container ownership (creator_uid) for attach
 
 **Residual risk:** Minimal (requires explicit bind mount)
 
@@ -162,7 +220,19 @@ When `--runtime gvisor`:
 
 **Residual risk:** Minimal
 
-### 5. Side Channel Attacks
+### 5. Network-Based Attacks
+
+**Attack:** Reach internal services or exfiltrate data
+
+**Mitigations:**
+- No networking by default
+- Bridge mode requires explicit opt-in and root
+- Only published ports are forwarded
+- Rootless cannot enable bridge mode
+
+**Residual risk:** Depends on network mode chosen
+
+### 6. Side Channel Attacks
 
 **Attack:** Spectre/Meltdown, cache timing
 
@@ -176,11 +246,13 @@ When `--runtime gvisor`:
 
 ### For Nucleus Users
 
-1. **Never mount sensitive host paths** - Avoid `--bind /etc` or similar
+1. **Never mount sensitive host paths** - Avoid unnecessary bind mounts
 2. **Use minimal resource limits** - Don't over-provision
 3. **Enable gVisor for untrusted code** - `--runtime gvisor`
 4. **Run rootless when possible** - Use user namespaces
 5. **Keep kernel updated** - Security patches are critical
+6. **Use `--network none` unless needed** - Default is safest
+7. **Use `--context-mode bind` carefully** - Read-only but exposes host filesystem structure
 
 ### For Nucleus Developers
 
@@ -197,13 +269,18 @@ When `--runtime gvisor`:
 | Namespaces | All 6 | All 6 |
 | Capabilities | Drop most | Drop all (default) |
 | Seccomp | Whitelist (~300) | Whitelist (~100) |
+| Landlock | No | Yes (path-based ACLs) |
 | cgroups | v1/v2 | v2 only |
-| Rootless | Yes | Yes (planned) |
+| Rootless | Yes | Yes |
 | gVisor | Optional | Optional |
-| AppArmor/SELinux | Yes | Planned |
+| AppArmor/SELinux | Yes | Landlock (kernel-native) |
+| Networking | Full CNI | None/Host/Bridge |
+| Checkpoint | Optional (CRIU) | Optional (CRIU) |
+| Ownership | Root/socket | creator_uid |
 
 Nucleus aims for a **smaller attack surface** by:
 - No daemon (smaller code)
 - Stricter seccomp defaults
 - Ephemeral-only (no persistence concerns)
 - Simpler design (fewer features = fewer bugs)
+- No networking by default

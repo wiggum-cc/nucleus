@@ -44,6 +44,18 @@ impl FilesystemState {
     pub fn is_terminal(&self) -> bool {
         matches!(self, FilesystemState::UnmountedFinal)
     }
+
+    /// Transition to the next state, returning an error if the transition is invalid
+    pub fn transition(self, next: FilesystemState) -> crate::error::Result<FilesystemState> {
+        if self.can_transition_to(next) {
+            Ok(next)
+        } else {
+            Err(crate::error::NucleusError::InvalidStateTransition {
+                from: format!("{:?}", self),
+                to: format!("{:?}", next),
+            })
+        }
+    }
 }
 
 #[cfg(test)]

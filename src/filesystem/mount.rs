@@ -110,15 +110,31 @@ pub fn bind_mount_host_paths(root: &Path, best_effort: bool) -> Result<()> {
         }
 
         // Attempt bind mount
+        // Note: Linux ignores MS_RDONLY on the initial bind mount call.
+        // A second remount is required to actually enforce read-only.
         match mount(
             Some(host),
             &container_path,
             None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_RDONLY | MsFlags::MS_REC,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
             None::<&str>,
         ) {
             Ok(_) => {
-                info!("Bind mounted {} to {:?}", host_path, container_path);
+                // Remount as read-only — required because MS_RDONLY is ignored on initial bind
+                mount(
+                    None::<&str>,
+                    &container_path,
+                    None::<&str>,
+                    MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY | MsFlags::MS_REC,
+                    None::<&str>,
+                )
+                .map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to remount {} as read-only: {}",
+                        host_path, e
+                    ))
+                })?;
+                info!("Bind mounted {} to {:?} (read-only)", host_path, container_path);
             }
             Err(e) => {
                 if best_effort {
@@ -193,9 +209,11 @@ pub fn switch_root(new_root: &Path, allow_chdir_fallback: bool) -> Result<()> {
                 Err(e2) => {
                     if allow_chdir_fallback {
                         warn!(
-                            "chroot also failed ({}), using chdir only (rootless mode)",
-                            e2
+                            "SECURITY WARNING: pivot_root and chroot both failed. \
+                             chdir fallback provides NO filesystem isolation. \
+                             Landlock is the only remaining filesystem defense."
                         );
+                        warn!("chroot failure reason: {}", e2);
                         // Just change directory - works in rootless
                         std::env::set_current_dir(new_root).map_err(|e| {
                             NucleusError::PivotRootError(format!("Failed to chdir: {}", e))

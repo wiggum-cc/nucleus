@@ -8,7 +8,7 @@ Nucleus is a minimalist container runtime designed specifically for AI agents ru
 
 AI agents need isolated, ephemeral execution environments with pre-populated context. Traditional containers are too heavyweight. Nucleus provides:
 
-- **Zero-overhead isolation** — Direct use of cgroups, namespaces, chroot, capabilities, and seccomp
+- **Zero-overhead isolation** — Direct use of cgroups, namespaces, chroot, capabilities, seccomp, and Landlock
 - **Memory-backed filesystems** — Container disk mapped to tmpfs/ramfs, pre-populated with agent context
 - **gVisor integration** — Optional application kernel for enhanced security
 - **Agent-optimized** — Fast startup, pre-seeded with files agents can read/grep
@@ -23,6 +23,7 @@ Nucleus leverages Linux kernel isolation primitives:
 - **chroot** — Filesystem isolation
 - **Capabilities** — Fine-grained privilege control
 - **seccomp** — Syscall filtering
+- **Landlock** — Path-based filesystem access control (Linux 5.13+)
 - **gVisor** — Optional application kernel (runsc)
 
 Container filesystem is backed by tmpfs/ramfs and pre-populated with context files before agent execution, allowing agents to use standard tools (read, grep, find) on the provided context.
@@ -56,8 +57,52 @@ nucleus run --context ./agent-context/ -- /usr/bin/agent
 # Specify resource limits
 nucleus run --memory 512M --cpus 2 --context ./ctx/ -- ./agent
 
+# Name your container
+nucleus run --name my-agent --context ./ctx/ -- ./agent
+
 # Use gVisor for enhanced isolation
 nucleus run --runtime gvisor --context ./ctx/ -- ./agent
+
+# Rootless mode
+nucleus run --rootless -- /bin/sh
+
+# List running containers
+nucleus ps
+
+# List all containers (including stopped)
+nucleus ps --all
+
+# Show resource usage statistics
+nucleus stats
+
+# Stop a container (SIGTERM, then SIGKILL after timeout)
+nucleus stop <container>
+nucleus stop --timeout 30 <container>
+
+# Kill a container with a specific signal
+nucleus kill <container>
+nucleus kill --signal TERM <container>
+
+# Remove a stopped container
+nucleus rm <container>
+nucleus rm --force <container>
+
+# Attach to a running container
+nucleus attach <container>
+nucleus attach <container> -- /bin/bash
+
+# Optional networking
+nucleus run --network host -- curl https://example.com
+nucleus run --network bridge -p 8080:80 -- ./server
+
+# Context streaming (bind mount for instant access)
+nucleus run --context ./large-dir/ --context-mode bind -- ./agent
+
+# Checkpoint a running container
+nucleus checkpoint <container> --output /path/to/checkpoint
+
+# Restore from checkpoint
+nucleus restore --input /path/to/checkpoint
 ```
 
 ## Development
@@ -71,7 +116,7 @@ nix develop
 # Build
 cargo build
 
-# Run tests (61 passing, 4 ignored - require Apalache)
+# Run tests (74 passing, 5 ignored - require root/Apalache)
 cargo test
 
 # Run with Apalache installed
@@ -89,11 +134,13 @@ sudo cargo run --example simple_container
 ```
 nucleus/
 ├── src/
-│   ├── container/      # Container orchestration
-│   ├── isolation/      # Namespace management
+│   ├── container/      # Container orchestration, lifecycle, state
+│   ├── isolation/      # Namespace management, attach
 │   ├── resources/      # cgroup resource control
-│   ├── filesystem/     # tmpfs and context population
-│   ├── security/       # Capabilities and seccomp
+│   ├── filesystem/     # tmpfs, context population, lazy loading
+│   ├── security/       # Capabilities, seccomp, Landlock, gVisor
+│   ├── network/        # Optional networking (none/host/bridge)
+│   ├── checkpoint/     # CRIU checkpoint/restore
 │   └── error.rs        # Error types
 ├── tests/
 │   ├── model_based_*   # Property-based tests from TLA+ specs
@@ -107,10 +154,10 @@ nucleus/
 
 Nucleus uses spec-driven development with comprehensive testing:
 
-- **Unit tests**: 29 tests for individual components
+- **Unit tests**: 42 tests for individual components
 - **Model-based tests**: 25 tests verifying TLA+ properties
 - **tla-connect tests**: 10 tests mapping TLA+ to Rust (6 passing, 4 require Apalache)
-- **Integration tests**: 4 tests for complete lifecycle
+- **Integration tests**: 8 tests for complete lifecycle
 
 All state machines are formally verified using TLA+ and Apalache model checker.
 

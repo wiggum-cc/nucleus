@@ -25,7 +25,7 @@ fn main() -> Result<()> {
     println!("  PIDs: {:?}", limits.pids_max);
 
     let config = ContainerConfig::new(
-        "limited-container".to_string(),
+        Some("limited-container".to_string()),
         vec![
             "/bin/sh".to_string(),
             "-c".to_string(),

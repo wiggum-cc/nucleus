@@ -1,7 +1,13 @@
 use anyhow::Result;
 use clap::Parser;
-use nucleus::container::{Container, ContainerConfig, ContainerStateManager};
+use nucleus::checkpoint::CriuRuntime;
+use nucleus::container::{
+    Container, ContainerConfig, ContainerLifecycle, ContainerStateManager, parse_signal,
+};
+use nucleus::filesystem::ContextMode;
+use nucleus::isolation::attach::ContainerAttach;
 use nucleus::isolation::NamespaceConfig;
+use nucleus::network::{BridgeConfig, NetworkMode, PortForward};
 use nucleus::resources::{IoDeviceLimit, ResourceLimits, ResourceStats};
 use std::path::PathBuf;
 use tracing::info;
@@ -15,9 +21,14 @@ struct Cli {
 }
 
 #[derive(Parser, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Run a command in an isolated container
     Run {
+        /// Container name (optional, auto-generated if not specified)
+        #[arg(long)]
+        name: Option<String>,
+
         /// Path to context directory to pre-populate in container
         #[arg(long)]
         context: Option<String>,
@@ -58,6 +69,18 @@ enum Commands {
         #[arg(long)]
         oci: bool,
 
+        /// Network mode: none, host, or bridge (default: none)
+        #[arg(long, default_value = "none")]
+        network: String,
+
+        /// Publish a port (format: HOST:CONTAINER or HOST:CONTAINER/PROTOCOL)
+        #[arg(short = 'p', long = "publish")]
+        publish: Vec<String>,
+
+        /// Context population mode: copy or bind (default: copy)
+        #[arg(long = "context-mode", default_value = "copy")]
+        context_mode: String,
+
         /// Command to run in container
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -74,6 +97,67 @@ enum Commands {
     Stats {
         /// Container ID (if not specified, shows all containers)
         container_id: Option<String>,
+    },
+
+    /// Stop a running container
+    Stop {
+        /// Container ID, name, or ID prefix
+        container: String,
+
+        /// Seconds to wait before killing (default: 10)
+        #[arg(short, long, default_value = "10")]
+        timeout: u64,
+    },
+
+    /// Remove a stopped container
+    Rm {
+        /// Container ID, name, or ID prefix
+        container: String,
+
+        /// Force remove (stop if running)
+        #[arg(short, long)]
+        force: bool,
+    },
+
+    /// Send a signal to a container
+    Kill {
+        /// Container ID, name, or ID prefix
+        container: String,
+
+        /// Signal to send (default: SIGKILL)
+        #[arg(short, long, default_value = "KILL")]
+        signal: String,
+    },
+
+    /// Attach to a running container
+    Attach {
+        /// Container ID, name, or ID prefix
+        container: String,
+
+        /// Command to run (default: /bin/sh)
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+
+    /// Checkpoint a running container
+    Checkpoint {
+        /// Container ID, name, or ID prefix
+        container: String,
+
+        /// Output directory for checkpoint data
+        #[arg(short, long)]
+        output: String,
+
+        /// Leave container running after checkpoint
+        #[arg(long)]
+        leave_running: bool,
+    },
+
+    /// Restore a container from checkpoint
+    Restore {
+        /// Input directory containing checkpoint data
+        #[arg(short, long)]
+        input: String,
     },
 }
 
@@ -102,13 +186,11 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            // Print header
             println!(
-                "{:<15} {:<10} {:<10} {:<10} {:<10} COMMAND",
-                "CONTAINER ID", "PID", "STATUS", "RUNTIME", "ROOTLESS"
+                "{:<15} {:<20} {:<10} {:<10} {:<10} {:<10} COMMAND",
+                "CONTAINER ID", "NAME", "PID", "STATUS", "RUNTIME", "ROOTLESS"
             );
 
-            // Print each container
             for state in states {
                 let status = if state.is_running() {
                     "Running"
@@ -128,9 +210,22 @@ fn main() -> Result<()> {
                     command
                 };
 
+                let id_display = if state.id.len() > 12 {
+                    &state.id[..12]
+                } else {
+                    &state.id
+                };
+
+                let name_display = if state.name.len() > 18 {
+                    format!("{}...", &state.name[..15])
+                } else {
+                    state.name.clone()
+                };
+
                 println!(
-                    "{:<15} {:<10} {:<10} {:<10} {:<10} {}",
-                    &state.id[..state.id.len().min(15)],
+                    "{:<15} {:<20} {:<10} {:<10} {:<10} {:<10} {}",
+                    id_display,
+                    name_display,
                     state.pid,
                     status,
                     runtime,
@@ -145,8 +240,8 @@ fn main() -> Result<()> {
         Commands::Stats { container_id } => {
             let state_mgr = ContainerStateManager::new()?;
 
-            let states = if let Some(id) = container_id {
-                vec![state_mgr.load_state(&id)?]
+            let states = if let Some(ref id) = container_id {
+                vec![state_mgr.resolve_container(id)?]
             } else {
                 state_mgr.list_running()?
             };
@@ -156,13 +251,11 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            // Print header
             println!(
                 "{:<15} {:<10} {:<15} {:<15} {:<10} {:<10} {:<10}",
                 "CONTAINER ID", "CPU TIME", "MEM USAGE", "MEM LIMIT", "MEM %", "SWAP", "PIDS"
             );
 
-            // Print stats for each container
             for state in states {
                 if !state.is_running() {
                     continue;
@@ -180,9 +273,15 @@ fn main() -> Result<()> {
                             let cpu_time = ResourceStats::format_cpu_time(stats.cpu_usage_ns);
                             let swap_usage = ResourceStats::format_memory(stats.memory_swap_usage);
 
+                            let id_display = if state.id.len() > 12 {
+                                &state.id[..12]
+                            } else {
+                                &state.id
+                            };
+
                             println!(
                                 "{:<15} {:<10} {:<15} {:<15} {:<10.2} {:<10} {:<10}",
-                                &state.id[..state.id.len().min(15)],
+                                id_display,
                                 cpu_time,
                                 mem_usage,
                                 mem_limit,
@@ -203,7 +302,65 @@ fn main() -> Result<()> {
             Ok(())
         }
 
+        Commands::Stop { container, timeout } => {
+            let state_mgr = ContainerStateManager::new()?;
+            let state = state_mgr.resolve_container(&container)?;
+            ContainerLifecycle::stop(&state, timeout)?;
+            println!("{}", state.id);
+            Ok(())
+        }
+
+        Commands::Rm { container, force } => {
+            let state_mgr = ContainerStateManager::new()?;
+            let state = state_mgr.resolve_container(&container)?;
+            ContainerLifecycle::remove(&state_mgr, &state, force)?;
+            println!("{}", state.id);
+            Ok(())
+        }
+
+        Commands::Kill { container, signal } => {
+            let state_mgr = ContainerStateManager::new()?;
+            let state = state_mgr.resolve_container(&container)?;
+            let sig = parse_signal(&signal)?;
+            ContainerLifecycle::kill_container(&state, sig)?;
+            println!("{}", state.id);
+            Ok(())
+        }
+
+        Commands::Attach { container, command } => {
+            let state_mgr = ContainerStateManager::new()?;
+            let state = state_mgr.resolve_container(&container)?;
+            let cmd = if command.is_empty() {
+                vec!["/bin/sh".to_string()]
+            } else {
+                command
+            };
+            let exit_code = ContainerAttach::attach(&state, cmd)?;
+            std::process::exit(exit_code);
+        }
+
+        Commands::Checkpoint {
+            container,
+            output,
+            leave_running,
+        } => {
+            let state_mgr = ContainerStateManager::new()?;
+            let state = state_mgr.resolve_container(&container)?;
+            let criu = CriuRuntime::new()?;
+            criu.checkpoint(&state, &PathBuf::from(&output), leave_running)?;
+            println!("Checkpoint saved to {}", output);
+            Ok(())
+        }
+
+        Commands::Restore { input } => {
+            let criu = CriuRuntime::new()?;
+            let pid = criu.restore(&PathBuf::from(&input))?;
+            println!("Restored container with PID {}", pid);
+            Ok(())
+        }
+
         Commands::Run {
+            name,
             context,
             memory,
             cpus,
@@ -214,15 +371,15 @@ fn main() -> Result<()> {
             runtime,
             rootless,
             oci,
+            network,
+            publish,
+            context_mode,
             command,
         } => {
             if command.is_empty() {
                 eprintln!("Error: No command specified");
                 std::process::exit(1);
             }
-
-            // Generate container ID
-            let container_id = format!("{}", std::process::id());
 
             // Build resource limits
             let mut limits = ResourceLimits::unlimited();
@@ -253,16 +410,48 @@ fn main() -> Result<()> {
                 info!("Swap enabled");
             }
 
+            // Parse network mode
+            let net_mode = match network.as_str() {
+                "none" => NetworkMode::None,
+                "host" => NetworkMode::Host,
+                "bridge" => {
+                    let mut bridge_config = BridgeConfig::default();
+                    // Parse port forwards
+                    for spec in &publish {
+                        let pf = PortForward::parse(spec).map_err(|e| {
+                            anyhow::anyhow!("Invalid port forward: {}", e)
+                        })?;
+                        bridge_config.port_forwards.push(pf);
+                    }
+                    NetworkMode::Bridge(bridge_config)
+                }
+                other => {
+                    eprintln!("Unknown network mode: {}. Use none, host, or bridge.", other);
+                    std::process::exit(1);
+                }
+            };
+
+            // Parse context mode
+            let ctx_mode = match context_mode.as_str() {
+                "copy" => ContextMode::Copy,
+                "bind" => ContextMode::BindMount,
+                other => {
+                    eprintln!("Unknown context mode: {}. Use copy or bind.", other);
+                    std::process::exit(1);
+                }
+            };
+
             // Build configuration
-            let mut config = ContainerConfig::new(container_id.clone(), command)
+            let mut config = ContainerConfig::new(name, command)
                 .with_limits(limits)
-                .with_namespaces(NamespaceConfig::all());
+                .with_namespaces(NamespaceConfig::all())
+                .with_network(net_mode)
+                .with_context_mode(ctx_mode);
 
             if let Some(ctx) = context {
                 config = config.with_context(PathBuf::from(ctx));
             }
 
-            // Set hostname (default is container_id)
             if let Some(host) = hostname {
                 config = config.with_hostname(Some(host));
             }
@@ -275,19 +464,18 @@ fn main() -> Result<()> {
                 }
             }
 
-            // Enable rootless mode if requested
             if rootless {
                 info!("Enabling rootless mode");
                 config = config.with_rootless();
             }
 
-            // Enable OCI bundle mode if requested
             if oci {
                 info!("Enabling OCI bundle mode");
                 config = config.with_oci_bundle();
             }
 
-            // Run container
+            println!("{}", config.id);
+
             let container = Container::new(config);
             let exit_code = container.run()?;
 

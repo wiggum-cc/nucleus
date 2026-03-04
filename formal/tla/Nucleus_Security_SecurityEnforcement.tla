@@ -7,10 +7,11 @@ EXTENDS Naturals, Sequences, TLC
 privileged == "privileged"
 capabilities_dropped == "capabilities_dropped"
 seccomp_applied == "seccomp_applied"
+landlock_applied == "landlock_applied"
 locked == "locked"
 
 States == {
-    privileged, capabilities_dropped, seccomp_applied, locked
+    privileged, capabilities_dropped, seccomp_applied, landlock_applied, locked
 }
 
 VARIABLES

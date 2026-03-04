@@ -11,10 +11,10 @@ use tracing::{debug, info, warn};
 /// Container state tracking information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerState {
-    /// Container ID
+    /// Container ID (unique 12 hex chars)
     pub id: String,
 
-    /// Container name (usually same as ID)
+    /// Container name (user-supplied or same as ID)
     pub name: String,
 
     /// PID of the container process
@@ -40,6 +40,10 @@ pub struct ContainerState {
 
     /// cgroup path
     pub cgroup_path: Option<String>,
+
+    /// UID of the user who created this container
+    #[serde(default)]
+    pub creator_uid: u32,
 }
 
 impl ContainerState {
@@ -72,12 +76,12 @@ impl ContainerState {
             using_gvisor,
             rootless,
             cgroup_path,
+            creator_uid: nix::unistd::Uid::effective().as_raw(),
         }
     }
 
     /// Check if the container process is still running
     pub fn is_running(&self) -> bool {
-        // Check if /proc/<pid> exists
         Path::new(&format!("/proc/{}", self.pid)).exists()
     }
 
@@ -126,7 +130,6 @@ impl ContainerStateManager {
 
     /// Get default state directory
     fn default_state_dir() -> PathBuf {
-        // Use /var/run/nucleus for root, ~/.local/share/nucleus for user
         if nix::unistd::Uid::effective().is_root() {
             PathBuf::from("/var/run/nucleus")
         } else {
@@ -136,7 +139,7 @@ impl ContainerStateManager {
         }
     }
 
-    /// Get path for a container state file
+    /// Validate a container ID for safe filesystem use
     fn validate_container_id(container_id: &str) -> Result<()> {
         if container_id.is_empty() {
             return Err(NucleusError::ConfigError(
@@ -160,6 +163,37 @@ impl ContainerStateManager {
     fn state_file_path(&self, container_id: &str) -> Result<PathBuf> {
         Self::validate_container_id(container_id)?;
         Ok(self.state_dir.join(format!("{}.json", container_id)))
+    }
+
+    /// Resolve a container reference by exact ID, name, or ID prefix
+    pub fn resolve_container(&self, reference: &str) -> Result<ContainerState> {
+        let states = self.list_states()?;
+
+        // Try exact ID match
+        if let Some(state) = states.iter().find(|s| s.id == reference) {
+            return Ok(state.clone());
+        }
+
+        // Try exact name match
+        if let Some(state) = states.iter().find(|s| s.name == reference) {
+            return Ok(state.clone());
+        }
+
+        // Try ID prefix match
+        let prefix_matches: Vec<&ContainerState> = states
+            .iter()
+            .filter(|s| s.id.starts_with(reference))
+            .collect();
+
+        match prefix_matches.len() {
+            0 => Err(NucleusError::ContainerNotFound(reference.to_string())),
+            1 => Ok(prefix_matches[0].clone()),
+            _ => Err(NucleusError::AmbiguousContainer(format!(
+                "'{}' matches {} containers",
+                reference,
+                prefix_matches.len()
+            ))),
+        }
     }
 
     /// Save container state
@@ -320,6 +354,7 @@ mod tests {
         assert_eq!(state.pid, 1234);
         assert_eq!(state.memory_limit, Some(512 * 1024 * 1024));
         assert_eq!(state.cpu_limit, Some(2000));
+        assert_eq!(state.creator_uid, nix::unistd::Uid::effective().as_raw());
     }
 
     #[test]
@@ -402,5 +437,38 @@ mod tests {
 
         let states = mgr.list_states().unwrap();
         assert_eq!(states.len(), 2);
+    }
+
+    #[test]
+    fn test_resolve_container_by_id() {
+        let (mgr, _temp_dir) = temp_state_manager();
+
+        let state = ContainerState::new(
+            "abc123def456".to_string(),
+            "mycontainer".to_string(),
+            1234,
+            vec!["/bin/sh".to_string()],
+            None,
+            None,
+            false,
+            false,
+            None,
+        );
+        mgr.save_state(&state).unwrap();
+
+        // Exact ID
+        let resolved = mgr.resolve_container("abc123def456").unwrap();
+        assert_eq!(resolved.id, "abc123def456");
+
+        // Name
+        let resolved = mgr.resolve_container("mycontainer").unwrap();
+        assert_eq!(resolved.id, "abc123def456");
+
+        // ID prefix
+        let resolved = mgr.resolve_container("abc123").unwrap();
+        assert_eq!(resolved.id, "abc123def456");
+
+        // Not found
+        assert!(mgr.resolve_container("nonexistent").is_err());
     }
 }

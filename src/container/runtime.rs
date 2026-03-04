@@ -2,12 +2,14 @@ use crate::container::{ContainerConfig, ContainerState, ContainerStateManager};
 use crate::error::{NucleusError, Result};
 use crate::filesystem::{
     bind_mount_host_paths, create_dev_nodes, create_minimal_fs, mount_procfs, switch_root,
-    ContextPopulator, TmpfsMount,
+    ContextPopulator, FilesystemState, LazyContextPopulator, TmpfsMount,
 };
 use crate::isolation::NamespaceManager;
+use crate::network::{BridgeNetwork, NetworkMode};
 use crate::resources::Cgroup;
 use crate::security::{
     CapabilityManager, GVisorRuntime, LandlockManager, OciBundle, OciConfig, SeccompManager,
+    SecurityState,
 };
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitStatus};
@@ -38,7 +40,10 @@ impl Container {
     ///
     /// This orchestrates all components according to the formal specifications
     pub fn run(&self) -> Result<i32> {
-        info!("Starting container: {}", self.config.name);
+        info!(
+            "Starting container: {} (ID: {})",
+            self.config.name, self.config.id
+        );
 
         // Auto-detect if we need rootless mode
         let is_root = nix::unistd::Uid::effective().is_root();
@@ -50,11 +55,25 @@ impl Container {
             config.user_ns_config = Some(crate::isolation::UserNamespaceConfig::rootless());
         }
 
+        // Adjust namespace config for network mode
+        if let NetworkMode::Host = &config.network {
+            info!("Host network mode: skipping network namespace");
+            config.namespaces.net = false;
+        }
+
+        // Bridge networking requires root
+        if let NetworkMode::Bridge(_) = &config.network {
+            if !is_root {
+                warn!("Bridge networking requires root, degrading to no networking");
+                config.network = NetworkMode::None;
+            }
+        }
+
         // Create state manager
         let state_mgr = ContainerStateManager::new()?;
 
         // Try to create cgroup (optional for rootless mode)
-        let cgroup_name = format!("nucleus-{}", config.name);
+        let cgroup_name = format!("nucleus-{}", config.id);
         let mut cgroup_opt = match Cgroup::create(&cgroup_name) {
             Ok(mut cgroup) => {
                 // Try to set limits
@@ -118,12 +137,10 @@ impl Container {
 
                 // Convert cpu_quota_us to millicores for storage
                 let cpu_millicores = config.limits.cpu_quota_us.map(|quota| {
-                    // quota is in microseconds per period (100ms)
-                    // millicores = (quota / period) * 1000
                     (quota * 1000) / config.limits.cpu_period_us
                 });
                 let state = ContainerState::new(
-                    config.name.clone(),
+                    config.id.clone(),
                     config.name.clone(),
                     child.as_raw() as u32,
                     config.command.clone(),
@@ -140,11 +157,31 @@ impl Container {
                     cgroup.attach_process(child.as_raw() as u32)?;
                 }
 
+                // Set up bridge networking in parent (needs host netns)
+                let bridge_net = if let NetworkMode::Bridge(ref bridge_config) = config.network {
+                    match BridgeNetwork::setup(child.as_raw() as u32, bridge_config) {
+                        Ok(net) => Some(net),
+                        Err(e) => {
+                            warn!("Failed to set up bridge networking: {}", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 // Set up signal handling
                 self.setup_signal_handlers(child)?;
 
                 // Wait for child to exit
                 let exit_code = self.wait_for_child(child)?;
+
+                // Cleanup bridge networking
+                if let Some(net) = bridge_net {
+                    if let Err(e) = net.cleanup() {
+                        warn!("Failed to cleanup bridge networking: {}", e);
+                    }
+                }
 
                 // Cleanup cgroup if we have one
                 if let Some(cgroup) = cgroup_opt {
@@ -152,19 +189,20 @@ impl Container {
                 }
 
                 // Delete container state
-                state_mgr.delete_state(&config.name)?;
+                state_mgr.delete_state(&config.id)?;
 
-                info!("Container {} exited with code {}", config.name, exit_code);
+                info!(
+                    "Container {} ({}) exited with code {}",
+                    config.name, config.id, exit_code
+                );
 
                 Ok(exit_code)
             }
             ForkResult::Child => {
                 // Child process - set up container environment
-                // Use the potentially modified config
                 let temp_container = Container { config };
                 match temp_container.setup_and_exec() {
                     Ok(_) => {
-                        // exec should not return
                         unreachable!()
                     }
                     Err(e) => {
@@ -178,7 +216,8 @@ impl Container {
 
     /// Set up container environment and exec target process
     ///
-    /// This runs in the child process after fork
+    /// This runs in the child process after fork.
+    /// Tracks FilesystemState and SecurityState machines to enforce correct ordering.
     fn setup_and_exec(&self) -> Result<()> {
         // Check if we should use gVisor
         if self.config.use_gvisor {
@@ -186,7 +225,10 @@ impl Container {
         }
         let is_rootless = self.config.user_ns_config.is_some();
 
-        // Native execution path
+        // Initialize state machines
+        let mut fs_state = FilesystemState::Unmounted;
+        let mut sec_state = SecurityState::Privileged;
+
         // 1. Set hostname if UTS namespace is enabled
         let namespace_mgr = NamespaceManager::new(self.config.namespaces.clone());
         if let Some(hostname) = &self.config.hostname {
@@ -194,6 +236,7 @@ impl Container {
         }
 
         // 2. Mount tmpfs as container root
+        // Filesystem: Unmounted -> Mounted
         let runtime_dir = Builder::new()
             .prefix("nucleus-runtime-")
             .tempdir_in("/tmp")
@@ -203,6 +246,7 @@ impl Container {
         let container_root = runtime_dir.path().to_path_buf();
         let mut tmpfs = TmpfsMount::new(&container_root, Some(1024 * 1024 * 1024)); // 1GB default
         tmpfs.mount()?;
+        fs_state = fs_state.transition(FilesystemState::Mounted)?;
 
         // 3. Create minimal filesystem structure
         create_minimal_fs(&container_root)?;
@@ -212,11 +256,16 @@ impl Container {
         create_dev_nodes(&dev_path)?;
 
         // 5. Populate context if provided
+        // Filesystem: Mounted -> Populated
         if let Some(context_dir) = &self.config.context_dir {
             let context_dest = container_root.join("context");
-            let populator = ContextPopulator::new(context_dir, &context_dest);
-            populator.populate()?;
+            LazyContextPopulator::populate(
+                &self.config.context_mode,
+                context_dir,
+                &context_dest,
+            )?;
         }
+        fs_state = fs_state.transition(FilesystemState::Populated)?;
 
         // 6. Bind mount host paths (for accessing host binaries)
         bind_mount_host_paths(&container_root, is_rootless)?;
@@ -225,22 +274,40 @@ impl Container {
         let proc_path = container_root.join("proc");
         mount_procfs(&proc_path, is_rootless)?;
 
-        // 8. Switch root filesystem
-        switch_root(&container_root, is_rootless)?;
+        // 8. Write resolv.conf for bridge networking (before pivot_root)
+        if let NetworkMode::Bridge(ref bridge_config) = self.config.network {
+            BridgeNetwork::write_resolv_conf(&container_root, &bridge_config.dns)?;
+        }
 
-        // 9. Drop capabilities
+        // 9. Switch root filesystem
+        // Filesystem: Populated -> Pivoted
+        switch_root(&container_root, is_rootless)?;
+        fs_state = fs_state.transition(FilesystemState::Pivoted)?;
+        debug!("Filesystem state: {:?}", fs_state);
+
+        // 10. Drop capabilities
+        // Security: Privileged -> CapabilitiesDropped
         let mut cap_mgr = CapabilityManager::new();
         cap_mgr.drop_all()?;
+        sec_state = sec_state.transition(SecurityState::CapabilitiesDropped)?;
 
-        // 10. Apply seccomp filter
+        // 11. Apply seccomp filter
+        // Security: CapabilitiesDropped -> SeccompApplied
         let mut seccomp_mgr = SeccompManager::new();
         seccomp_mgr.apply_minimal_filter_with_mode(is_rootless)?;
+        sec_state = sec_state.transition(SecurityState::SeccompApplied)?;
 
-        // 11. Apply Landlock filesystem policy
+        // 12. Apply Landlock filesystem policy
+        // Security: SeccompApplied -> LandlockApplied
         let mut landlock_mgr = LandlockManager::new();
         landlock_mgr.apply_container_policy_with_mode(is_rootless)?;
+        sec_state = sec_state.transition(SecurityState::LandlockApplied)?;
 
-        // 12. Exec target process
+        // Security: LandlockApplied -> Locked
+        sec_state = sec_state.transition(SecurityState::Locked)?;
+        debug!("Security state: {:?}", sec_state);
+
+        // 13. Exec target process
         self.exec_command()?;
 
         // Should never reach here
@@ -248,17 +315,13 @@ impl Container {
     }
 
     /// Set up container with gVisor and exec
-    ///
-    /// This implements the gVisor execution path
     fn setup_and_exec_gvisor(&self) -> Result<()> {
         info!("Using gVisor runtime");
 
-        // Create gVisor runtime
         let gvisor = GVisorRuntime::new().map_err(|e| {
             NucleusError::GVisorError(format!("Failed to initialize gVisor runtime: {}", e))
         })?;
 
-        // Security hardening: always use OCI mode with explicit sandbox configuration.
         if !self.config.use_oci_bundle {
             info!("Security hardening enabled: forcing gVisor OCI bundle mode");
         }
@@ -269,19 +332,15 @@ impl Container {
     fn setup_and_exec_gvisor_oci(&self, gvisor: &GVisorRuntime) -> Result<()> {
         info!("Using gVisor with OCI bundle format");
 
-        // Create OCI config
         let mut oci_config =
             OciConfig::new(self.config.command.clone(), self.config.hostname.clone());
 
-        // Add resource limits
         oci_config = oci_config.with_resources(&self.config.limits);
 
-        // Add user namespace if configured
         if self.config.user_ns_config.is_some() {
             oci_config = oci_config.with_user_namespace();
         }
 
-        // Create OCI bundle
         let bundle_dir = Builder::new()
             .prefix("nucleus-oci-")
             .tempdir_in("/tmp")
@@ -292,26 +351,20 @@ impl Container {
         let bundle = OciBundle::new(bundle_path, oci_config);
         bundle.create()?;
 
-        // Populate rootfs with minimal filesystem
         let rootfs = bundle.rootfs_path();
         create_minimal_fs(&rootfs)?;
 
-        // Create device nodes
         let dev_path = rootfs.join("dev");
         create_dev_nodes(&dev_path)?;
 
-        // Populate context if provided
         if let Some(context_dir) = &self.config.context_dir {
             let context_dest = rootfs.join("context");
             let populator = ContextPopulator::new(context_dir, &context_dest);
             populator.populate()?;
         }
 
-        // Execute with gVisor using OCI bundle
-        // This will replace the current process with runsc
-        gvisor.exec_with_oci_bundle(&self.config.name, &bundle)?;
+        gvisor.exec_with_oci_bundle(&self.config.id, &bundle)?;
 
-        // Should never reach here
         Ok(())
     }
 
@@ -337,10 +390,8 @@ impl Container {
             .collect();
         let args = args?;
 
-        // execve - this replaces the current process
         nix::unistd::execve::<std::ffi::CString, std::ffi::CString>(&program, &args, &[])?;
 
-        // Should never reach here
         Ok(())
     }
 
@@ -348,11 +399,9 @@ impl Container {
     fn setup_signal_handlers(&self, child: Pid) -> Result<()> {
         use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet};
 
-        // Store child PID in static for signal handler access
         static CHILD_PID: AtomicI32 = AtomicI32::new(0);
         CHILD_PID.store(child.as_raw(), Ordering::SeqCst);
 
-        // Signal handler that forwards signals to child
         extern "C" fn forward_signal(sig: i32) {
             let child_pid = CHILD_PID.load(Ordering::SeqCst);
             if child_pid > 0 {
@@ -367,7 +416,6 @@ impl Container {
         let handler = SigHandler::Handler(forward_signal);
         let action = SigAction::new(handler, SaFlags::empty(), SigSet::empty());
 
-        // Set up handlers for common termination and control signals
         unsafe {
             for (signal, name) in [
                 (Signal::SIGTERM, "SIGTERM"),
@@ -400,7 +448,6 @@ impl Container {
                     return Ok(128 + signal as i32);
                 }
                 Err(nix::errno::Errno::EINTR) => {
-                    // Interrupted by signal, continue waiting
                     continue;
                 }
                 Err(e) => {
@@ -410,7 +457,6 @@ impl Container {
                     )));
                 }
                 _ => {
-                    // Continue waiting for other status changes
                     continue;
                 }
             }
@@ -424,12 +470,17 @@ mod tests {
 
     #[test]
     fn test_container_config() {
-        let config = ContainerConfig::new("test".to_string(), vec!["/bin/sh".to_string()]);
-        assert_eq!(config.name, "test");
+        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
+        assert!(!config.id.is_empty());
         assert_eq!(config.command, vec!["/bin/sh"]);
         assert!(!config.use_gvisor);
     }
 
-    // Note: Testing actual container execution requires root privileges
-    // These are tested in integration tests
+    #[test]
+    fn test_container_config_with_name() {
+        let config = ContainerConfig::new(Some("mycontainer".to_string()), vec!["/bin/sh".to_string()]);
+        assert_eq!(config.name, "mycontainer");
+        assert!(!config.id.is_empty());
+        assert_ne!(config.id, config.name);
+    }
 }

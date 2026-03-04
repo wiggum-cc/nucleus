@@ -1,5 +1,5 @@
 use crate::error::{NucleusError, Result};
-use crate::resources::ResourceLimits;
+use crate::resources::{CgroupState, ResourceLimits};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
@@ -12,15 +12,15 @@ const CGROUP_V2_ROOT: &str = "/sys/fs/cgroup";
 /// Nucleus_Resources_CgroupLifecycle.tla
 pub struct Cgroup {
     path: PathBuf,
-    created: bool,
-    configured: bool,
+    state: CgroupState,
 }
 
 impl Cgroup {
     /// Create a new cgroup with the given name
     ///
-    /// This implements the transition: nonexistent -> created
+    /// State transition: Nonexistent -> Created
     pub fn create(name: &str) -> Result<Self> {
+        let state = CgroupState::Nonexistent.transition(CgroupState::Created)?;
         let path = PathBuf::from(CGROUP_V2_ROOT).join(name);
 
         info!("Creating cgroup at {:?}", path);
@@ -30,22 +30,14 @@ impl Cgroup {
             NucleusError::CgroupError(format!("Failed to create cgroup directory: {}", e))
         })?;
 
-        Ok(Self {
-            path,
-            created: true,
-            configured: false,
-        })
+        Ok(Self { path, state })
     }
 
     /// Set resource limits
     ///
-    /// This implements the transition: created -> configured
+    /// State transition: Created -> Configured
     pub fn set_limits(&mut self, limits: &ResourceLimits) -> Result<()> {
-        if !self.created {
-            return Err(NucleusError::CgroupError(
-                "Cannot set limits on non-existent cgroup".to_string(),
-            ));
-        }
+        self.state = self.state.transition(CgroupState::Configured)?;
 
         info!("Configuring cgroup limits: {:?}", limits);
 
@@ -93,7 +85,6 @@ impl Cgroup {
             debug!("Set io.max: {}", line);
         }
 
-        self.configured = true;
         info!("Successfully configured cgroup limits");
 
         Ok(())
@@ -101,13 +92,9 @@ impl Cgroup {
 
     /// Attach a process to this cgroup
     ///
-    /// This implements the transition: configured -> attached
-    pub fn attach_process(&self, pid: u32) -> Result<()> {
-        if !self.configured {
-            return Err(NucleusError::CgroupError(
-                "Cannot attach to unconfigured cgroup".to_string(),
-            ));
-        }
+    /// State transition: Configured -> Attached
+    pub fn attach_process(&mut self, pid: u32) -> Result<()> {
+        self.state = self.state.transition(CgroupState::Attached)?;
 
         info!("Attaching process {} to cgroup", pid);
 
@@ -151,10 +138,16 @@ impl Cgroup {
         &self.path
     }
 
+    /// Get the current state of this cgroup
+    pub fn state(&self) -> CgroupState {
+        self.state
+    }
+
     /// Clean up the cgroup
     ///
-    /// This implements the transition: (any state) -> removed
-    pub fn cleanup(self) -> Result<()> {
+    /// State transition: * -> Removed
+    pub fn cleanup(mut self) -> Result<()> {
+        self.state = self.state.transition(CgroupState::Removed)?;
         info!("Cleaning up cgroup {:?}", self.path);
 
         // Try to remove the cgroup directory
@@ -173,7 +166,7 @@ impl Cgroup {
 
 impl Drop for Cgroup {
     fn drop(&mut self) {
-        if self.created && self.path.exists() {
+        if !self.state.is_terminal() && self.path.exists() {
             let _ = fs::remove_dir(&self.path);
         }
     }

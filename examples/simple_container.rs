@@ -15,7 +15,7 @@ fn main() -> Result<()> {
         .with_cpu_cores(1.0)?;
 
     let config = ContainerConfig::new(
-        "example-container".to_string(),
+        Some("example-container".to_string()),
         vec!["/bin/echo".to_string(), "Hello from Nucleus!".to_string()],
     )
     .with_limits(limits)

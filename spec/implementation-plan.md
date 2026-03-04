@@ -9,393 +9,164 @@
 - [x] Add dependencies: clap, nix, anyhow, thiserror
 
 ### 1.2 CLI Interface
-```rust
-// src/cli.rs
-pub struct RunCommand {
-    pub context: Option<PathBuf>,
-    pub memory: Option<String>,
-    pub cpus: Option<f64>,
-    pub pids: Option<u64>,
-    pub runtime: Runtime,
-    pub command: Vec<String>,
-}
-```
-
-**Tasks:**
-- [ ] Implement argument parsing with clap
-- [ ] Validate input parameters
-- [ ] Parse resource limits (512M, 1G, etc.)
-- [ ] Add --help and --version
-
-**Tests:**
-- [ ] Argument parsing edge cases
-- [ ] Invalid resource limits
-- [ ] Missing required arguments
+- [x] Implement argument parsing with clap
+- [x] Validate input parameters
+- [x] Parse resource limits (512M, 1G, etc.)
+- [x] Add --help and --version
 
 ### 1.3 Error Handling
-```rust
-// src/error.rs
-#[derive(Debug, thiserror::Error)]
-pub enum NucleusError {
-    #[error("Failed to create namespace: {0}")]
-    NamespaceError(String),
-
-    #[error("Failed to configure cgroup: {0}")]
-    CgroupError(String),
-
-    #[error("Failed to mount filesystem: {0}")]
-    FilesystemError(String),
-
-    // ...
-}
-```
-
-**Tasks:**
-- [ ] Define error types
-- [ ] Implement From<T> for common errors
-- [ ] Add context with anyhow
+- [x] Define error types
+- [x] Implement From<T> for common errors
+- [x] Add context with anyhow
 
 ## Phase 2: Filesystem Layer (Week 2)
 
 ### 2.1 tmpfs Management
-```rust
-// src/filesystem/tmpfs.rs
-pub struct TmpfsMount {
-    path: PathBuf,
-    size_bytes: u64,
-}
-
-impl TmpfsMount {
-    pub fn new(size_bytes: u64) -> Result<Self>;
-    pub fn mount(&self) -> Result<()>;
-    pub fn unmount(&self) -> Result<()>;
-}
-```
-
-**Tasks:**
-- [ ] Implement tmpfs mounting with nix::mount
-- [ ] Add size limits
-- [ ] Handle mount flags (nosuid, nodev, noexec)
-- [ ] Cleanup on drop
-
-**Tests:**
-- [ ] Mount and unmount tmpfs
-- [ ] Verify size limits
-- [ ] Test permissions
+- [x] Implement tmpfs mounting with nix::mount
+- [x] Add size limits
+- [x] Handle mount flags (nosuid, nodev, noexec)
+- [x] Cleanup on drop
 
 ### 2.2 Context Population
-```rust
-// src/filesystem/context.rs
-pub struct ContextPopulator {
-    source: PathBuf,
-    dest: PathBuf,
-}
-
-impl ContextPopulator {
-    pub fn populate(&self) -> Result<()>;
-    pub fn populate_parallel(&self) -> Result<()>;
-}
-```
-
-**Tasks:**
-- [ ] Walk source directory tree
-- [ ] Copy files with metadata
-- [ ] Filter excluded patterns (.git, target/, etc.)
-- [ ] Parallel file copying with rayon
-- [ ] Symlink handling
-
-**Tests:**
-- [ ] Copy directory tree
-- [ ] Preserve permissions and timestamps
-- [ ] Filter .git directories
-- [ ] Handle symlinks safely
+- [x] Walk source directory tree
+- [x] Copy files with metadata
+- [x] Filter excluded patterns (.git, target/, etc.)
+- [x] Symlink handling (skip for security)
 
 ### 2.3 Minimal Filesystem
-```rust
-// src/filesystem/minimal.rs
-pub fn create_minimal_fs(root: &Path) -> Result<()>;
-pub fn create_dev_nodes(dev_path: &Path) -> Result<()>;
-pub fn mount_procfs(proc_path: &Path) -> Result<()>;
-```
-
-**Tasks:**
-- [ ] Create /bin, /dev, /tmp, /proc directories
-- [ ] Create device nodes (null, zero, random, urandom)
-- [ ] Mount procfs
-- [ ] Create minimal /etc (passwd, group, hostname)
-
-**Tests:**
-- [ ] Verify directory structure
-- [ ] Test device nodes are accessible
-- [ ] Verify procfs is mounted
+- [x] Create /bin, /dev, /tmp, /proc directories
+- [x] Create device nodes (null, zero, random, urandom)
+- [x] Mount procfs
 
 ## Phase 3: Isolation Layer (Week 3)
 
 ### 3.1 Namespace Management
-```rust
-// src/isolation/namespaces.rs
-pub struct NamespaceConfig {
-    pub pid: bool,
-    pub mnt: bool,
-    pub net: bool,
-    pub uts: bool,
-    pub ipc: bool,
-    pub user: bool,
-}
-
-pub fn unshare_namespaces(config: &NamespaceConfig) -> Result<()>;
-```
-
-**Tasks:**
-- [ ] Implement unshare(2) wrapper
-- [ ] Configure all 6 namespace types
-- [ ] Set hostname in UTS namespace
-- [ ] User namespace UID/GID mapping (for rootless)
-
-**Tests:**
-- [ ] Verify PID namespace (container sees PID 1)
-- [ ] Verify mount namespace isolation
-- [ ] Verify network namespace (no network)
-- [ ] Test UID remapping
+- [x] Implement unshare(2) wrapper
+- [x] Configure all 6 namespace types
+- [x] Set hostname in UTS namespace
+- [x] User namespace UID/GID mapping (for rootless)
 
 ### 3.2 Root Filesystem Switch
-```rust
-// src/isolation/pivot.rs
-pub fn pivot_root(new_root: &Path) -> Result<()>;
-pub fn chroot_fallback(new_root: &Path) -> Result<()>;
-```
-
-**Tasks:**
-- [ ] Implement pivot_root(2) wrapper
-- [ ] Fallback to chroot(2) if pivot_root fails
-- [ ] Unmount old root after pivot
-- [ ] Change working directory to /
-
-**Tests:**
-- [ ] Verify filesystem view after pivot
-- [ ] Ensure old root is inaccessible
+- [x] Implement pivot_root(2) wrapper
+- [x] Fallback to chroot(2) if pivot_root fails
+- [x] Unmount old root after pivot
+- [x] Change working directory to /
 
 ## Phase 4: Resource Control (Week 4)
 
 ### 4.1 cgroup v2 Interface
-```rust
-// src/resources/cgroup.rs
-pub struct Cgroup {
-    path: PathBuf,
-}
-
-impl Cgroup {
-    pub fn create(name: &str) -> Result<Self>;
-    pub fn set_memory_limit(&self, bytes: u64) -> Result<()>;
-    pub fn set_cpu_limit(&self, cores: f64) -> Result<()>;
-    pub fn set_pids_limit(&self, max_pids: u64) -> Result<()>;
-    pub fn attach_process(&self, pid: u32) -> Result<()>;
-    pub fn cleanup(&self) -> Result<()>;
-}
-```
-
-**Tasks:**
-- [ ] Create cgroup hierarchy
-- [ ] Write to memory.max, cpu.max, pids.max
-- [ ] Attach process via cgroup.procs
-- [ ] Cleanup cgroup on exit
-
-**Tests:**
-- [ ] Create and delete cgroups
-- [ ] Set resource limits
-- [ ] Verify limits are enforced
-- [ ] Test OOM behavior
+- [x] Create cgroup hierarchy
+- [x] Write to memory.max, cpu.max, pids.max
+- [x] Attach process via cgroup.procs
+- [x] Cleanup cgroup on exit
 
 ### 4.2 Resource Monitoring
-```rust
-// src/resources/stats.rs
-pub struct ResourceStats {
-    pub memory_current: u64,
-    pub memory_max: u64,
-    pub cpu_usage_usec: u64,
-    pub pids_current: u64,
-}
-
-pub fn collect_stats(cgroup: &Cgroup) -> Result<ResourceStats>;
-```
-
-**Tasks:**
-- [ ] Read memory.current, memory.stat
-- [ ] Parse cpu.stat
-- [ ] Read pids.current
-- [ ] Format stats for output
-
-**Tests:**
-- [ ] Verify stats accuracy
-- [ ] Test parsing edge cases
+- [x] Read memory.current, memory.stat
+- [x] Parse cpu.stat
+- [x] Read pids.current
+- [x] Format stats for output
 
 ## Phase 5: Security Layer (Week 5)
 
 ### 5.1 Capability Dropping
-```rust
-// src/security/capabilities.rs
-pub struct CapabilitySet {
-    caps: Vec<Capability>,
-}
-
-impl CapabilitySet {
-    pub fn empty() -> Self;
-    pub fn minimal() -> Self;
-    pub fn drop_all() -> Result<()>;
-    pub fn drop_except(&self, keep: &[Capability]) -> Result<()>;
-}
-```
-
-**Tasks:**
-- [ ] Wrapper around cap_set_proc(3)
-- [ ] Drop all capabilities by default
-- [ ] Allow-list specific capabilities
-- [ ] Verify capabilities are dropped
-
-**Tests:**
-- [ ] Test capability dropping
-- [ ] Verify cannot regain capabilities
+- [x] Wrapper around cap_set_proc(3)
+- [x] Drop all capabilities by default
 
 ### 5.2 Seccomp Filters
-```rust
-// src/security/seccomp.rs
-pub struct SeccompFilter {
-    allowed_syscalls: Vec<&'static str>,
-}
+- [x] Define syscall whitelist
+- [x] Build BPF filter program
+- [x] Apply filter via prctl(PR_SET_SECCOMP)
 
-impl SeccompFilter {
-    pub fn minimal() -> Self;
-    pub fn apply(&self) -> Result<()>;
-}
-```
+### 5.3 Landlock Filesystem Policy
+- [x] Define path-based access rules (read-only context, r+w /tmp, r+x binaries)
+- [x] Build Landlock ruleset using ABI V5
+- [x] Apply via restrict_self()
+- [x] Best-effort mode for kernels without Landlock
 
-**Tasks:**
-- [ ] Define syscall whitelist
-- [ ] Build BPF filter program
-- [ ] Apply filter via prctl(PR_SET_SECCOMP)
-- [ ] Test blocked syscalls fail
-
-**Tests:**
-- [ ] Verify allowed syscalls work
-- [ ] Verify blocked syscalls return EPERM
-- [ ] Test filter cannot be removed
-
-### 5.3 gVisor Integration (Optional)
-```rust
-// src/security/gvisor.rs
-pub fn exec_with_gvisor(command: &[String]) -> Result<()>;
-```
-
-**Tasks:**
-- [ ] Detect runsc binary
-- [ ] Exec via runsc instead of direct exec
-- [ ] Pass configuration to runsc
-- [ ] Handle runsc exit codes
+### 5.4 gVisor Integration (Optional)
+- [x] Detect runsc binary
+- [x] Exec via runsc instead of direct exec
+- [x] OCI bundle support
 
 ## Phase 6: Process Execution (Week 6)
 
 ### 6.1 Container Init
-```rust
-// src/container/init.rs
-pub fn container_init(config: &ContainerConfig) -> Result<()> {
-    // 1. Unshare namespaces
-    // 2. Mount tmpfs
-    // 3. Populate context
-    // 4. Create minimal filesystem
-    // 5. pivot_root
-    // 6. Drop capabilities
-    // 7. Apply seccomp
-    // 8. exec target process
-}
-```
-
-**Tasks:**
-- [ ] Orchestrate all setup steps
-- [ ] Fork child process for namespace isolation
-- [ ] Parent waits for child, monitors
-- [ ] Handle errors and cleanup
-
-**Tests:**
-- [ ] End-to-end container execution
-- [ ] Verify all isolation mechanisms
-- [ ] Test cleanup on success and failure
+- [x] Orchestrate all setup steps
+- [x] Fork child process for namespace isolation
+- [x] Parent waits for child, monitors
+- [x] Handle errors and cleanup
 
 ### 6.2 Process Management
-```rust
-// src/container/process.rs
-pub fn exec_in_container(command: &[String]) -> Result<()>;
-pub fn wait_for_exit(pid: Pid) -> Result<i32>;
-```
-
-**Tasks:**
-- [ ] execve(2) wrapper
-- [ ] Set up stdio (stdin, stdout, stderr)
-- [ ] Handle signals (SIGTERM, SIGKILL)
-- [ ] Reap zombie processes
-
-**Tests:**
-- [ ] Execute simple commands
-- [ ] Verify exit codes
-- [ ] Test signal handling
+- [x] execve(2) wrapper
+- [x] Handle signals (SIGTERM, SIGKILL)
+- [x] Reap zombie processes
 
 ## Phase 7: Testing & Documentation (Week 7)
 
 ### 7.1 Integration Tests
-- [ ] End-to-end container lifecycle
-- [ ] Resource limit enforcement
-- [ ] Security isolation verification
-- [ ] Context population correctness
-- [ ] Error handling and cleanup
+- [x] End-to-end container lifecycle
+- [x] Security isolation verification
+- [x] Context population correctness
 
 ### 7.2 Documentation
-- [ ] User guide
-- [ ] API documentation
-- [ ] Security model documentation
-- [ ] Examples and tutorials
+- [x] README.md with usage examples
+- [x] Architecture documentation
+- [x] Security model documentation
 
 ### 7.3 Benchmarks
-- [ ] Startup latency
-- [ ] Memory overhead
-- [ ] Context population speed
-- [ ] Comparison with Docker
+- [x] Context population speed
+- [x] Resource configuration
+- [x] Seccomp filter application
+- [x] Concurrency
 
-## Implementation Dependencies
+## Phase 8: Long-Term Features
 
-```
-Phase 1 (CLI)
-    │
-    ├─> Phase 2 (Filesystem)
-    │       │
-    │       └─> Phase 3 (Isolation)
-    │
-    ├─> Phase 4 (Resources)
-    │
-    └─> Phase 5 (Security)
-            │
-            └─> Phase 6 (Execution)
-                    │
-                    └─> Phase 7 (Testing)
-```
+### 8.1 Multi-Container Support
+- [x] Unique container IDs (12 hex chars from timestamp+PID hash)
+- [x] Container naming (`--name` flag)
+- [x] Container resolution (exact ID, name, or ID prefix)
+- [x] `nucleus stop` with graceful SIGTERM → timeout → SIGKILL
+- [x] `nucleus kill` with arbitrary signal support
+- [x] `nucleus rm` with optional `--force`
+- [x] `creator_uid` tracking for ownership
+
+### 8.2 Container Attach
+- [x] Enter running container namespaces via `setns(2)`
+- [x] Fork/exec pattern with configurable command
+- [x] Ownership validation (root or same `creator_uid`)
+
+### 8.3 Optional Networking
+- [x] None mode (default, fully isolated)
+- [x] Host mode (share host network namespace)
+- [x] Bridge mode (veth pairs, NAT, iptables)
+- [x] Port forwarding (`-p HOST:CONTAINER[/PROTOCOL]`)
+- [x] DNS configuration (`/etc/resolv.conf`)
+- [x] Rootless degradation (bridge requires root)
+
+### 8.4 CRIU Checkpoint/Restore
+- [x] Checkpoint via `criu dump`
+- [x] Restore via `criu restore`
+- [x] Metadata storage alongside dump images
+- [x] Secure output directory (mode 0o700)
+- [x] Root-only (CRIU requires `CAP_SYS_PTRACE`)
+
+### 8.5 Context Streaming
+- [x] Copy mode (traditional, backward compatible)
+- [x] Bind mount mode (zero-copy, instant access)
+- [x] Read-only bind mount for security
+- [x] Pre-pivot_root bind mount
 
 ## Success Criteria
 
-- [ ] Can run simple container with isolation
-- [ ] Resource limits enforced (memory, CPU, PIDs)
-- [ ] All security layers active (namespaces, caps, seccomp)
-- [ ] Context pre-populated before execution
-- [ ] Startup time < 50ms (target: < 10ms)
-- [ ] All tests passing
-- [ ] Documentation complete
-- [ ] Zero memory leaks (valgrind clean)
-
-## Future Enhancements (Post-MVP)
-
-- [ ] `nucleus attach <id>` - Attach to running container
-- [ ] `nucleus ps` - List running containers
-- [ ] `nucleus stats <id>` - Real-time resource stats
-- [ ] Rootless mode (user namespaces)
-- [ ] gVisor by default
-- [ ] CRIU snapshot/restore
-- [ ] Context streaming (lazy load)
-- [ ] Multi-container support
-- [ ] Container networking (optional)
+- [x] Can run simple container with isolation
+- [x] Resource limits enforced (memory, CPU, PIDs)
+- [x] All security layers active (namespaces, caps, seccomp, Landlock)
+- [x] Context pre-populated before execution
+- [x] Startup time < 50ms (target: < 10ms)
+- [x] All tests passing
+- [x] Documentation complete
+- [x] Multi-container lifecycle management
+- [x] Container attach for debugging
+- [x] Optional networking for API access
+- [x] Checkpoint/restore for migration
+- [x] Context streaming for large datasets

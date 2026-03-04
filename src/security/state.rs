@@ -44,6 +44,18 @@ impl SecurityState {
     pub fn is_terminal(&self) -> bool {
         matches!(self, SecurityState::Locked)
     }
+
+    /// Transition to the next state, returning an error if the transition is invalid
+    pub fn transition(self, next: SecurityState) -> crate::error::Result<SecurityState> {
+        if self.can_transition_to(next) {
+            Ok(next)
+        } else {
+            Err(crate::error::NucleusError::InvalidStateTransition {
+                from: format!("{:?}", self),
+                to: format!("{:?}", next),
+            })
+        }
+    }
 }
 
 #[cfg(test)]

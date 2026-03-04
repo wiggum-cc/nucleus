@@ -35,9 +35,10 @@ impl CgroupState {
                 | (Configured, Attached)
                 | (Attached, Monitoring)
                 | (Monitoring, Removed)
-                // Error paths
+                // Cleanup paths
                 | (Created, Removed)
                 | (Configured, Removed)
+                | (Attached, Removed)
                 // Stuttering
                 | (Nonexistent, Nonexistent)
                 | (Created, Created)
@@ -51,6 +52,18 @@ impl CgroupState {
     /// Check if this is a terminal state
     pub fn is_terminal(&self) -> bool {
         matches!(self, CgroupState::Removed)
+    }
+
+    /// Transition to the next state, returning an error if the transition is invalid
+    pub fn transition(self, next: CgroupState) -> crate::error::Result<CgroupState> {
+        if self.can_transition_to(next) {
+            Ok(next)
+        } else {
+            Err(crate::error::NucleusError::InvalidStateTransition {
+                from: format!("{:?}", self),
+                to: format!("{:?}", next),
+            })
+        }
     }
 }
 

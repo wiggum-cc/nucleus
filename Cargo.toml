@@ -48,3 +48,7 @@ harness = false
 [[bench]]
 name = "seccomp_filter"
 harness = false
+
+[[bench]]
+name = "concurrency"
+harness = false

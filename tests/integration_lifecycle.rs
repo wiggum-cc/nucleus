@@ -33,7 +33,7 @@ mod tests {
             .expect("Failed to set CPU");
 
         let config = ContainerConfig::new(
-            "test-echo".to_string(),
+            Some("test-echo".to_string()),
             vec!["/bin/echo".to_string(), "hello".to_string()],
         )
         .with_context(context_path)
@@ -54,7 +54,7 @@ mod tests {
     fn test_container_config_builder() {
         // Test the configuration builder pattern
         let config = ContainerConfig::new(
-            "test".to_string(),
+            Some("test".to_string()),
             vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
@@ -103,7 +103,7 @@ mod tests {
     fn test_container_with_device_nodes() {
         // Test that device nodes are accessible in container
         let config = ContainerConfig::new(
-            "test-dev".to_string(),
+            Some("test-dev".to_string()),
             vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
@@ -128,7 +128,7 @@ mod tests {
         namespaces.uts = true; // Enable UTS namespace
 
         let config = ContainerConfig::new(
-            "test-hostname".to_string(),
+            Some("test-hostname".to_string()),
             vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
@@ -172,7 +172,7 @@ mod tests {
         namespaces.uts = true;
 
         let config = ContainerConfig::new(
-            "test-full".to_string(),
+            Some("test-full".to_string()),
             vec!["/bin/sh".to_string(), "/context/test.sh".to_string()],
         )
         .with_context(context_path)
@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn test_container_with_custom_hostname() {
         // Test hostname configuration
-        let config = ContainerConfig::new("test".to_string(), vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::new(Some("test".to_string()), vec!["/bin/sh".to_string()])
             .with_hostname(Some("custom-host".to_string()));
 
         assert_eq!(config.hostname, Some("custom-host".to_string()));
@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn test_container_default_hostname() {
         // Test that default hostname is set to container name
-        let config = ContainerConfig::new("my-container".to_string(), vec!["/bin/sh".to_string()]);
+        let config = ContainerConfig::new(Some("my-container".to_string()), vec!["/bin/sh".to_string()]);
 
         assert_eq!(config.hostname, Some("my-container".to_string()));
     }
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn test_container_rootless_config() {
         let config =
-            ContainerConfig::new("test".to_string(), vec!["/bin/sh".to_string()]).with_rootless();
+            ContainerConfig::new(Some("test".to_string()), vec!["/bin/sh".to_string()]).with_rootless();
 
         assert!(
             config.namespaces.user,
