@@ -134,7 +134,10 @@ pub fn bind_mount_host_paths(root: &Path, best_effort: bool) -> Result<()> {
                         host_path, e
                     ))
                 })?;
-                info!("Bind mounted {} to {:?} (read-only)", host_path, container_path);
+                info!(
+                    "Bind mounted {} to {:?} (read-only)",
+                    host_path, container_path
+                );
             }
             Err(e) => {
                 if best_effort {

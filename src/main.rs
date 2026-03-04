@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use nucleus::checkpoint::CriuRuntime;
 use nucleus::container::{
-    Container, ContainerConfig, ContainerLifecycle, ContainerStateManager, parse_signal,
+    parse_signal, Container, ContainerConfig, ContainerLifecycle, ContainerStateManager,
 };
 use nucleus::filesystem::ContextMode;
 use nucleus::isolation::attach::ContainerAttach;
@@ -224,13 +224,7 @@ fn main() -> Result<()> {
 
                 println!(
                     "{:<15} {:<20} {:<10} {:<10} {:<10} {:<10} {}",
-                    id_display,
-                    name_display,
-                    state.pid,
-                    status,
-                    runtime,
-                    rootless,
-                    command_display
+                    id_display, name_display, state.pid, status, runtime, rootless, command_display
                 );
             }
 
@@ -418,15 +412,17 @@ fn main() -> Result<()> {
                     let mut bridge_config = BridgeConfig::default();
                     // Parse port forwards
                     for spec in &publish {
-                        let pf = PortForward::parse(spec).map_err(|e| {
-                            anyhow::anyhow!("Invalid port forward: {}", e)
-                        })?;
+                        let pf = PortForward::parse(spec)
+                            .map_err(|e| anyhow::anyhow!("Invalid port forward: {}", e))?;
                         bridge_config.port_forwards.push(pf);
                     }
                     NetworkMode::Bridge(bridge_config)
                 }
                 other => {
-                    eprintln!("Unknown network mode: {}. Use none, host, or bridge.", other);
+                    eprintln!(
+                        "Unknown network mode: {}. Use none, host, or bridge.",
+                        other
+                    );
                     std::process::exit(1);
                 }
             };

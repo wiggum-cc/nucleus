@@ -62,10 +62,8 @@ fn test_liveness() {
     // From TLA+: Liveness == <>(state \in {gvisor_kernel})
     // This means: eventually, the state reaches gvisor_kernel
 
-    let mut state = GVisorState::NativeKernel;
-
     // Enable gVisor (single transition)
-    state = GVisorState::GVisorKernel;
+    let state = GVisorState::GVisorKernel;
 
     // Verify we reached the terminal state
     assert_eq!(state, GVisorState::GVisorKernel);
@@ -76,7 +74,7 @@ fn test_liveness() {
 #[test]
 fn test_type_ok() {
     // All states should be valid
-    let states = vec![GVisorState::NativeKernel, GVisorState::GVisorKernel];
+    let states = [GVisorState::NativeKernel, GVisorState::GVisorKernel];
 
     for state in states {
         match state {

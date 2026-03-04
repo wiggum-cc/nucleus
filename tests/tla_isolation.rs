@@ -16,27 +16,50 @@ struct IsolationSpecState {
 /// Driver wrapping the Rust NamespaceState implementation
 struct IsolationDriver {
     state: NamespaceState,
+    pc: i64,
 }
 
 impl IsolationDriver {
     fn new() -> Self {
         Self {
             state: NamespaceState::Uninitialized,
+            pc: 0,
         }
     }
+}
+
+/// Extract pc from ITF state record for stuttering detection
+fn spec_pc(step: &Step) -> Option<i64> {
+    if let itf::Value::Record(ref rec) = step.state {
+        if let Some(itf::Value::BigInt(ref n)) = rec.get("pc") {
+            return n.to_string().parse().ok();
+        }
+    }
+    None
 }
 
 impl Driver for IsolationDriver {
     type State = IsolationSpecState;
 
     fn step(&mut self, step: &Step) -> Result<()> {
+        // Skip stuttering steps (UNCHANGED vars — pc stays the same)
+        if let Some(p) = spec_pc(step) {
+            if p == self.pc {
+                return Ok(());
+            }
+        }
+
         switch!(step {
+            "init" => {
+                // Initial state — already set by new()
+            },
             "uninitialized_create_namespaces" => {
                 // TLA+ transition: uninitialized -> unshared
                 if self.state != NamespaceState::Uninitialized {
                     anyhow::bail!("Invalid state for create_namespaces: {:?}", self.state);
                 }
                 self.state = NamespaceState::Unshared;
+                self.pc += 1;
             },
             "unshared_enter_namespaces" => {
                 // TLA+ transition: unshared -> entered
@@ -44,6 +67,7 @@ impl Driver for IsolationDriver {
                     anyhow::bail!("Invalid state for enter_namespaces: {:?}", self.state);
                 }
                 self.state = NamespaceState::Entered;
+                self.pc += 1;
             },
             "entered_cleanup" => {
                 // TLA+ transition: entered -> cleaned
@@ -51,6 +75,7 @@ impl Driver for IsolationDriver {
                     anyhow::bail!("Invalid state for cleanup: {:?}", self.state);
                 }
                 self.state = NamespaceState::Cleaned;
+                self.pc += 1;
             },
         })
     }
@@ -67,7 +92,7 @@ impl State<IsolationDriver> for IsolationSpecState {
 
         Ok(Self {
             state: state_str.to_string(),
-            pc: 0,
+            pc: driver.pc,
         })
     }
 }
@@ -77,7 +102,7 @@ impl State<IsolationDriver> for IsolationSpecState {
 fn test_isolation_replay_apalache_traces() -> Result<()> {
     let traces = generate_traces(&ApalacheConfig {
         spec: "formal/tla/Nucleus_Isolation_NamespaceLifecycle.tla".into(),
-        inv: "Liveness".into(),
+        inv: "NotTerminated".into(),
         max_traces: 10,
         max_length: 10,
         mode: ApalacheMode::Simulate,
@@ -99,7 +124,14 @@ fn test_isolation_property_no_state_skipping() {
     let invalid_step = Step {
         action_taken: "unshared_enter_namespaces".to_string(),
         nondet_picks: itf::Value::Record(Default::default()),
-        state: itf::Value::Record(Default::default()),
+        state: itf::Value::Record(
+            [(
+                "pc".to_string(),
+                itf::Value::BigInt(itf::value::BigInt::new(1)),
+            )]
+            .into_iter()
+            .collect(),
+        ),
     };
 
     let result = driver.step(&invalid_step);

@@ -12,7 +12,7 @@ use nucleus::isolation::NamespaceState;
 #[test]
 fn test_namespace_state_machine_valid_path() {
     // Verify the happy path: uninitialized -> unshared -> entered -> cleaned
-    let states = vec![
+    let states = [
         NamespaceState::Uninitialized,
         NamespaceState::Unshared,
         NamespaceState::Entered,

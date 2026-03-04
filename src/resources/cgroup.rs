@@ -147,7 +147,8 @@ impl Cgroup {
     ///
     /// State transition: * -> Removed
     pub fn cleanup(mut self) -> Result<()> {
-        self.state = self.state.transition(CgroupState::Removed)?;
+        // Mark as terminal first so Drop doesn't retry if remove fails
+        self.state = CgroupState::Removed;
         info!("Cleaning up cgroup {:?}", self.path);
 
         // Try to remove the cgroup directory

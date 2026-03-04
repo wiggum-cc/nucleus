@@ -23,15 +23,18 @@ VARIABLES
     \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
     \* @type: Seq(Str);
-    event_queue     \* Pending events/messages queue
+    event_queue,     \* Pending events/messages queue
+    \* @type: Str;
+    action_taken     \* MBT: name of the last action (for tla-connect replay)
 
-vars == <<state, pc, history, event_queue>>
+vars == <<state, pc, history, event_queue, action_taken>>
 
 Init ==
     /\ state = nonexistent
     /\ pc = 0
     /\ history = <<>>
     /\ event_queue = <<>>
+    /\ action_taken = "init"
 
 \* Transition actions
 nonexistent_create_cgroup ==
@@ -40,6 +43,7 @@ nonexistent_create_cgroup ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ action_taken' = "nonexistent_create_cgroup"
 
 created_set_limits ==
     /\ state = created
@@ -47,6 +51,7 @@ created_set_limits ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ action_taken' = "created_set_limits"
 
 configured_attach_process ==
     /\ state = configured
@@ -54,6 +59,7 @@ configured_attach_process ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ action_taken' = "configured_attach_process"
 
 attached_start_monitoring ==
     /\ state = attached
@@ -61,6 +67,7 @@ attached_start_monitoring ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ action_taken' = "attached_start_monitoring"
 
 monitoring_cleanup ==
     /\ state = monitoring
@@ -68,6 +75,7 @@ monitoring_cleanup ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ action_taken' = "monitoring_cleanup"
 
 created_cleanup_failed_cgroup ==
     /\ state = created
@@ -75,6 +83,7 @@ created_cleanup_failed_cgroup ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ action_taken' = "created_cleanup_failed_cgroup"
 
 configured_cleanup_failed_cgroup ==
     /\ state = configured
@@ -82,6 +91,15 @@ configured_cleanup_failed_cgroup ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ action_taken' = "configured_cleanup_failed_cgroup"
+
+attached_cleanup ==
+    /\ state = attached
+    /\ state' = removed
+    /\ pc' = pc + 1
+    /\ history' = Append(history, state)
+    /\ event_queue' = event_queue
+    /\ action_taken' = "attached_cleanup"
 
 Next ==
     \/ nonexistent_create_cgroup
@@ -91,6 +109,7 @@ Next ==
     \/ monitoring_cleanup
     \/ created_cleanup_failed_cgroup
     \/ configured_cleanup_failed_cgroup
+    \/ attached_cleanup
     \/ UNCHANGED vars
 
 \* Stuttering step (system does nothing)
@@ -122,6 +141,9 @@ HistoryConsistent ==
 Prop_resource_limits_enforced == [][(state = configured) => (((state' = attached) \/ (state' = monitoring)) \/ (state' = removed))]_vars
 Prop_cleanup_guaranteed == []((state = created) => (<>(state = removed)))
 Prop_no_resource_leak == [][(state = removed) => (state' = removed)]_vars
+
+\* State invariant for trace generation (negated to find terminating traces)
+NotTerminated == state \notin TerminalStates
 
 \* Liveness: Eventually reaches a terminal state
 Liveness ==

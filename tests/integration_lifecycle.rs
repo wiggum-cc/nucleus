@@ -5,7 +5,6 @@
 ///
 /// State transitions tested:
 /// test_start -> container_created -> container_running -> container_exited -> cleanup_done
-
 #[cfg(test)]
 mod tests {
     use nucleus::container::{Container, ContainerConfig};
@@ -200,15 +199,18 @@ mod tests {
     #[test]
     fn test_container_default_hostname() {
         // Test that default hostname is set to container name
-        let config = ContainerConfig::new(Some("my-container".to_string()), vec!["/bin/sh".to_string()]);
+        let config = ContainerConfig::new(
+            Some("my-container".to_string()),
+            vec!["/bin/sh".to_string()],
+        );
 
         assert_eq!(config.hostname, Some("my-container".to_string()));
     }
 
     #[test]
     fn test_container_rootless_config() {
-        let config =
-            ContainerConfig::new(Some("test".to_string()), vec!["/bin/sh".to_string()]).with_rootless();
+        let config = ContainerConfig::new(Some("test".to_string()), vec!["/bin/sh".to_string()])
+            .with_rootless();
 
         assert!(
             config.namespaces.user,

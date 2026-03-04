@@ -12,7 +12,7 @@ use nucleus::resources::CgroupState;
 #[test]
 fn test_cgroup_state_machine_happy_path() {
     // Verify the happy path: nonexistent -> created -> configured -> attached -> monitoring -> removed
-    let states = vec![
+    let states = [
         CgroupState::Nonexistent,
         CgroupState::Created,
         CgroupState::Configured,
@@ -115,10 +115,11 @@ fn test_cgroup_property_cleanup_guaranteed() {
 
 #[test]
 fn test_cgroup_error_paths() {
-    // Error paths allow jumping to Removed from Created or Configured
+    // Cleanup paths allow jumping to Removed from Created, Configured, or Attached
 
     assert!(CgroupState::Created.can_transition_to(CgroupState::Removed));
     assert!(CgroupState::Configured.can_transition_to(CgroupState::Removed));
+    assert!(CgroupState::Attached.can_transition_to(CgroupState::Removed));
 }
 
 #[test]

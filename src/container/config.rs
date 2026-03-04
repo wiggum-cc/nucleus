@@ -3,14 +3,26 @@ use crate::resources::ResourceLimits;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-/// Generate a unique 12-hex-char container ID from timestamp and PID
+/// Generate a unique 12-hex-char container ID using /dev/urandom
 pub fn generate_container_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    let pid = std::process::id() as u64;
-    format!("{:012x}", (nanos ^ pid) & 0xFFFF_FFFF_FFFF)
+    use std::io::Read;
+
+    let mut buf = [0u8; 6];
+    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf).map(|_| ())) {
+        Ok(()) => {}
+        Err(_) => {
+            // Fallback to timestamp-based if /dev/urandom unavailable
+            let nanos = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            buf.copy_from_slice(&nanos.to_le_bytes()[..6]);
+        }
+    }
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]
+    )
 }
 
 /// Container configuration

@@ -16,44 +16,67 @@ struct FilesystemSpecState {
 /// Driver wrapping the Rust FilesystemState implementation
 struct FilesystemDriver {
     state: FilesystemState,
+    pc: i64,
 }
 
 impl FilesystemDriver {
     fn new() -> Self {
         Self {
             state: FilesystemState::Unmounted,
+            pc: 0,
         }
     }
+}
+
+/// Extract pc from ITF state record for stuttering detection
+fn spec_pc(step: &Step) -> Option<i64> {
+    if let itf::Value::Record(ref rec) = step.state {
+        if let Some(itf::Value::BigInt(ref n)) = rec.get("pc") {
+            return n.to_string().parse().ok();
+        }
+    }
+    None
 }
 
 impl Driver for FilesystemDriver {
     type State = FilesystemSpecState;
 
     fn step(&mut self, step: &Step) -> Result<()> {
+        // Skip stuttering steps (UNCHANGED vars — pc stays the same)
+        if let Some(p) = spec_pc(step) {
+            if p == self.pc {
+                return Ok(());
+            }
+        }
+
         switch!(step {
             "unmounted_mount_tmpfs" => {
                 if self.state != FilesystemState::Unmounted {
                     anyhow::bail!("Invalid state for mount_tmpfs: {:?}", self.state);
                 }
                 self.state = FilesystemState::Mounted;
+                self.pc += 1;
             },
             "mounted_populate_context" => {
                 if self.state != FilesystemState::Mounted {
                     anyhow::bail!("Invalid state for populate_context: {:?}", self.state);
                 }
                 self.state = FilesystemState::Populated;
+                self.pc += 1;
             },
             "populated_pivot_root" => {
                 if self.state != FilesystemState::Populated {
                     anyhow::bail!("Invalid state for pivot_root: {:?}", self.state);
                 }
                 self.state = FilesystemState::Pivoted;
+                self.pc += 1;
             },
             "pivoted_cleanup" => {
                 if self.state != FilesystemState::Pivoted {
                     anyhow::bail!("Invalid state for cleanup: {:?}", self.state);
                 }
                 self.state = FilesystemState::UnmountedFinal;
+                self.pc += 1;
             },
         })
     }
@@ -71,7 +94,7 @@ impl State<FilesystemDriver> for FilesystemSpecState {
 
         Ok(Self {
             state: state_str.to_string(),
-            pc: 0,
+            pc: driver.pc,
         })
     }
 }
@@ -81,7 +104,7 @@ impl State<FilesystemDriver> for FilesystemSpecState {
 fn test_filesystem_replay_apalache_traces() -> Result<()> {
     let traces = generate_traces(&ApalacheConfig {
         spec: "formal/tla/Nucleus_Filesystem_FilesystemLifecycle.tla".into(),
-        inv: "Liveness".into(),
+        inv: "NotTerminated".into(),
         max_traces: 10,
         max_length: 10,
         mode: ApalacheMode::Simulate,
@@ -93,20 +116,24 @@ fn test_filesystem_replay_apalache_traces() -> Result<()> {
     Ok(())
 }
 
-// Manual trace test removed - use Apalache-generated traces instead
-
 #[test]
 fn test_filesystem_property_context_isolation() {
-    // Property: Once pivoted, can only move to pivoted or unmounted_final
     let mut driver = FilesystemDriver {
         state: FilesystemState::Pivoted,
+        pc: 3,
     };
 
-    // Try to go back to populated (should fail)
     let invalid_step = Step {
         action_taken: "mounted_populate_context".to_string(),
         nondet_picks: itf::Value::Record(Default::default()),
-        state: itf::Value::Record(Default::default()),
+        state: itf::Value::Record(
+            [(
+                "pc".to_string(),
+                itf::Value::BigInt(itf::value::BigInt::new(4)),
+            )]
+            .into_iter()
+            .collect(),
+        ),
     };
 
     let result = driver.step(&invalid_step);
@@ -118,14 +145,19 @@ fn test_filesystem_property_context_isolation() {
 
 #[test]
 fn test_filesystem_property_mount_ordering() {
-    // Property: Must mount before populating
     let mut driver = FilesystemDriver::new();
 
-    // Try to populate without mounting first
     let invalid_step = Step {
         action_taken: "mounted_populate_context".to_string(),
         nondet_picks: itf::Value::Record(Default::default()),
-        state: itf::Value::Record(Default::default()),
+        state: itf::Value::Record(
+            [(
+                "pc".to_string(),
+                itf::Value::BigInt(itf::value::BigInt::new(1)),
+            )]
+            .into_iter()
+            .collect(),
+        ),
     };
 
     let result = driver.step(&invalid_step);

@@ -22,15 +22,18 @@ VARIABLES
     \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
     \* @type: Seq(Str);
-    event_queue     \* Pending events/messages queue
+    event_queue,     \* Pending events/messages queue
+    \* @type: Str;
+    action_taken     \* MBT: name of the last action (for tla-connect replay)
 
-vars == <<state, pc, history, event_queue>>
+vars == <<state, pc, history, event_queue, action_taken>>
 
 Init ==
     /\ state = privileged
     /\ pc = 0
     /\ history = <<>>
     /\ event_queue = <<>>
+    /\ action_taken = "init"
 
 \* Transition actions
 privileged_drop_capabilities ==
@@ -39,6 +42,7 @@ privileged_drop_capabilities ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ action_taken' = "privileged_drop_capabilities"
 
 capabilities_dropped_apply_seccomp ==
     /\ state = capabilities_dropped
@@ -46,18 +50,29 @@ capabilities_dropped_apply_seccomp ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ action_taken' = "capabilities_dropped_apply_seccomp"
 
-seccomp_applied_finalize ==
+seccomp_applied_apply_landlock ==
     /\ state = seccomp_applied
+    /\ state' = landlock_applied
+    /\ pc' = pc + 1
+    /\ history' = Append(history, state)
+    /\ event_queue' = event_queue
+    /\ action_taken' = "seccomp_applied_apply_landlock"
+
+landlock_applied_finalize ==
+    /\ state = landlock_applied
     /\ state' = locked
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ action_taken' = "landlock_applied_finalize"
 
 Next ==
     \/ privileged_drop_capabilities
     \/ capabilities_dropped_apply_seccomp
-    \/ seccomp_applied_finalize
+    \/ seccomp_applied_apply_landlock
+    \/ landlock_applied_finalize
     \/ UNCHANGED vars
 
 \* Stuttering step (system does nothing)
@@ -86,9 +101,13 @@ HistoryConsistent ==
     Len(history) = pc
 
 \* Temporal properties (LTL)
-Prop_irreversible_lockdown == [][(state = seccomp_applied) => ((state' = seccomp_applied) \/ (state' = locked))]_vars
-Prop_defense_in_depth == []((state = locked) => ((state = capabilities_dropped) /\ (state = seccomp_applied)))
+Prop_irreversible_lockdown == [][(state = seccomp_applied) => ((state' = seccomp_applied) \/ (state' = landlock_applied))]_vars
+Prop_landlock_lockdown == [][(state = landlock_applied) => ((state' = landlock_applied) \/ (state' = locked))]_vars
+Prop_defense_in_depth == []((state = locked) => ((state = capabilities_dropped) /\ (state = seccomp_applied) /\ (state = landlock_applied)))
 Prop_no_privilege_escalation == [][(state = capabilities_dropped) => (~(state' = privileged))]_vars
+
+\* State invariant for trace generation (negated to find terminating traces)
+NotTerminated == state \notin TerminalStates
 
 \* Liveness: Eventually reaches a terminal state
 Liveness ==
@@ -102,6 +121,7 @@ DeadlockFree ==
 CanReach_privileged == <>(state = privileged)
 CanReach_capabilities_dropped == <>(state = capabilities_dropped)
 CanReach_seccomp_applied == <>(state = seccomp_applied)
+CanReach_landlock_applied == <>(state = landlock_applied)
 CanReach_locked == <>(state = locked)
 
 ========================================================

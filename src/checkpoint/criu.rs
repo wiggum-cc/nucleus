@@ -23,9 +23,7 @@ impl CriuRuntime {
         let output = Command::new(&binary_path)
             .arg("--version")
             .output()
-            .map_err(|e| {
-                NucleusError::CheckpointError(format!("Failed to execute criu: {}", e))
-            })?;
+            .map_err(|e| NucleusError::CheckpointError(format!("Failed to execute criu: {}", e)))?;
 
         if !output.status.success() {
             return Err(NucleusError::CheckpointError(
@@ -39,11 +37,33 @@ impl CriuRuntime {
         Ok(Self { binary_path })
     }
 
+    /// Validate a binary path for safe execution
+    fn validate_binary(path: &Path) -> Result<()> {
+        let metadata = fs::metadata(path).map_err(|e| {
+            NucleusError::CheckpointError(format!("Cannot stat criu binary {:?}: {}", path, e))
+        })?;
+        let mode = metadata.permissions().mode();
+        if mode & 0o022 != 0 {
+            return Err(NucleusError::CheckpointError(format!(
+                "criu binary {:?} is writable by group/others (mode {:o}), refusing to execute",
+                path, mode
+            )));
+        }
+        if mode & 0o111 == 0 {
+            return Err(NucleusError::CheckpointError(format!(
+                "criu binary {:?} is not executable",
+                path
+            )));
+        }
+        Ok(())
+    }
+
     fn find_binary() -> Result<PathBuf> {
         // Check common locations
         for path in &["/usr/sbin/criu", "/usr/bin/criu", "/usr/local/sbin/criu"] {
             let p = PathBuf::from(path);
             if p.exists() {
+                Self::validate_binary(&p)?;
                 return Ok(p);
             }
         }
@@ -52,7 +72,9 @@ impl CriuRuntime {
         if let Ok(output) = Command::new("which").arg("criu").output() {
             if output.status.success() {
                 let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                return Ok(PathBuf::from(path));
+                let p = PathBuf::from(&path);
+                Self::validate_binary(&p)?;
+                return Ok(p);
             }
         }
 
@@ -99,10 +121,7 @@ impl CriuRuntime {
         // Create images subdirectory
         let images_dir = output_dir.join("images");
         fs::create_dir_all(&images_dir).map_err(|e| {
-            NucleusError::CheckpointError(format!(
-                "Failed to create images directory: {}",
-                e
-            ))
+            NucleusError::CheckpointError(format!("Failed to create images directory: {}", e))
         })?;
 
         // Run criu dump
@@ -188,10 +207,12 @@ impl CriuRuntime {
 
         // Parse PID from criu output (criu prints the restored PID)
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let pid: u32 = stdout
-            .trim()
-            .parse()
-            .unwrap_or(0);
+        let pid: u32 = stdout.trim().parse().map_err(|_| {
+            NucleusError::CheckpointError(format!(
+                "Failed to parse restored PID from criu output: '{}'",
+                stdout.trim()
+            ))
+        })?;
 
         info!("Restore complete, new PID: {}", pid);
         Ok(pid)

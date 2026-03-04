@@ -40,7 +40,7 @@ impl LandlockManager {
     /// - `/context`:         read-only (pre-populated agent data)
     ///
     /// Everything else is denied by the ruleset.
-    pub fn apply_container_policy(&mut self) -> Result<()> {
+    pub fn apply_container_policy(&mut self) -> Result<bool> {
         self.apply_container_policy_with_mode(false)
     }
 
@@ -48,36 +48,38 @@ impl LandlockManager {
     ///
     /// When `best_effort` is true, failures (e.g. kernel without Landlock) are
     /// logged and execution continues.
-    pub fn apply_container_policy_with_mode(&mut self, best_effort: bool) -> Result<()> {
+    pub fn apply_container_policy_with_mode(&mut self, best_effort: bool) -> Result<bool> {
         if self.applied {
             debug!("Landlock policy already applied, skipping");
-            return Ok(());
+            return Ok(true);
         }
 
         info!("Applying Landlock filesystem policy");
 
         match self.build_and_restrict() {
-            Ok(status) => {
-                self.applied = true;
-                match status {
-                    RulesetStatus::FullyEnforced => {
-                        info!("Landlock policy fully enforced");
-                    }
-                    RulesetStatus::PartiallyEnforced => {
-                        info!(
-                            "Landlock policy partially enforced (kernel lacks some access rights)"
-                        );
-                    }
-                    RulesetStatus::NotEnforced => {
-                        warn!("Landlock not enforced (kernel does not support Landlock)");
-                    }
+            Ok(status) => match status {
+                RulesetStatus::FullyEnforced => {
+                    self.applied = true;
+                    info!("Landlock policy fully enforced");
+                    Ok(true)
                 }
-                Ok(())
-            }
+                RulesetStatus::PartiallyEnforced => {
+                    self.applied = true;
+                    info!("Landlock policy partially enforced (kernel lacks some access rights)");
+                    Ok(true)
+                }
+                RulesetStatus::NotEnforced => {
+                    warn!("Landlock not enforced (kernel does not support Landlock)");
+                    Ok(false)
+                }
+            },
             Err(e) => {
                 if best_effort {
-                    warn!("Failed to apply Landlock policy: {} (continuing without Landlock)", e);
-                    Ok(())
+                    warn!(
+                        "Failed to apply Landlock policy: {} (continuing without Landlock)",
+                        e
+                    );
+                    Ok(false)
                 } else {
                     Err(e)
                 }

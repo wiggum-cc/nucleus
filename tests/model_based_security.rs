@@ -12,7 +12,7 @@ use nucleus::security::SecurityState;
 #[test]
 fn test_security_state_machine_valid_path() {
     // Verify the happy path: privileged -> capabilities_dropped -> seccomp_applied -> landlock_applied -> locked
-    let states = vec![
+    let states = [
         SecurityState::Privileged,
         SecurityState::CapabilitiesDropped,
         SecurityState::SeccompApplied,

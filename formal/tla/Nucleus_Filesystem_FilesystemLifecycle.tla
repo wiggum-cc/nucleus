@@ -22,15 +22,18 @@ VARIABLES
     \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
     \* @type: Seq(Str);
-    event_queue     \* Pending events/messages queue
+    event_queue,     \* Pending events/messages queue
+    \* @type: Str;
+    action_taken     \* MBT: name of the last action (for tla-connect replay)
 
-vars == <<state, pc, history, event_queue>>
+vars == <<state, pc, history, event_queue, action_taken>>
 
 Init ==
     /\ state = unmounted
     /\ pc = 0
     /\ history = <<>>
     /\ event_queue = <<>>
+    /\ action_taken = "init"
 
 \* Transition actions
 unmounted_mount_tmpfs ==
@@ -39,6 +42,7 @@ unmounted_mount_tmpfs ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ action_taken' = "unmounted_mount_tmpfs"
 
 mounted_populate_context ==
     /\ state = mounted
@@ -46,6 +50,7 @@ mounted_populate_context ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ action_taken' = "mounted_populate_context"
 
 populated_pivot_root ==
     /\ state = populated
@@ -53,6 +58,7 @@ populated_pivot_root ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ action_taken' = "populated_pivot_root"
 
 pivoted_cleanup ==
     /\ state = pivoted
@@ -60,6 +66,7 @@ pivoted_cleanup ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ action_taken' = "pivoted_cleanup"
 
 Next ==
     \/ unmounted_mount_tmpfs
@@ -97,6 +104,9 @@ HistoryConsistent ==
 Prop_context_isolation == [][(state = pivoted) => ((state' = pivoted) \/ (state' = unmounted_final))]_vars
 Prop_ephemeral_guarantee == [][(state = unmounted_final) => (state' = unmounted_final)]_vars
 Prop_mount_ordering == [][(state = populated) => ((state' = pivoted) \/ (state' = unmounted_final))]_vars
+
+\* State invariant for trace generation (negated to find terminating traces)
+NotTerminated == state \notin TerminalStates
 
 \* Liveness: Eventually reaches a terminal state
 Liveness ==

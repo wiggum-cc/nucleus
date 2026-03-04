@@ -53,8 +53,10 @@ impl TmpfsMount {
             Some(options.as_str())
         };
 
-        // Mount tmpfs with nosuid, nodev, noexec for security
-        let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
+        // Mount tmpfs with nosuid, nodev for security
+        // Note: MS_NOEXEC is omitted so user binaries in /context/ can execute.
+        // Execution control is provided by seccomp + capability drop + Landlock.
+        let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
 
         mount(
             Some("tmpfs"),

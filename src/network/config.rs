@@ -51,6 +51,9 @@ impl PortForward {
     /// Parse a port forward spec like "8080:80" or "8080:80/udp"
     pub fn parse(spec: &str) -> Result<Self, String> {
         let (ports, protocol) = if let Some((p, proto)) = spec.rsplit_once('/') {
+            if proto != "tcp" && proto != "udp" {
+                return Err(format!("Invalid protocol '{}', must be tcp or udp", proto));
+            }
             (p, proto.to_string())
         } else {
             (spec, "tcp".to_string())
@@ -58,7 +61,10 @@ impl PortForward {
 
         let parts: Vec<&str> = ports.split(':').collect();
         if parts.len() != 2 {
-            return Err(format!("Invalid port forward format '{}', expected HOST:CONTAINER", spec));
+            return Err(format!(
+                "Invalid port forward format '{}', expected HOST:CONTAINER",
+                spec
+            ));
         }
 
         let host_port: u16 = parts[0]

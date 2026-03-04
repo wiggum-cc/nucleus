@@ -20,7 +20,10 @@ impl ContainerLifecycle {
         let pid = Pid::from_raw(state.pid as i32);
 
         // Send SIGTERM
-        info!("Sending SIGTERM to container {} (PID {})", state.id, state.pid);
+        info!(
+            "Sending SIGTERM to container {} (PID {})",
+            state.id, state.pid
+        );
         if let Err(e) = kill(pid, Signal::SIGTERM) {
             if e == nix::errno::Errno::ESRCH {
                 info!("Process already exited");
@@ -114,9 +117,8 @@ impl ContainerLifecycle {
 pub fn parse_signal(s: &str) -> Result<Signal> {
     // Try numeric
     if let Ok(num) = s.parse::<i32>() {
-        return Signal::try_from(num).map_err(|_| {
-            NucleusError::ConfigError(format!("Invalid signal number: {}", num))
-        });
+        return Signal::try_from(num)
+            .map_err(|_| NucleusError::ConfigError(format!("Invalid signal number: {}", num)));
     }
 
     // Try name (with or without SIG prefix)
@@ -135,10 +137,7 @@ pub fn parse_signal(s: &str) -> Result<Signal> {
             "USR2" => Ok(Signal::SIGUSR2),
             "STOP" => Ok(Signal::SIGSTOP),
             "CONT" => Ok(Signal::SIGCONT),
-            _ => Err(NucleusError::ConfigError(format!(
-                "Unknown signal: {}",
-                s
-            ))),
+            _ => Err(NucleusError::ConfigError(format!("Unknown signal: {}", s))),
         };
     };
 
@@ -152,10 +151,7 @@ pub fn parse_signal(s: &str) -> Result<Signal> {
         "SIGUSR2" => Ok(Signal::SIGUSR2),
         "SIGSTOP" => Ok(Signal::SIGSTOP),
         "SIGCONT" => Ok(Signal::SIGCONT),
-        _ => Err(NucleusError::ConfigError(format!(
-            "Unknown signal: {}",
-            s
-        ))),
+        _ => Err(NucleusError::ConfigError(format!("Unknown signal: {}", s))),
     }
 }
 

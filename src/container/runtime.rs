@@ -13,8 +13,9 @@ use crate::security::{
 };
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::{fork, ForkResult, Pid};
+use nix::unistd::{fork, pipe, read, write, ForkResult, Pid};
 use std::ffi::CString;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicI32, Ordering};
 use tempfile::Builder;
 use tracing::{debug, error, info, warn};
@@ -114,31 +115,24 @@ impl Container {
             }
         };
 
-        // Create namespace manager
-        let mut namespace_mgr = NamespaceManager::new(config.namespaces.clone());
-
-        // Configure user namespace mapping if provided
-        if let Some(user_config) = &config.user_ns_config {
-            namespace_mgr = namespace_mgr.with_user_mapping(user_config.clone());
-        }
-
-        // Unshare namespaces in parent process
-        namespace_mgr.unshare_namespaces()?;
+        // Child notifies parent after namespaces are ready.
+        let (ready_read, ready_write) = pipe().map_err(|e| {
+            NucleusError::ExecError(format!("Failed to create namespace sync pipe: {}", e))
+        })?;
 
         // Fork child process
         match unsafe { fork() }? {
             ForkResult::Parent { child } => {
+                drop(ready_write);
                 info!("Forked child process: {}", child);
 
-                // Save container state
                 let cgroup_path = cgroup_opt
                     .as_ref()
                     .map(|_| format!("/sys/fs/cgroup/{}", cgroup_name));
-
-                // Convert cpu_quota_us to millicores for storage
-                let cpu_millicores = config.limits.cpu_quota_us.map(|quota| {
-                    (quota * 1000) / config.limits.cpu_period_us
-                });
+                let cpu_millicores = config
+                    .limits
+                    .cpu_quota_us
+                    .map(|quota| (quota * 1000) / config.limits.cpu_period_us);
                 let state = ContainerState::new(
                     config.id.clone(),
                     config.name.clone(),
@@ -150,58 +144,67 @@ impl Container {
                     config.user_ns_config.is_some(),
                     cgroup_path,
                 );
-                state_mgr.save_state(&state)?;
 
-                // Attach child to cgroup if we have one
-                if let Some(ref mut cgroup) = cgroup_opt {
-                    cgroup.attach_process(child.as_raw() as u32)?;
-                }
+                let mut bridge_net: Option<BridgeNetwork> = None;
+                let mut child_waited = false;
+                let run_result: Result<i32> = (|| {
+                    Self::wait_for_namespace_ready(&ready_read, child)?;
+                    state_mgr.save_state(&state)?;
 
-                // Set up bridge networking in parent (needs host netns)
-                let bridge_net = if let NetworkMode::Bridge(ref bridge_config) = config.network {
-                    match BridgeNetwork::setup(child.as_raw() as u32, bridge_config) {
-                        Ok(net) => Some(net),
-                        Err(e) => {
-                            warn!("Failed to set up bridge networking: {}", e);
-                            None
+                    if let Some(ref mut cgroup) = cgroup_opt {
+                        cgroup.attach_process(child.as_raw() as u32)?;
+                    }
+
+                    if let NetworkMode::Bridge(ref bridge_config) = config.network {
+                        match BridgeNetwork::setup(child.as_raw() as u32, bridge_config) {
+                            Ok(net) => bridge_net = Some(net),
+                            Err(e) => warn!("Failed to set up bridge networking: {}", e),
                         }
                     }
-                } else {
-                    None
-                };
 
-                // Set up signal handling
-                self.setup_signal_handlers(child)?;
+                    self.setup_signal_handlers(child)?;
+                    let exit_code = self.wait_for_child(child)?;
+                    child_waited = true;
+                    Ok(exit_code)
+                })();
 
-                // Wait for child to exit
-                let exit_code = self.wait_for_child(child)?;
-
-                // Cleanup bridge networking
                 if let Some(net) = bridge_net {
                     if let Err(e) = net.cleanup() {
                         warn!("Failed to cleanup bridge networking: {}", e);
                     }
                 }
 
-                // Cleanup cgroup if we have one
-                if let Some(cgroup) = cgroup_opt {
-                    cgroup.cleanup()?;
+                if !child_waited {
+                    let _ = kill(child, Signal::SIGKILL);
+                    let _ = waitpid(child, None);
                 }
 
-                // Delete container state
-                state_mgr.delete_state(&config.id)?;
+                if let Some(cgroup) = cgroup_opt {
+                    if let Err(e) = cgroup.cleanup() {
+                        warn!("Failed to cleanup cgroup: {}", e);
+                    }
+                }
 
-                info!(
-                    "Container {} ({}) exited with code {}",
-                    config.name, config.id, exit_code
-                );
+                if let Err(e) = state_mgr.delete_state(&config.id) {
+                    warn!("Failed to delete state for {}: {}", config.id, e);
+                }
 
-                Ok(exit_code)
+                match run_result {
+                    Ok(exit_code) => {
+                        info!(
+                            "Container {} ({}) exited with code {}",
+                            config.name, config.id, exit_code
+                        );
+                        Ok(exit_code)
+                    }
+                    Err(e) => Err(e),
+                }
             }
             ForkResult::Child => {
+                drop(ready_read);
                 // Child process - set up container environment
                 let temp_container = Container { config };
-                match temp_container.setup_and_exec() {
+                match temp_container.setup_and_exec(Some(ready_write)) {
                     Ok(_) => {
                         unreachable!()
                     }
@@ -218,24 +221,36 @@ impl Container {
     ///
     /// This runs in the child process after fork.
     /// Tracks FilesystemState and SecurityState machines to enforce correct ordering.
-    fn setup_and_exec(&self) -> Result<()> {
-        // Check if we should use gVisor
-        if self.config.use_gvisor {
-            return self.setup_and_exec_gvisor();
-        }
+    fn setup_and_exec(&self, ready_pipe: Option<OwnedFd>) -> Result<()> {
         let is_rootless = self.config.user_ns_config.is_some();
 
         // Initialize state machines
         let mut fs_state = FilesystemState::Unmounted;
         let mut sec_state = SecurityState::Privileged;
 
-        // 1. Set hostname if UTS namespace is enabled
-        let namespace_mgr = NamespaceManager::new(self.config.namespaces.clone());
+        // 1. Create namespaces in child and optionally configure user mapping.
+        let mut namespace_mgr = NamespaceManager::new(self.config.namespaces.clone());
+        if let Some(user_config) = &self.config.user_ns_config {
+            namespace_mgr = namespace_mgr.with_user_mapping(user_config.clone());
+        }
+        namespace_mgr.unshare_namespaces()?;
+        if let Some(fd) = ready_pipe.as_ref() {
+            write(fd, &[1u8]).map_err(|e| {
+                NucleusError::ExecError(format!("Failed to notify namespace readiness: {}", e))
+            })?;
+        }
+
+        // 2. Set hostname if UTS namespace is enabled
         if let Some(hostname) = &self.config.hostname {
             namespace_mgr.set_hostname(hostname)?;
         }
 
-        // 2. Mount tmpfs as container root
+        // gVisor flow uses OCI/runsc instead of native mount/isolation path.
+        if self.config.use_gvisor {
+            return self.setup_and_exec_gvisor();
+        }
+
+        // 3. Mount tmpfs as container root
         // Filesystem: Unmounted -> Mounted
         let runtime_dir = Builder::new()
             .prefix("nucleus-runtime-")
@@ -248,66 +263,67 @@ impl Container {
         tmpfs.mount()?;
         fs_state = fs_state.transition(FilesystemState::Mounted)?;
 
-        // 3. Create minimal filesystem structure
+        // 4. Create minimal filesystem structure
         create_minimal_fs(&container_root)?;
 
-        // 4. Create device nodes
+        // 5. Create device nodes
         let dev_path = container_root.join("dev");
         create_dev_nodes(&dev_path)?;
 
-        // 5. Populate context if provided
+        // 6. Populate context if provided
         // Filesystem: Mounted -> Populated
         if let Some(context_dir) = &self.config.context_dir {
             let context_dest = container_root.join("context");
-            LazyContextPopulator::populate(
-                &self.config.context_mode,
-                context_dir,
-                &context_dest,
-            )?;
+            LazyContextPopulator::populate(&self.config.context_mode, context_dir, &context_dest)?;
         }
         fs_state = fs_state.transition(FilesystemState::Populated)?;
 
-        // 6. Bind mount host paths (for accessing host binaries)
+        // 7. Bind mount host paths (for accessing host binaries)
         bind_mount_host_paths(&container_root, is_rootless)?;
 
-        // 7. Mount procfs
+        // 8. Mount procfs
         let proc_path = container_root.join("proc");
         mount_procfs(&proc_path, is_rootless)?;
 
-        // 8. Write resolv.conf for bridge networking (before pivot_root)
+        // 9. Write resolv.conf for bridge networking (before pivot_root)
         if let NetworkMode::Bridge(ref bridge_config) = self.config.network {
             BridgeNetwork::write_resolv_conf(&container_root, &bridge_config.dns)?;
         }
 
-        // 9. Switch root filesystem
+        // 10. Switch root filesystem
         // Filesystem: Populated -> Pivoted
-        switch_root(&container_root, is_rootless)?;
+        switch_root(&container_root, false)?;
         fs_state = fs_state.transition(FilesystemState::Pivoted)?;
         debug!("Filesystem state: {:?}", fs_state);
 
-        // 10. Drop capabilities
+        // 11. Drop capabilities
         // Security: Privileged -> CapabilitiesDropped
         let mut cap_mgr = CapabilityManager::new();
         cap_mgr.drop_all()?;
         sec_state = sec_state.transition(SecurityState::CapabilitiesDropped)?;
 
-        // 11. Apply seccomp filter
+        // 12. Apply seccomp filter
         // Security: CapabilitiesDropped -> SeccompApplied
         let mut seccomp_mgr = SeccompManager::new();
-        seccomp_mgr.apply_minimal_filter_with_mode(is_rootless)?;
-        sec_state = sec_state.transition(SecurityState::SeccompApplied)?;
+        let seccomp_applied = seccomp_mgr.apply_minimal_filter_with_mode(is_rootless)?;
+        if seccomp_applied {
+            sec_state = sec_state.transition(SecurityState::SeccompApplied)?;
+        } else {
+            warn!("Seccomp not enforced; container is running with degraded hardening");
+        }
 
-        // 12. Apply Landlock filesystem policy
-        // Security: SeccompApplied -> LandlockApplied
+        // 13. Apply Landlock filesystem policy
         let mut landlock_mgr = LandlockManager::new();
-        landlock_mgr.apply_container_policy_with_mode(is_rootless)?;
-        sec_state = sec_state.transition(SecurityState::LandlockApplied)?;
-
-        // Security: LandlockApplied -> Locked
-        sec_state = sec_state.transition(SecurityState::Locked)?;
+        let landlock_applied = landlock_mgr.apply_container_policy_with_mode(is_rootless)?;
+        if seccomp_applied && landlock_applied {
+            sec_state = sec_state.transition(SecurityState::LandlockApplied)?;
+            sec_state = sec_state.transition(SecurityState::Locked)?;
+        } else {
+            warn!("Security state not locked; one or more hardening controls are inactive");
+        }
         debug!("Security state: {:?}", sec_state);
 
-        // 13. Exec target process
+        // 14. Exec target process
         self.exec_command()?;
 
         // Should never reach here
@@ -390,7 +406,13 @@ impl Container {
             .collect();
         let args = args?;
 
-        nix::unistd::execve::<std::ffi::CString, std::ffi::CString>(&program, &args, &[])?;
+        let env = vec![
+            CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+                .unwrap(),
+            CString::new("TERM=xterm").unwrap(),
+            CString::new("HOME=/").unwrap(),
+        ];
+        nix::unistd::execve(&program, &args, &env)?;
 
         Ok(())
     }
@@ -462,6 +484,24 @@ impl Container {
             }
         }
     }
+
+    fn wait_for_namespace_ready(ready_read: &OwnedFd, child: Pid) -> Result<()> {
+        let mut byte = [0u8; 1];
+        match read(ready_read.as_raw_fd(), &mut byte) {
+            Ok(1) => Ok(()),
+            Ok(0) => Err(NucleusError::ExecError(format!(
+                "Child {} exited before namespace initialization",
+                child
+            ))),
+            Ok(_) => Err(NucleusError::ExecError(
+                "Invalid namespace sync signal from child".to_string(),
+            )),
+            Err(e) => Err(NucleusError::ExecError(format!(
+                "Failed waiting for child namespace setup: {}",
+                e
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -478,7 +518,8 @@ mod tests {
 
     #[test]
     fn test_container_config_with_name() {
-        let config = ContainerConfig::new(Some("mycontainer".to_string()), vec!["/bin/sh".to_string()]);
+        let config =
+            ContainerConfig::new(Some("mycontainer".to_string()), vec!["/bin/sh".to_string()]);
         assert_eq!(config.name, "mycontainer");
         assert!(!config.id.is_empty());
         assert_ne!(config.id, config.name);

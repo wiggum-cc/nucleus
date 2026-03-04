@@ -4,7 +4,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
@@ -44,6 +44,11 @@ pub struct ContainerState {
     /// UID of the user who created this container
     #[serde(default)]
     pub creator_uid: u32,
+
+    /// Process start time in clock ticks (from /proc/<pid>/stat field 22)
+    /// Used to detect PID reuse in is_running()
+    #[serde(default)]
+    pub start_ticks: u64,
 }
 
 impl ContainerState {
@@ -62,8 +67,10 @@ impl ContainerState {
     ) -> Self {
         let started_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
+
+        let start_ticks = Self::read_start_ticks(pid);
 
         Self {
             id,
@@ -77,19 +84,52 @@ impl ContainerState {
             rootless,
             cgroup_path,
             creator_uid: nix::unistd::Uid::effective().as_raw(),
+            start_ticks,
         }
     }
 
+    /// Read the start time in clock ticks from /proc/<pid>/stat (field 22)
+    fn read_start_ticks(pid: u32) -> u64 {
+        let stat_path = format!("/proc/{}/stat", pid);
+        match std::fs::read_to_string(&stat_path) {
+            Ok(content) => Self::parse_start_ticks(&content).unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
+    /// Parse start time (field 22) from /proc/<pid>/stat content
+    fn parse_start_ticks(content: &str) -> Option<u64> {
+        // Field 2 (comm) is in parens and may contain spaces; find last ')'
+        let after_comm = content.rfind(')')?;
+        let fields: Vec<&str> = content[after_comm + 2..].split_whitespace().collect();
+        // After ')' we have fields 3..N; field 22 is index 19 (22 - 3 = 19)
+        fields.get(19)?.parse().ok()
+    }
+
     /// Check if the container process is still running
+    ///
+    /// Cross-checks PID start time to detect PID reuse after process exit.
     pub fn is_running(&self) -> bool {
-        Path::new(&format!("/proc/{}", self.pid)).exists()
+        let stat_path = format!("/proc/{}/stat", self.pid);
+        match std::fs::read_to_string(&stat_path) {
+            Ok(content) => {
+                if self.start_ticks == 0 {
+                    // Legacy state without start_ticks — fall back to existence check
+                    return true;
+                }
+                Self::parse_start_ticks(&content)
+                    .map(|ticks| ticks == self.start_ticks)
+                    .unwrap_or(false)
+            }
+            Err(_) => false,
+        }
     }
 
     /// Get uptime in seconds
     pub fn uptime(&self) -> u64 {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         now.saturating_sub(self.started_at)
     }
@@ -149,10 +189,10 @@ impl ContainerStateManager {
 
         if !container_id
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         {
             return Err(NucleusError::ConfigError(format!(
-                "Invalid container ID (allowed: a-zA-Z0-9._-): {}",
+                "Invalid container ID (allowed: a-zA-Z0-9_-): {}",
                 container_id
             )));
         }

@@ -57,9 +57,9 @@ impl ContainerAttach {
         }
 
         // Fork child
-        match unsafe { fork() }.map_err(|e| {
-            NucleusError::AttachError(format!("Fork failed: {}", e))
-        })? {
+        match unsafe { fork() }
+            .map_err(|e| NucleusError::AttachError(format!("Fork failed: {}", e)))?
+        {
             ForkResult::Parent { child } => {
                 // Parent: wait for child
                 Self::wait_for_child(child)
@@ -78,6 +78,12 @@ impl ContainerAttach {
     }
 
     fn enter_and_exec(ns_fds: &[(String, File)], command: &[String]) -> Result<()> {
+        if command.is_empty() {
+            return Err(NucleusError::AttachError(
+                "No command specified for attach".to_string(),
+            ));
+        }
+
         // Enter each namespace via setns(2)
         for (ns_name, fd) in ns_fds {
             let raw_fd = fd.as_raw_fd();
@@ -96,21 +102,18 @@ impl ContainerAttach {
         let _ = nix::unistd::chdir("/");
 
         // Exec the command
-        let program = CString::new(command[0].as_str()).map_err(|e| {
-            NucleusError::AttachError(format!("Invalid program name: {}", e))
-        })?;
+        let program = CString::new(command[0].as_str())
+            .map_err(|e| NucleusError::AttachError(format!("Invalid program name: {}", e)))?;
 
         let args: std::result::Result<Vec<CString>, _> = command
             .iter()
             .map(|arg| CString::new(arg.as_str()))
             .collect();
-        let args = args.map_err(|e| {
-            NucleusError::AttachError(format!("Invalid argument: {}", e))
-        })?;
+        let args =
+            args.map_err(|e| NucleusError::AttachError(format!("Invalid argument: {}", e)))?;
 
-        nix::unistd::execve::<CString, CString>(&program, &args, &[]).map_err(|e| {
-            NucleusError::AttachError(format!("execve failed: {}", e))
-        })?;
+        nix::unistd::execve::<CString, CString>(&program, &args, &[])
+            .map_err(|e| NucleusError::AttachError(format!("execve failed: {}", e)))?;
 
         Ok(())
     }
@@ -122,10 +125,7 @@ impl ContainerAttach {
                 Ok(WaitStatus::Signaled(_, signal, _)) => return Ok(128 + signal as i32),
                 Err(nix::errno::Errno::EINTR) => continue,
                 Err(e) => {
-                    return Err(NucleusError::AttachError(format!(
-                        "waitpid failed: {}",
-                        e
-                    )));
+                    return Err(NucleusError::AttachError(format!("waitpid failed: {}", e)));
                 }
                 _ => continue,
             }

@@ -42,7 +42,6 @@ impl SeccompManager {
             libc::SYS_lseek,
             libc::SYS_access,
             libc::SYS_fcntl,
-            libc::SYS_ioctl,
             libc::SYS_readv,
             libc::SYS_writev,
             libc::SYS_pread64,
@@ -138,18 +137,15 @@ impl SeccompManager {
             libc::SYS_set_tid_address,
             libc::SYS_set_robust_list,
             libc::SYS_get_robust_list,
-            libc::SYS_prctl,
             libc::SYS_arch_prctl,
             libc::SYS_sysinfo,
             libc::SYS_umask,
             libc::SYS_getrlimit,
-            libc::SYS_setrlimit,
             libc::SYS_prlimit64,
             libc::SYS_getrusage,
             libc::SYS_times,
             libc::SYS_sched_yield,
             libc::SYS_sched_getaffinity,
-            libc::SYS_sched_setaffinity,
             libc::SYS_getcpu,
             libc::SYS_rseq,
             // Socket/Network (minimal for DNS, etc)
@@ -189,31 +185,64 @@ impl SeccompManager {
         ];
 
         // Allow all these syscalls unconditionally
-        // Use a single always-true condition to avoid empty rules
         for syscall in allowed_syscalls {
-            match SeccompRule::new(vec![]) {
-                Ok(rule) => {
-                    rules.insert(syscall, vec![rule]);
-                }
-                Err(_) => {
-                    // For unconditional allow, create a condition that's always true
-                    // Compare argument 0 (which always exists) >= 0
-                    let condition = SeccompCondition::new(
-                        0,
-                        seccompiler::SeccompCmpArgLen::Dword,
-                        seccompiler::SeccompCmpOp::Ge,
-                        0,
-                    )
-                    .map_err(|e| {
-                        NucleusError::SeccompError(format!("Failed to create condition: {}", e))
-                    })?;
-                    let rule = SeccompRule::new(vec![condition]).map_err(|e| {
-                        NucleusError::SeccompError(format!("Failed to create rule: {}", e))
-                    })?;
-                    rules.insert(syscall, vec![rule]);
-                }
-            }
+            let rule = SeccompRule::new(vec![])
+                .map_err(|e| NucleusError::SeccompError(format!("Failed to create rule: {}", e)))?;
+            rules.insert(syscall, vec![rule]);
         }
+
+        // ioctl: allow only safe terminal operations (arg0 = request code)
+        let ioctl_allowed: &[u64] = &[
+            0x5413, // TIOCGWINSZ
+            0x5401, // TCGETS
+            0x5402, // TCSETS
+            0x541B, // FIONREAD
+            0x5421, // FIONBIO
+        ];
+        let mut ioctl_rules = Vec::new();
+        for &request in ioctl_allowed {
+            let condition = SeccompCondition::new(
+                1, // arg1 is the request code for ioctl(fd, request, ...)
+                seccompiler::SeccompCmpArgLen::Dword,
+                seccompiler::SeccompCmpOp::Eq,
+                request,
+            )
+            .map_err(|e| {
+                NucleusError::SeccompError(format!("Failed to create ioctl condition: {}", e))
+            })?;
+            let rule = SeccompRule::new(vec![condition]).map_err(|e| {
+                NucleusError::SeccompError(format!("Failed to create ioctl rule: {}", e))
+            })?;
+            ioctl_rules.push(rule);
+        }
+        rules.insert(libc::SYS_ioctl, ioctl_rules);
+
+        // prctl: allow only safe operations (arg0 = option)
+        let prctl_allowed: &[u64] = &[
+            1,  // PR_SET_PDEATHSIG
+            2,  // PR_GET_PDEATHSIG
+            15, // PR_SET_NAME
+            16, // PR_GET_NAME
+            38, // PR_SET_NO_NEW_PRIVS
+            39, // PR_GET_NO_NEW_PRIVS
+        ];
+        let mut prctl_rules = Vec::new();
+        for &option in prctl_allowed {
+            let condition = SeccompCondition::new(
+                0, // arg0 is the option for prctl(option, ...)
+                seccompiler::SeccompCmpArgLen::Dword,
+                seccompiler::SeccompCmpOp::Eq,
+                option,
+            )
+            .map_err(|e| {
+                NucleusError::SeccompError(format!("Failed to create prctl condition: {}", e))
+            })?;
+            let rule = SeccompRule::new(vec![condition]).map_err(|e| {
+                NucleusError::SeccompError(format!("Failed to create prctl rule: {}", e))
+            })?;
+            prctl_rules.push(rule);
+        }
+        rules.insert(libc::SYS_prctl, prctl_rules);
 
         Ok(rules)
     }
@@ -250,7 +279,7 @@ impl SeccompManager {
     ///
     /// Once applied, the filter cannot be removed (irreversible property)
     /// In rootless mode or if seccomp setup fails, this will warn and continue
-    pub fn apply_minimal_filter(&mut self) -> Result<()> {
+    pub fn apply_minimal_filter(&mut self) -> Result<bool> {
         self.apply_minimal_filter_with_mode(false)
     }
 
@@ -258,10 +287,10 @@ impl SeccompManager {
     ///
     /// When `best_effort` is true, failures are logged and execution continues.
     /// When false, seccomp setup is fail-closed.
-    pub fn apply_minimal_filter_with_mode(&mut self, best_effort: bool) -> Result<()> {
+    pub fn apply_minimal_filter_with_mode(&mut self, best_effort: bool) -> Result<bool> {
         if self.applied {
             debug!("Seccomp filter already applied, skipping");
-            return Ok(());
+            return Ok(true);
         }
 
         info!("Applying seccomp filter");
@@ -274,7 +303,7 @@ impl SeccompManager {
                         "Failed to create seccomp rules: {} (continuing without seccomp)",
                         e
                     );
-                    return Ok(());
+                    return Ok(false);
                 }
                 return Err(e);
             }
@@ -295,7 +324,7 @@ impl SeccompManager {
                         "Failed to create seccomp filter: {} (continuing without seccomp)",
                         e
                     );
-                    return Ok(());
+                    return Ok(false);
                 }
                 return Err(NucleusError::SeccompError(format!(
                     "Failed to create seccomp filter: {}",
@@ -312,7 +341,7 @@ impl SeccompManager {
                         "Failed to compile BPF program: {} (continuing without seccomp)",
                         e
                     );
-                    return Ok(());
+                    return Ok(false);
                 }
                 return Err(NucleusError::SeccompError(format!(
                     "Failed to compile BPF program: {}",
@@ -326,6 +355,7 @@ impl SeccompManager {
             Ok(_) => {
                 self.applied = true;
                 info!("Successfully applied seccomp filter");
+                Ok(true)
             }
             Err(e) => {
                 if best_effort {
@@ -333,16 +363,15 @@ impl SeccompManager {
                         "Failed to apply seccomp filter: {} (continuing without seccomp)",
                         e
                     );
+                    Ok(false)
                 } else {
-                    return Err(NucleusError::SeccompError(format!(
+                    Err(NucleusError::SeccompError(format!(
                         "Failed to apply seccomp filter: {}",
                         e
-                    )));
+                    )))
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Check if seccomp filter has been applied

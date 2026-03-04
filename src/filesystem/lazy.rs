@@ -20,19 +20,13 @@ impl LazyContextPopulator {
     ///
     /// For BindMount mode, the bind mount must happen before pivot_root
     /// since the source is on the host filesystem.
-    pub fn populate(
-        mode: &ContextMode,
-        source: &Path,
-        dest: &Path,
-    ) -> Result<()> {
+    pub fn populate(mode: &ContextMode, source: &Path, dest: &Path) -> Result<()> {
         match mode {
             ContextMode::Copy => {
                 let populator = ContextPopulator::new(source, dest);
                 populator.populate()
             }
-            ContextMode::BindMount => {
-                Self::bind_mount_context(source, dest)
-            }
+            ContextMode::BindMount => Self::bind_mount_context(source, dest),
         }
     }
 
@@ -54,10 +48,7 @@ impl LazyContextPopulator {
 
         // Ensure destination exists
         std::fs::create_dir_all(dest).map_err(|e| {
-            NucleusError::ContextError(format!(
-                "Failed to create destination {:?}: {}",
-                dest, e
-            ))
+            NucleusError::ContextError(format!("Failed to create destination {:?}: {}", dest, e))
         })?;
 
         info!(
@@ -92,10 +83,7 @@ impl LazyContextPopulator {
             None::<&str>,
         )
         .map_err(|e| {
-            NucleusError::ContextError(format!(
-                "Failed to remount {:?} read-only: {}",
-                dest, e
-            ))
+            NucleusError::ContextError(format!("Failed to remount {:?} read-only: {}", dest, e))
         })?;
 
         info!("Context bind mounted successfully");

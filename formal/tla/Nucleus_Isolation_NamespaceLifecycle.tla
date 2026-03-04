@@ -21,15 +21,18 @@ VARIABLES
     \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
     \* @type: Seq(Str);
-    event_queue     \* Pending events/messages queue
+    event_queue,     \* Pending events/messages queue
+    \* @type: Str;
+    action_taken     \* MBT: name of the last action (for tla-connect replay)
 
-vars == <<state, pc, history, event_queue>>
+vars == <<state, pc, history, event_queue, action_taken>>
 
 Init ==
     /\ state = uninitialized
     /\ pc = 0
     /\ history = <<>>
     /\ event_queue = <<>>
+    /\ action_taken = "init"
 
 \* Transition actions
 uninitialized_create_namespaces ==
@@ -38,6 +41,7 @@ uninitialized_create_namespaces ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ action_taken' = "uninitialized_create_namespaces"
 
 unshared_enter_namespaces ==
     /\ state = unshared
@@ -45,6 +49,7 @@ unshared_enter_namespaces ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ action_taken' = "unshared_enter_namespaces"
 
 entered_cleanup ==
     /\ state = entered
@@ -52,6 +57,7 @@ entered_cleanup ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ action_taken' = "entered_cleanup"
 
 Next ==
     \/ uninitialized_create_namespaces
@@ -87,6 +93,9 @@ HistoryConsistent ==
 \* Temporal properties (LTL)
 Prop_isolation_integrity == [][(state = entered) => ((state' = entered) \/ (state' = cleaned))]_vars
 Prop_cleanup_happens == []((state = entered) => (<>(state = cleaned)))
+
+\* State invariant for trace generation (negated to find terminating traces)
+NotTerminated == state \notin TerminalStates
 
 \* Liveness: Eventually reaches a terminal state
 Liveness ==

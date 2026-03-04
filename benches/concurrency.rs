@@ -310,10 +310,8 @@ fn concurrent_state_file_io(c: &mut Criterion) {
                                 .iter()
                                 .map(|state| {
                                     s.spawn(|| {
-                                        let path =
-                                            dir_path.join(format!("{}.json", state.id));
-                                        let json =
-                                            serde_json::to_string_pretty(state).unwrap();
+                                        let path = dir_path.join(format!("{}.json", state.id));
+                                        let json = serde_json::to_string_pretty(state).unwrap();
                                         fs::write(&path, &json).unwrap();
                                         let loaded = fs::read_to_string(&path).unwrap();
                                         let _: ContainerState =

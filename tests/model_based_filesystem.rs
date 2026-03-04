@@ -12,7 +12,7 @@ use nucleus::filesystem::FilesystemState;
 #[test]
 fn test_filesystem_state_machine_happy_path() {
     // Verify the happy path: unmounted -> mounted -> populated -> pivoted -> unmounted_final
-    let states = vec![
+    let states = [
         FilesystemState::Unmounted,
         FilesystemState::Mounted,
         FilesystemState::Populated,
