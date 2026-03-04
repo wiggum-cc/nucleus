@@ -110,7 +110,10 @@ fn test_isolation_replay_apalache_traces() -> TlaResult<()> {
 
 fn itf_state(index: u64, action: &str, state: &str, pc: i64) -> itf::state::State<itf::Value> {
     itf::state::State {
-        meta: itf::state::Meta { index: Some(index), ..Default::default() },
+        meta: itf::state::Meta {
+            index: Some(index),
+            ..Default::default()
+        },
         value: itf::Value::Record(
             [
                 ("state".into(), itf::Value::String(state.into())),

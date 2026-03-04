@@ -137,7 +137,10 @@ fn test_security_state_comparison() -> TlaResult<()> {
 
 fn itf_state(index: u64, action: &str, state: &str, pc: i64) -> itf::state::State<itf::Value> {
     itf::state::State {
-        meta: itf::state::Meta { index: Some(index), ..Default::default() },
+        meta: itf::state::Meta {
+            index: Some(index),
+            ..Default::default()
+        },
         value: itf::Value::Record(
             [
                 ("state".into(), itf::Value::String(state.into())),
@@ -165,7 +168,12 @@ fn test_security_invalid_transition() {
     // From privileged state, try capabilities_dropped_apply_seccomp (requires CapabilitiesDropped)
     let trace = itf_trace(vec![
         itf_state(0, "init", "privileged", 0),
-        itf_state(1, "capabilities_dropped_apply_seccomp", "seccomp_applied", 1),
+        itf_state(
+            1,
+            "capabilities_dropped_apply_seccomp",
+            "seccomp_applied",
+            1,
+        ),
     ]);
     let result = replay_traces(SecurityDriver::new, &[trace]);
     assert!(result.is_err(), "Should reject invalid transition");

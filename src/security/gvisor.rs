@@ -1,5 +1,6 @@
 use crate::error::{NucleusError, Result};
 use crate::security::OciBundle;
+use nix::unistd::Uid;
 use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -37,6 +38,14 @@ impl GVisorRuntime {
             if let Some(validated) = Self::validate_runsc_path(Path::new(path))? {
                 return Ok(validated);
             }
+        }
+
+        // For privileged execution, do not resolve runtime binaries via PATH.
+        // This avoids environment-based binary hijacking when running as root.
+        if Uid::effective().is_root() {
+            return Err(NucleusError::GVisorError(
+                "runsc binary not found in trusted system paths".to_string(),
+            ));
         }
 
         // Try to find in PATH without invoking a shell command.
@@ -98,6 +107,7 @@ impl GVisorRuntime {
         // Build runsc run command with OCI bundle
         // runsc run --bundle <bundle-path> <container-id>
         let args = vec![
+            self.runsc_path.clone(),
             "run".to_string(),
             "--bundle".to_string(),
             bundle.bundle_path().to_string_lossy().to_string(),

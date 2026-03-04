@@ -84,8 +84,15 @@ impl ContainerAttach {
             ));
         }
 
-        // Enter each namespace via setns(2)
+        // Enter non-PID namespaces first.
+        // PID namespace membership only applies to future children after setns().
+        let mut pid_ns_fd: Option<&File> = None;
         for (ns_name, fd) in ns_fds {
+            if ns_name == "pid" {
+                pid_ns_fd = Some(fd);
+                continue;
+            }
+
             let raw_fd = fd.as_raw_fd();
             let ret = unsafe { libc::setns(raw_fd, 0) };
             if ret != 0 {
@@ -96,6 +103,31 @@ impl ContainerAttach {
                 )));
             }
             info!("Entered {} namespace", ns_name);
+        }
+
+        if let Some(fd) = pid_ns_fd {
+            let ret = unsafe { libc::setns(fd.as_raw_fd(), 0) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(NucleusError::AttachError(format!(
+                    "setns(pid) failed: {}",
+                    err
+                )));
+            }
+            info!("Entered pid namespace");
+
+            // A second fork is required for PID namespace to take effect.
+            match unsafe { fork() }.map_err(|e| {
+                NucleusError::AttachError(format!("Fork failed after setns(pid): {}", e))
+            })? {
+                ForkResult::Parent { child } => {
+                    let code = Self::wait_for_child(child)?;
+                    std::process::exit(code);
+                }
+                ForkResult::Child => {
+                    // Continue and exec below.
+                }
+            }
         }
 
         // Change to root directory of the namespace

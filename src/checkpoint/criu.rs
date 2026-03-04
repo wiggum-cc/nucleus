@@ -1,6 +1,7 @@
 use crate::checkpoint::metadata::CheckpointMetadata;
 use crate::container::ContainerState;
 use crate::error::{NucleusError, Result};
+use nix::unistd::Uid;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -68,13 +69,22 @@ impl CriuRuntime {
             }
         }
 
-        // Try PATH
-        if let Ok(output) = Command::new("which").arg("criu").output() {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let p = PathBuf::from(&path);
-                Self::validate_binary(&p)?;
-                return Ok(p);
+        // For privileged execution, do not resolve runtime binaries via PATH.
+        // This avoids environment-based binary hijacking when running as root.
+        if Uid::effective().is_root() {
+            return Err(NucleusError::CheckpointError(
+                "CRIU binary not found in trusted system paths".to_string(),
+            ));
+        }
+
+        // Try PATH for unprivileged execution.
+        if let Some(path_var) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                let candidate = dir.join("criu");
+                if candidate.exists() {
+                    Self::validate_binary(&candidate)?;
+                    return Ok(candidate);
+                }
             }
         }
 
