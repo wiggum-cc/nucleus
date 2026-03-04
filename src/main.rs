@@ -53,6 +53,10 @@ enum Commands {
         #[arg(long = "io-limit")]
         io_limits: Vec<String>,
 
+        /// Maximum number of PIDs (default: 512, 0 = unlimited)
+        #[arg(long)]
+        pids: Option<u64>,
+
         /// Enable swap (by default swap is disabled when --memory is set)
         #[arg(long)]
         swap: bool,
@@ -72,6 +76,22 @@ enum Commands {
         /// Network mode: none, host, or bridge (default: none)
         #[arg(long, default_value = "none")]
         network: String,
+
+        /// Explicitly allow host network mode (dangerous: weakens isolation)
+        #[arg(long)]
+        allow_host_network: bool,
+
+        /// Allow degraded security if seccomp/Landlock cannot be applied
+        #[arg(long)]
+        allow_degraded_security: bool,
+
+        /// Allow chroot fallback if pivot_root fails (weaker than pivot_root)
+        #[arg(long)]
+        allow_chroot_fallback: bool,
+
+        /// Mount /proc writable (default is read-only for hardening)
+        #[arg(long)]
+        proc_rw: bool,
 
         /// Publish a port (format: HOST:CONTAINER or HOST:CONTAINER/PROTOCOL)
         #[arg(short = 'p', long = "publish")]
@@ -360,12 +380,17 @@ fn main() -> Result<()> {
             cpus,
             cpu_weight,
             io_limits,
+            pids,
             swap,
             hostname,
             runtime,
             rootless,
             oci,
             network,
+            allow_host_network,
+            allow_degraded_security,
+            allow_chroot_fallback,
+            proc_rw,
             publish,
             context_mode,
             command,
@@ -379,8 +404,8 @@ fn main() -> Result<()> {
                 validate_container_name(n)?;
             }
 
-            // Build resource limits
-            let mut limits = ResourceLimits::unlimited();
+            // Build resource limits (default includes pids_max=512)
+            let mut limits = ResourceLimits::default();
 
             if let Some(mem_str) = memory {
                 limits = limits.with_memory(&mem_str)?;
@@ -395,6 +420,16 @@ fn main() -> Result<()> {
             if let Some(weight) = cpu_weight {
                 limits = limits.with_cpu_weight(weight)?;
                 info!("CPU weight: {}", weight);
+            }
+
+            if let Some(max_pids) = pids {
+                if max_pids == 0 {
+                    limits.pids_max = None;
+                    info!("PID limit: unlimited");
+                } else {
+                    limits = limits.with_pids(max_pids)?;
+                    info!("PID limit: {}", max_pids);
+                }
             }
 
             for io_spec in &io_limits {
@@ -446,7 +481,11 @@ fn main() -> Result<()> {
                 .with_limits(limits)
                 .with_namespaces(NamespaceConfig::all())
                 .with_network(net_mode)
-                .with_context_mode(ctx_mode);
+                .with_context_mode(ctx_mode)
+                .with_allow_host_network(allow_host_network)
+                .with_allow_degraded_security(allow_degraded_security)
+                .with_allow_chroot_fallback(allow_chroot_fallback)
+                .with_proc_readonly(!proc_rw);
 
             if let Some(ctx) = context {
                 config = config.with_context(PathBuf::from(ctx));

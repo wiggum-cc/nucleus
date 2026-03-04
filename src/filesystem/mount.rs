@@ -27,18 +27,20 @@ pub fn create_minimal_fs(root: &Path) -> Result<()> {
 /// Create essential device nodes in /dev
 ///
 /// In rootless mode, device node creation will fail gracefully
-pub fn create_dev_nodes(dev_path: &Path) -> Result<()> {
+pub fn create_dev_nodes(dev_path: &Path, include_tty: bool) -> Result<()> {
     info!("Creating device nodes at {:?}", dev_path);
 
     // Device nodes: (name, type, major, minor)
-    let devices = vec![
+    let mut devices = vec![
         ("null", SFlag::S_IFCHR, 1, 3),
         ("zero", SFlag::S_IFCHR, 1, 5),
         ("full", SFlag::S_IFCHR, 1, 7),
         ("random", SFlag::S_IFCHR, 1, 8),
         ("urandom", SFlag::S_IFCHR, 1, 9),
-        ("tty", SFlag::S_IFCHR, 5, 0),
     ];
+    if include_tty {
+        devices.push(("tty", SFlag::S_IFCHR, 5, 0));
+    }
 
     let mut created_count = 0;
     let mut failed_count = 0;
@@ -124,7 +126,12 @@ pub fn bind_mount_host_paths(root: &Path, best_effort: bool) -> Result<()> {
                     None::<&str>,
                     &container_path,
                     None::<&str>,
-                    MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY | MsFlags::MS_REC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+                    MsFlags::MS_REMOUNT
+                        | MsFlags::MS_BIND
+                        | MsFlags::MS_RDONLY
+                        | MsFlags::MS_REC
+                        | MsFlags::MS_NOSUID
+                        | MsFlags::MS_NODEV,
                     None::<&str>,
                 )
                 .map_err(|e| {
@@ -160,7 +167,7 @@ pub fn bind_mount_host_paths(root: &Path, best_effort: bool) -> Result<()> {
 /// Mount procfs at the given path
 ///
 /// In rootless mode, procfs mounting should work due to user namespace capabilities
-pub fn mount_procfs(proc_path: &Path, best_effort: bool) -> Result<()> {
+pub fn mount_procfs(proc_path: &Path, best_effort: bool, read_only: bool) -> Result<()> {
     info!("Mounting procfs at {:?}", proc_path);
 
     match mount(
@@ -171,7 +178,28 @@ pub fn mount_procfs(proc_path: &Path, best_effort: bool) -> Result<()> {
         None::<&str>,
     ) {
         Ok(_) => {
-            info!("Successfully mounted procfs");
+            if read_only {
+                mount(
+                    None::<&str>,
+                    proc_path,
+                    None::<&str>,
+                    MsFlags::MS_REMOUNT
+                        | MsFlags::MS_RDONLY
+                        | MsFlags::MS_NOSUID
+                        | MsFlags::MS_NODEV
+                        | MsFlags::MS_NOEXEC,
+                    None::<&str>,
+                )
+                .map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to remount procfs read-only: {}",
+                        e
+                    ))
+                })?;
+                info!("Successfully mounted procfs (read-only)");
+            } else {
+                info!("Successfully mounted procfs");
+            }
             Ok(())
         }
         Err(e) => {
@@ -188,11 +216,64 @@ pub fn mount_procfs(proc_path: &Path, best_effort: bool) -> Result<()> {
     }
 }
 
+/// Mask sensitive /proc paths by bind-mounting /dev/null or tmpfs over them
+///
+/// This reduces kernel information leakage from the container. Follows OCI runtime
+/// conventions for masked paths.
+pub fn mask_proc_paths(proc_path: &Path) -> Result<()> {
+    info!("Masking sensitive /proc paths");
+
+    // Paths to mask with /dev/null (files)
+    let null_masked = ["kallsyms", "kcore", "sched_debug", "timer_list"];
+
+    // Paths to mask with empty tmpfs (directories)
+    let tmpfs_masked = ["acpi", "bus", "irq", "scsi", "sys"];
+
+    let dev_null = Path::new("/dev/null");
+
+    for name in &null_masked {
+        let target = proc_path.join(name);
+        if !target.exists() {
+            continue;
+        }
+        match mount(
+            Some(dev_null),
+            &target,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        ) {
+            Ok(_) => debug!("Masked /proc/{}", name),
+            Err(e) => warn!("Failed to mask /proc/{}: {} (continuing)", name, e),
+        }
+    }
+
+    for name in &tmpfs_masked {
+        let target = proc_path.join(name);
+        if !target.exists() {
+            continue;
+        }
+        match mount(
+            Some("tmpfs"),
+            &target,
+            Some("tmpfs"),
+            MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+            Some("size=0"),
+        ) {
+            Ok(_) => debug!("Masked /proc/{}", name),
+            Err(e) => warn!("Failed to mask /proc/{}: {} (continuing)", name, e),
+        }
+    }
+
+    info!("Finished masking sensitive /proc paths");
+    Ok(())
+}
+
 /// Switch to new root filesystem using pivot_root or chroot
 ///
 /// This implements the transition: populated -> pivoted
 /// Fails closed if root switching cannot be established.
-pub fn switch_root(new_root: &Path) -> Result<()> {
+pub fn switch_root(new_root: &Path, allow_chroot_fallback: bool) -> Result<()> {
     info!("Switching root to {:?}", new_root);
 
     match pivot_root_impl(new_root) {
@@ -201,28 +282,22 @@ pub fn switch_root(new_root: &Path) -> Result<()> {
             Ok(())
         }
         Err(e) => {
-            if allow_chroot_fallback() {
+            if allow_chroot_fallback {
                 warn!(
-                    "pivot_root failed ({}), falling back to chroot because \
-                     NUCLEUS_ALLOW_CHROOT_FALLBACK is enabled",
+                    "pivot_root failed ({}), falling back to chroot due to explicit \
+                     configuration",
                     e
                 );
                 chroot_impl(new_root)
             } else {
                 Err(NucleusError::PivotRootError(format!(
-                    "pivot_root failed: {}. chroot fallback is disabled by default; set \
-                     NUCLEUS_ALLOW_CHROOT_FALLBACK=1 to allow weaker isolation",
+                    "pivot_root failed: {}. chroot fallback is disabled by default; use \
+                     --allow-chroot-fallback to allow weaker isolation",
                     e
                 )))
             }
         }
     }
-}
-
-fn allow_chroot_fallback() -> bool {
-    std::env::var("NUCLEUS_ALLOW_CHROOT_FALLBACK")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
 }
 
 /// Implement root switch using pivot_root(2)

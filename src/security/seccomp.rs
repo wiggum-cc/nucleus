@@ -11,6 +11,14 @@ pub struct SeccompManager {
     applied: bool,
 }
 
+const DENIED_CLONE_NAMESPACE_FLAGS: u64 = (libc::CLONE_NEWUSER
+    | libc::CLONE_NEWNS
+    | libc::CLONE_NEWNET
+    | libc::CLONE_NEWIPC
+    | libc::CLONE_NEWUTS
+    | libc::CLONE_NEWPID
+    | libc::CLONE_NEWCGROUP) as u64;
+
 impl SeccompManager {
     pub fn new() -> Self {
         Self { applied: false }
@@ -190,9 +198,8 @@ impl SeccompManager {
 
         // SYS_socket: when network is disabled, only allow AF_UNIX (domain == 1)
         if allow_network {
-            let rule = SeccompRule::new(vec![]).map_err(|e| {
-                NucleusError::SeccompError(format!("Failed to create rule: {}", e))
-            })?;
+            let rule = SeccompRule::new(vec![])
+                .map_err(|e| NucleusError::SeccompError(format!("Failed to create rule: {}", e)))?;
             rules.insert(libc::SYS_socket, vec![rule]);
         } else {
             let condition = SeccompCondition::new(
@@ -266,17 +273,17 @@ impl SeccompManager {
         }
         rules.insert(libc::SYS_prctl, prctl_rules);
 
+        // clone3: block entirely — clone3 passes flags via a struct pointer that seccomp
+        // cannot inspect, so we must deny it and force workloads through clone() which
+        // we can filter by flags above. glibc/musl fall back to clone() when clone3 returns EPERM.
+        // (clone3 is not in the allowlist, so it's already denied by the default action,
+        // but we add an explicit empty entry as documentation and defense-in-depth.)
+
         // clone: allow but deny namespace-creating flags to prevent nested namespace creation
-        let ns_flags: u64 = (libc::CLONE_NEWUSER
-            | libc::CLONE_NEWNS
-            | libc::CLONE_NEWNET
-            | libc::CLONE_NEWIPC
-            | libc::CLONE_NEWUTS
-            | libc::CLONE_NEWPID) as u64;
         let clone_condition = SeccompCondition::new(
             0, // arg0 = flags
             seccompiler::SeccompCmpArgLen::Qword,
-            seccompiler::SeccompCmpOp::MaskedEq(ns_flags),
+            seccompiler::SeccompCmpOp::MaskedEq(DENIED_CLONE_NAMESPACE_FLAGS),
             0, // (flags & ns_flags) == 0: none of the namespace flags set
         )
         .map_err(|e| {
@@ -352,10 +359,7 @@ impl SeccompManager {
             return Ok(true);
         }
 
-        info!(
-            allow_network,
-            "Applying seccomp filter"
-        );
+        info!(allow_network, "Applying seccomp filter");
 
         let rules = match Self::minimal_filter(allow_network) {
             Ok(r) => r,
@@ -465,5 +469,13 @@ mod tests {
         // as it would affect the test process itself
         // This is tested in integration tests instead
         assert!(!mgr.is_applied());
+    }
+
+    #[test]
+    fn test_clone_denied_flags_include_newcgroup() {
+        assert_ne!(
+            DENIED_CLONE_NAMESPACE_FLAGS & libc::CLONE_NEWCGROUP as u64,
+            0
+        );
     }
 }

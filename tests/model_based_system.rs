@@ -1,3 +1,4 @@
+use proptest::prelude::*;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,7 +246,8 @@ impl SystemModel {
             assert!(c.network_ready);
         }
         assert!(
-            c.sec == SecurityState::Locked || (c.sec == SecurityState::Degraded && c.allow_degraded)
+            c.sec == SecurityState::Locked
+                || (c.sec == SecurityState::Degraded && c.allow_degraded)
         );
 
         c.start_requested = true;
@@ -280,7 +282,10 @@ impl SystemModel {
     fn kill(&mut self, id: &str) -> OpResult {
         let allowed = self.can_access(id) && self.pid_fresh(id);
         let c = self.c_mut(id);
-        assert!(matches!(c.lifecycle, Lifecycle::Running | Lifecycle::Stopping));
+        assert!(matches!(
+            c.lifecycle,
+            Lifecycle::Running | Lifecycle::Stopping
+        ));
         if allowed {
             c.lifecycle = Lifecycle::Stopped;
             c.stop_requested = true;
@@ -310,7 +315,10 @@ impl SystemModel {
     fn remove(&mut self, id: &str) -> OpResult {
         let allowed = self.can_access(id);
         let c = self.c_mut(id);
-        assert!(matches!(c.lifecycle, Lifecycle::Stopped | Lifecycle::Failed));
+        assert!(matches!(
+            c.lifecycle,
+            Lifecycle::Stopped | Lifecycle::Failed
+        ));
         if allowed {
             c.lifecycle = Lifecycle::Removed;
             c.ns = NamespaceState::Cleaned;
@@ -537,4 +545,66 @@ fn test_partial_setup_failure_path() {
 
     assert_eq!(m.remove("c1"), OpResult::Granted);
     assert_eq!(m.c("c1").lifecycle, Lifecycle::Removed);
+}
+
+proptest! {
+    #[test]
+    fn prop_security_chain_invariance(
+        seccomp_supported in any::<bool>(),
+        landlock_supported in any::<bool>(),
+        allow_degraded in any::<bool>(),
+    ) {
+        let mut m = SystemModel::new(&["c1"]);
+        m.create("c1");
+        if allow_degraded {
+            m.enable_degraded("c1");
+        }
+        m.drop_capabilities("c1");
+
+        if !seccomp_supported {
+            m.set_seccomp_unsupported("c1");
+        }
+        m.apply_seccomp("c1");
+
+        let c_after_seccomp = m.c("c1");
+        if !seccomp_supported && !allow_degraded {
+            prop_assert_eq!(c_after_seccomp.lifecycle, Lifecycle::Failed);
+            prop_assert!(!c_after_seccomp.seccomp_on);
+            return Ok(());
+        }
+        if !seccomp_supported && allow_degraded {
+            prop_assert_eq!(c_after_seccomp.sec, SecurityState::Degraded);
+            prop_assert_eq!(c_after_seccomp.lifecycle, Lifecycle::Created);
+            prop_assert!(!c_after_seccomp.seccomp_on);
+            return Ok(());
+        }
+
+        prop_assert_eq!(c_after_seccomp.sec, SecurityState::SeccompApplied);
+        prop_assert!(c_after_seccomp.seccomp_on);
+
+        if !landlock_supported {
+            m.set_landlock_unsupported("c1");
+        }
+        m.apply_landlock("c1");
+
+        let c_after_landlock = m.c("c1");
+        if !landlock_supported && !allow_degraded {
+            prop_assert_eq!(c_after_landlock.lifecycle, Lifecycle::Failed);
+            prop_assert!(!c_after_landlock.landlock_on);
+            return Ok(());
+        }
+        if !landlock_supported && allow_degraded {
+            prop_assert_eq!(c_after_landlock.sec, SecurityState::Degraded);
+            prop_assert_eq!(c_after_landlock.lifecycle, Lifecycle::Created);
+            prop_assert!(!c_after_landlock.landlock_on);
+            return Ok(());
+        }
+
+        m.finalize_security("c1");
+        let c_final = m.c("c1");
+        prop_assert_eq!(c_final.sec, SecurityState::Locked);
+        prop_assert!(c_final.caps_dropped);
+        prop_assert!(c_final.seccomp_on);
+        prop_assert!(c_final.landlock_on);
+    }
 }

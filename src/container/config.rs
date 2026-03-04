@@ -60,6 +60,18 @@ pub struct ContainerConfig {
 
     /// Context mode (copy or bind mount)
     pub context_mode: crate::filesystem::ContextMode,
+
+    /// Allow degraded security behavior if a hardening layer cannot be applied
+    pub allow_degraded_security: bool,
+
+    /// Allow chroot fallback when pivot_root fails (weaker isolation)
+    pub allow_chroot_fallback: bool,
+
+    /// Require explicit opt-in for host networking
+    pub allow_host_network: bool,
+
+    /// Mount /proc read-only inside the container
+    pub proc_readonly: bool,
 }
 
 impl ContainerConfig {
@@ -78,6 +90,10 @@ impl ContainerConfig {
             use_gvisor: false,
             network: crate::network::NetworkMode::None,
             context_mode: crate::filesystem::ContextMode::Copy,
+            allow_degraded_security: false,
+            allow_chroot_fallback: false,
+            allow_host_network: false,
+            proc_readonly: true,
         }
     }
 
@@ -134,5 +150,56 @@ impl ContainerConfig {
     pub fn with_context_mode(mut self, mode: crate::filesystem::ContextMode) -> Self {
         self.context_mode = mode;
         self
+    }
+
+    pub fn with_allow_degraded_security(mut self, allow: bool) -> Self {
+        self.allow_degraded_security = allow;
+        self
+    }
+
+    pub fn with_allow_chroot_fallback(mut self, allow: bool) -> Self {
+        self.allow_chroot_fallback = allow;
+        self
+    }
+
+    pub fn with_allow_host_network(mut self, allow: bool) -> Self {
+        self.allow_host_network = allow;
+        self
+    }
+
+    pub fn with_proc_readonly(mut self, proc_readonly: bool) -> Self {
+        self.proc_readonly = proc_readonly;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::NetworkMode;
+
+    #[test]
+    fn test_config_security_defaults_are_hardened() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
+        assert!(!cfg.allow_degraded_security);
+        assert!(!cfg.allow_chroot_fallback);
+        assert!(!cfg.allow_host_network);
+        assert!(cfg.proc_readonly);
+    }
+
+    #[test]
+    fn test_config_security_builders_override_defaults() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_allow_degraded_security(true)
+            .with_allow_chroot_fallback(true)
+            .with_allow_host_network(true)
+            .with_proc_readonly(false)
+            .with_network(NetworkMode::Host);
+
+        assert!(cfg.allow_degraded_security);
+        assert!(cfg.allow_chroot_fallback);
+        assert!(cfg.allow_host_network);
+        assert!(!cfg.proc_readonly);
+        assert!(matches!(cfg.network, NetworkMode::Host));
     }
 }

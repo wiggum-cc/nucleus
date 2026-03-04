@@ -1,8 +1,8 @@
 use crate::container::{ContainerConfig, ContainerState, ContainerStateManager};
 use crate::error::{NucleusError, Result};
 use crate::filesystem::{
-    bind_mount_host_paths, create_dev_nodes, create_minimal_fs, mount_procfs, switch_root,
-    ContextPopulator, FilesystemState, LazyContextPopulator, TmpfsMount,
+    bind_mount_host_paths, create_dev_nodes, create_minimal_fs, mask_proc_paths, mount_procfs,
+    switch_root, ContextPopulator, FilesystemState, LazyContextPopulator, TmpfsMount,
 };
 use crate::isolation::NamespaceManager;
 use crate::network::{BridgeNetwork, NetworkMode};
@@ -56,18 +56,12 @@ impl Container {
             config.user_ns_config = Some(crate::isolation::UserNamespaceConfig::rootless());
         }
 
-        // Adjust namespace config for network mode
-        if let NetworkMode::Host = &config.network {
-            info!("Host network mode: skipping network namespace");
-            config.namespaces.net = false;
-        }
+        Self::apply_network_mode_guards(&mut config, is_root)?;
 
         // Bridge networking requires root
-        if let NetworkMode::Bridge(_) = &config.network {
-            if !is_root {
-                warn!("Bridge networking requires root, degrading to no networking");
-                config.network = NetworkMode::None;
-            }
+        if matches!(config.network, NetworkMode::Bridge(_)) && !is_root {
+            warn!("Bridge networking requires root, degrading to no networking");
+            config.network = NetworkMode::None;
         }
 
         // Create state manager
@@ -224,7 +218,7 @@ impl Container {
     /// Tracks FilesystemState and SecurityState machines to enforce correct ordering.
     fn setup_and_exec(&self, ready_pipe: Option<OwnedFd>) -> Result<()> {
         let is_rootless = self.config.user_ns_config.is_some();
-        let allow_degraded_security = Self::allow_degraded_security();
+        let allow_degraded_security = Self::allow_degraded_security(&self.config);
 
         // Initialize state machines
         let mut fs_state = FilesystemState::Unmounted;
@@ -283,7 +277,7 @@ impl Container {
 
         // 5. Create device nodes
         let dev_path = container_root.join("dev");
-        create_dev_nodes(&dev_path)?;
+        create_dev_nodes(&dev_path, false)?;
 
         // 6. Populate context if provided
         // Filesystem: Mounted -> Populated
@@ -298,7 +292,10 @@ impl Container {
 
         // 8. Mount procfs
         let proc_path = container_root.join("proc");
-        mount_procfs(&proc_path, is_rootless)?;
+        mount_procfs(&proc_path, is_rootless, self.config.proc_readonly)?;
+
+        // 8b. Mask sensitive /proc paths to reduce kernel info leakage
+        mask_proc_paths(&proc_path)?;
 
         // 9. Write resolv.conf for bridge networking (before pivot_root)
         if let NetworkMode::Bridge(ref bridge_config) = self.config.network {
@@ -307,7 +304,7 @@ impl Container {
 
         // 10. Switch root filesystem
         // Filesystem: Populated -> Pivoted
-        switch_root(&container_root)?;
+        switch_root(&container_root, self.config.allow_chroot_fallback)?;
         fs_state = fs_state.transition(FilesystemState::Pivoted)?;
         debug!("Filesystem state: {:?}", fs_state);
 
@@ -424,7 +421,7 @@ impl Container {
         create_minimal_fs(&rootfs)?;
 
         let dev_path = rootfs.join("dev");
-        create_dev_nodes(&dev_path)?;
+        create_dev_nodes(&dev_path, false)?;
 
         if let Some(context_dir) = &self.config.context_dir {
             let context_dest = rootfs.join("context");
@@ -576,16 +573,44 @@ impl Container {
         }
     }
 
-    fn allow_degraded_security() -> bool {
-        std::env::var("NUCLEUS_ALLOW_DEGRADED_SECURITY")
+    fn allow_degraded_security(config: &ContainerConfig) -> bool {
+        if std::env::var("NUCLEUS_ALLOW_DEGRADED_SECURITY")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false)
+            && !config.allow_degraded_security
+        {
+            warn!(
+                "Ignoring NUCLEUS_ALLOW_DEGRADED_SECURITY environment variable; use \
+                 --allow-degraded-security for explicit opt-in"
+            );
+        }
+        config.allow_degraded_security
+    }
+
+    fn apply_network_mode_guards(config: &mut ContainerConfig, _is_root: bool) -> Result<()> {
+        if let NetworkMode::Host = &config.network {
+            if !config.allow_host_network {
+                return Err(NucleusError::NetworkError(
+                    "Host network mode requires explicit opt-in: pass --allow-host-network"
+                        .to_string(),
+                ));
+            }
+            warn!(
+                "Host network mode enabled: container shares host network namespace and can \
+                 access localhost services, scan LAN-reachable endpoints, and bypass network \
+                 namespace isolation"
+            );
+            info!("Host network mode: skipping network namespace");
+            config.namespaces.net = false;
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::NetworkMode;
 
     #[test]
     fn test_container_config() {
@@ -602,5 +627,33 @@ mod tests {
         assert_eq!(config.name, "mycontainer");
         assert!(!config.id.is_empty());
         assert_ne!(config.id, config.name);
+    }
+
+    #[test]
+    fn test_allow_degraded_security_requires_explicit_config() {
+        let strict = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
+        assert!(!Container::allow_degraded_security(&strict));
+
+        let relaxed = strict.clone().with_allow_degraded_security(true);
+        assert!(Container::allow_degraded_security(&relaxed));
+    }
+
+    #[test]
+    fn test_host_network_requires_explicit_opt_in() {
+        let mut config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_network(NetworkMode::Host)
+            .with_allow_host_network(false);
+        let err = Container::apply_network_mode_guards(&mut config, true).unwrap_err();
+        assert!(matches!(err, NucleusError::NetworkError(_)));
+    }
+
+    #[test]
+    fn test_host_network_opt_in_disables_net_namespace() {
+        let mut config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_network(NetworkMode::Host)
+            .with_allow_host_network(true);
+        assert!(config.namespaces.net);
+        Container::apply_network_mode_guards(&mut config, true).unwrap();
+        assert!(!config.namespaces.net);
     }
 }
