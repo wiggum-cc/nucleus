@@ -221,7 +221,10 @@ impl ResourceLimits {
 
 impl Default for ResourceLimits {
     fn default() -> Self {
-        Self::unlimited()
+        Self {
+            pids_max: Some(512),
+            ..Self::unlimited()
+        }
     }
 }
 

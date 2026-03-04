@@ -323,8 +323,9 @@ impl Container {
         // 13. Apply seccomp filter
         // Security: CapabilitiesDropped -> SeccompApplied
         let mut seccomp_mgr = SeccompManager::new();
+        let allow_network = !matches!(self.config.network, NetworkMode::None);
         let seccomp_applied =
-            seccomp_mgr.apply_minimal_filter_with_mode(allow_degraded_security)?;
+            seccomp_mgr.apply_filter_for_network_mode(allow_network, allow_degraded_security)?;
         if seccomp_applied {
             sec_state = sec_state.transition(SecurityState::SeccompApplied)?;
         } else if !allow_degraded_security {
@@ -350,6 +351,33 @@ impl Container {
             warn!("Security state not locked; one or more hardening controls are inactive");
         }
         debug!("Security state: {:?}", sec_state);
+
+        // 14b. RLIMIT backstop: defense-in-depth against fork bombs and fd exhaustion
+        {
+            let nproc_limit = self.config.limits.pids_max.unwrap_or(512);
+            let rlim_nproc = libc::rlimit {
+                rlim_cur: nproc_limit,
+                rlim_max: nproc_limit,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc) } != 0 {
+                warn!(
+                    "Failed to set RLIMIT_NPROC to {}: {}",
+                    nproc_limit,
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            let rlim_nofile = libc::rlimit {
+                rlim_cur: 1024,
+                rlim_max: 1024,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim_nofile) } != 0 {
+                warn!(
+                    "Failed to set RLIMIT_NOFILE to 1024: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
 
         // 15. Exec target process
         self.exec_command()?;

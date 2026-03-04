@@ -2,6 +2,9 @@ use crate::container::ContainerState;
 use crate::error::{NucleusError, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -56,11 +59,42 @@ impl CheckpointMetadata {
     /// Save metadata to checkpoint directory
     pub fn save(&self, dir: &Path) -> Result<()> {
         let path = dir.join("metadata.json");
+        let tmp_path = dir.join("metadata.json.tmp");
         let json = serde_json::to_string_pretty(self).map_err(|e| {
             NucleusError::CheckpointError(format!("Failed to serialize metadata: {}", e))
         })?;
-        fs::write(&path, json).map_err(|e| {
-            NucleusError::CheckpointError(format!("Failed to write metadata: {}", e))
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| {
+                NucleusError::CheckpointError(format!(
+                    "Failed to open temp metadata file {:?}: {}",
+                    tmp_path, e
+                ))
+            })?;
+
+        file.write_all(json.as_bytes()).map_err(|e| {
+            NucleusError::CheckpointError(format!(
+                "Failed to write metadata file {:?}: {}",
+                tmp_path, e
+            ))
+        })?;
+        file.sync_all().map_err(|e| {
+            NucleusError::CheckpointError(format!(
+                "Failed to sync metadata file {:?}: {}",
+                tmp_path, e
+            ))
+        })?;
+
+        fs::rename(&tmp_path, &path).map_err(|e| {
+            NucleusError::CheckpointError(format!(
+                "Failed to atomically replace metadata file {:?}: {}",
+                path, e
+            ))
         })?;
         Ok(())
     }

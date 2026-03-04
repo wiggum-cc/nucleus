@@ -38,7 +38,6 @@ pub fn create_dev_nodes(dev_path: &Path) -> Result<()> {
         ("random", SFlag::S_IFCHR, 1, 8),
         ("urandom", SFlag::S_IFCHR, 1, 9),
         ("tty", SFlag::S_IFCHR, 5, 0),
-        ("console", SFlag::S_IFCHR, 5, 1),
     ];
 
     let mut created_count = 0;
@@ -125,7 +124,7 @@ pub fn bind_mount_host_paths(root: &Path, best_effort: bool) -> Result<()> {
                     None::<&str>,
                     &container_path,
                     None::<&str>,
-                    MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY | MsFlags::MS_REC,
+                    MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY | MsFlags::MS_REC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
                     None::<&str>,
                 )
                 .map_err(|e| {

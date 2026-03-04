@@ -25,7 +25,7 @@ impl SeccompManager {
     /// - bpf (eBPF programs)
     /// - perf_event_open (performance monitoring)
     /// - userfaultfd (user fault handling)
-    fn minimal_filter() -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
+    fn minimal_filter(allow_network: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
         let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
         // Essential syscalls for basic operation
@@ -93,7 +93,6 @@ impl SeccompManager {
             libc::SYS_munlock,
             libc::SYS_mincore,
             // Process management
-            libc::SYS_clone,
             libc::SYS_fork,
             libc::SYS_vfork,
             libc::SYS_execve,
@@ -112,7 +111,6 @@ impl SeccompManager {
             libc::SYS_getpgrp,
             libc::SYS_setsid,
             libc::SYS_getgroups,
-            libc::SYS_setgroups,
             // Signals
             libc::SYS_rt_sigaction,
             libc::SYS_rt_sigprocmask,
@@ -148,8 +146,7 @@ impl SeccompManager {
             libc::SYS_sched_getaffinity,
             libc::SYS_getcpu,
             libc::SYS_rseq,
-            // Socket/Network (minimal for DNS, etc)
-            libc::SYS_socket,
+            // Socket/Network — ops on existing fds (safe regardless of network mode)
             libc::SYS_connect,
             libc::SYS_sendto,
             libc::SYS_recvfrom,
@@ -189,6 +186,31 @@ impl SeccompManager {
             let rule = SeccompRule::new(vec![])
                 .map_err(|e| NucleusError::SeccompError(format!("Failed to create rule: {}", e)))?;
             rules.insert(syscall, vec![rule]);
+        }
+
+        // SYS_socket: when network is disabled, only allow AF_UNIX (domain == 1)
+        if allow_network {
+            let rule = SeccompRule::new(vec![]).map_err(|e| {
+                NucleusError::SeccompError(format!("Failed to create rule: {}", e))
+            })?;
+            rules.insert(libc::SYS_socket, vec![rule]);
+        } else {
+            let condition = SeccompCondition::new(
+                0, // arg0 is the domain for socket(domain, type, protocol)
+                seccompiler::SeccompCmpArgLen::Dword,
+                seccompiler::SeccompCmpOp::Eq,
+                libc::AF_UNIX as u64,
+            )
+            .map_err(|e| {
+                NucleusError::SeccompError(format!(
+                    "Failed to create socket domain condition: {}",
+                    e
+                ))
+            })?;
+            let rule = SeccompRule::new(vec![condition]).map_err(|e| {
+                NucleusError::SeccompError(format!("Failed to create socket rule: {}", e))
+            })?;
+            rules.insert(libc::SYS_socket, vec![rule]);
         }
 
         // ioctl: allow only safe terminal operations (arg0 = request code)
@@ -244,6 +266,27 @@ impl SeccompManager {
         }
         rules.insert(libc::SYS_prctl, prctl_rules);
 
+        // clone: allow but deny namespace-creating flags to prevent nested namespace creation
+        let ns_flags: u64 = (libc::CLONE_NEWUSER
+            | libc::CLONE_NEWNS
+            | libc::CLONE_NEWNET
+            | libc::CLONE_NEWIPC
+            | libc::CLONE_NEWUTS
+            | libc::CLONE_NEWPID) as u64;
+        let clone_condition = SeccompCondition::new(
+            0, // arg0 = flags
+            seccompiler::SeccompCmpArgLen::Qword,
+            seccompiler::SeccompCmpOp::MaskedEq(ns_flags),
+            0, // (flags & ns_flags) == 0: none of the namespace flags set
+        )
+        .map_err(|e| {
+            NucleusError::SeccompError(format!("Failed to create clone condition: {}", e))
+        })?;
+        let clone_rule = SeccompRule::new(vec![clone_condition]).map_err(|e| {
+            NucleusError::SeccompError(format!("Failed to create clone rule: {}", e))
+        })?;
+        rules.insert(libc::SYS_clone, vec![clone_rule]);
+
         Ok(rules)
     }
 
@@ -252,7 +295,7 @@ impl SeccompManager {
     /// This is useful for benchmarking filter compilation overhead
     /// without the irreversible side effect of applying the filter.
     pub fn compile_minimal_filter() -> Result<BpfProgram> {
-        let rules = Self::minimal_filter()?;
+        let rules = Self::minimal_filter(true)?;
         let filter = SeccompFilter::new(
             rules,
             SeccompAction::Errno(libc::EPERM as u32),
@@ -288,14 +331,33 @@ impl SeccompManager {
     /// When `best_effort` is true, failures are logged and execution continues.
     /// When false, seccomp setup is fail-closed.
     pub fn apply_minimal_filter_with_mode(&mut self, best_effort: bool) -> Result<bool> {
+        self.apply_filter_for_network_mode(true, best_effort)
+    }
+
+    /// Apply seccomp filter with network-mode-aware socket restrictions
+    ///
+    /// When `allow_network` is false, `SYS_socket` is restricted to AF_UNIX only,
+    /// preventing creation of network sockets (AF_INET, AF_INET6, etc.).
+    /// When `allow_network` is true, all socket domains are permitted.
+    ///
+    /// When `best_effort` is true, failures are logged and execution continues.
+    /// When false, seccomp setup is fail-closed.
+    pub fn apply_filter_for_network_mode(
+        &mut self,
+        allow_network: bool,
+        best_effort: bool,
+    ) -> Result<bool> {
         if self.applied {
             debug!("Seccomp filter already applied, skipping");
             return Ok(true);
         }
 
-        info!("Applying seccomp filter");
+        info!(
+            allow_network,
+            "Applying seccomp filter"
+        );
 
-        let rules = match Self::minimal_filter() {
+        let rules = match Self::minimal_filter(allow_network) {
             Ok(r) => r,
             Err(e) => {
                 if best_effort {
