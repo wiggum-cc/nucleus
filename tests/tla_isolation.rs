@@ -1,7 +1,6 @@
 /// Model-based testing for isolation module using tla-connect
 ///
 /// Replays traces from Nucleus_Isolation_NamespaceLifecycle.tla
-use anyhow::Result;
 use nucleus::isolation::NamespaceState;
 use serde::Deserialize;
 use tla_connect::*;
@@ -28,61 +27,56 @@ impl IsolationDriver {
     }
 }
 
-/// Extract pc from ITF state record for stuttering detection
-fn spec_pc(step: &Step) -> Option<i64> {
-    if let itf::Value::Record(ref rec) = step.state {
-        if let Some(itf::Value::BigInt(ref n)) = rec.get("pc") {
-            return n.to_string().parse().ok();
-        }
-    }
-    None
-}
-
 impl Driver for IsolationDriver {
     type State = IsolationSpecState;
 
-    fn step(&mut self, step: &Step) -> Result<()> {
-        // Skip stuttering steps (UNCHANGED vars – pc stays the same)
-        if let Some(p) = spec_pc(step) {
-            if p == self.pc {
-                return Ok(());
-            }
-        }
-
+    fn step(&mut self, step: &Step) -> Result<(), DriverError> {
         switch!(step {
             "init" => {
                 // Initial state – already set by new()
+                Ok(())
             },
             "uninitialized_create_namespaces" => {
-                // TLA+ transition: uninitialized -> unshared
                 if self.state != NamespaceState::Uninitialized {
-                    anyhow::bail!("Invalid state for create_namespaces: {:?}", self.state);
+                    return Err(DriverError::ActionFailed {
+                        action: step.action_taken.clone(),
+                        reason: format!("Invalid state for create_namespaces: {:?}", self.state),
+                    });
                 }
                 self.state = NamespaceState::Unshared;
                 self.pc += 1;
+                Ok(())
             },
             "unshared_enter_namespaces" => {
-                // TLA+ transition: unshared -> entered
                 if self.state != NamespaceState::Unshared {
-                    anyhow::bail!("Invalid state for enter_namespaces: {:?}", self.state);
+                    return Err(DriverError::ActionFailed {
+                        action: step.action_taken.clone(),
+                        reason: format!("Invalid state for enter_namespaces: {:?}", self.state),
+                    });
                 }
                 self.state = NamespaceState::Entered;
                 self.pc += 1;
+                Ok(())
             },
             "entered_cleanup" => {
-                // TLA+ transition: entered -> cleaned
                 if self.state != NamespaceState::Entered {
-                    anyhow::bail!("Invalid state for cleanup: {:?}", self.state);
+                    return Err(DriverError::ActionFailed {
+                        action: step.action_taken.clone(),
+                        reason: format!("Invalid state for cleanup: {:?}", self.state),
+                    });
                 }
                 self.state = NamespaceState::Cleaned;
                 self.pc += 1;
+                Ok(())
             },
         })
     }
 }
 
-impl State<IsolationDriver> for IsolationSpecState {
-    fn from_driver(driver: &IsolationDriver) -> Result<Self> {
+impl State for IsolationSpecState {}
+
+impl ExtractState<IsolationDriver> for IsolationSpecState {
+    fn from_driver(driver: &IsolationDriver) -> Result<Self, DriverError> {
         let state_str = match driver.state {
             NamespaceState::Uninitialized => "uninitialized",
             NamespaceState::Unshared => "unshared",
@@ -99,41 +93,53 @@ impl State<IsolationDriver> for IsolationSpecState {
 
 #[test]
 #[ignore] // Requires Apalache
-fn test_isolation_replay_apalache_traces() -> Result<()> {
-    let traces = generate_traces(&ApalacheConfig {
-        spec: "formal/tla/Nucleus_Isolation_NamespaceLifecycle.tla".into(),
-        inv: "NotTerminated".into(),
-        max_traces: 10,
-        max_length: 10,
-        mode: ApalacheMode::Simulate,
-        ..Default::default()
-    })?;
+fn test_isolation_replay_apalache_traces() -> TlaResult<()> {
+    let config = ApalacheConfig::builder()
+        .spec("formal/tla/Nucleus_Isolation_NamespaceLifecycle.tla")
+        .inv("NotTerminated")
+        .max_traces(10_usize)
+        .max_length(10_usize)
+        .mode(ApalacheMode::Simulate)
+        .build()?;
+    let traces = generate_traces(&config)?;
 
-    replay_traces(IsolationDriver::new, &traces)?;
+    let _ = replay_traces(IsolationDriver::new, &traces.traces)?;
 
     Ok(())
 }
 
-// Manual trace test removed - use Apalache-generated traces instead
+fn itf_state(index: u64, action: &str, state: &str, pc: i64) -> itf::state::State<itf::Value> {
+    itf::state::State {
+        meta: itf::state::Meta { index: Some(index), ..Default::default() },
+        value: itf::Value::Record(
+            [
+                ("state".into(), itf::Value::String(state.into())),
+                ("pc".into(), itf::Value::BigInt(itf::value::BigInt::new(pc))),
+                ("action_taken".into(), itf::Value::String(action.into())),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    }
+}
+
+fn itf_trace(states: Vec<itf::state::State<itf::Value>>) -> itf::Trace<itf::Value> {
+    itf::Trace {
+        meta: Default::default(),
+        params: vec![],
+        vars: vec!["state".into(), "pc".into(), "action_taken".into()],
+        loop_index: None,
+        states,
+    }
+}
 
 #[test]
 fn test_isolation_property_no_state_skipping() {
     // Verify cannot skip from uninitialized directly to entered
-    let mut driver = IsolationDriver::new();
-
-    let invalid_step = Step {
-        action_taken: "unshared_enter_namespaces".to_string(),
-        nondet_picks: itf::Value::Record(Default::default()),
-        state: itf::Value::Record(
-            [(
-                "pc".to_string(),
-                itf::Value::BigInt(itf::value::BigInt::new(1)),
-            )]
-            .into_iter()
-            .collect(),
-        ),
-    };
-
-    let result = driver.step(&invalid_step);
+    let trace = itf_trace(vec![
+        itf_state(0, "init", "uninitialized", 0),
+        itf_state(1, "unshared_enter_namespaces", "entered", 1),
+    ]);
+    let result = replay_traces(IsolationDriver::new, &[trace]);
     assert!(result.is_err(), "Should reject skipping unshared state");
 }

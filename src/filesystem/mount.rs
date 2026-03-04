@@ -192,8 +192,8 @@ pub fn mount_procfs(proc_path: &Path, best_effort: bool) -> Result<()> {
 /// Switch to new root filesystem using pivot_root or chroot
 ///
 /// This implements the transition: populated -> pivoted
-/// In rootless mode, this may fail - we'll just chdir instead
-pub fn switch_root(new_root: &Path, allow_chdir_fallback: bool) -> Result<()> {
+/// Fails closed if root switching cannot be established.
+pub fn switch_root(new_root: &Path) -> Result<()> {
     info!("Switching root to {:?}", new_root);
 
     // Try pivot_root first (preferred method)
@@ -209,24 +209,7 @@ pub fn switch_root(new_root: &Path, allow_chdir_fallback: bool) -> Result<()> {
             warn!("pivot_root failed ({}), falling back to chroot", e);
             match chroot_impl(new_root) {
                 Ok(()) => Ok(()),
-                Err(e2) => {
-                    if allow_chdir_fallback {
-                        warn!(
-                            "SECURITY WARNING: pivot_root and chroot both failed. \
-                             chdir fallback provides NO filesystem isolation. \
-                             Landlock is the only remaining filesystem defense."
-                        );
-                        warn!("chroot failure reason: {}", e2);
-                        // Just change directory - works in rootless
-                        std::env::set_current_dir(new_root).map_err(|e| {
-                            NucleusError::PivotRootError(format!("Failed to chdir: {}", e))
-                        })?;
-                        info!("Changed directory to {:?} (rootless mode)", new_root);
-                        Ok(())
-                    } else {
-                        Err(e2)
-                    }
-                }
+                Err(e2) => Err(e2),
             }
         }
     }

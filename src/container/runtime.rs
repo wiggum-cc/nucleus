@@ -12,11 +12,11 @@ use crate::security::{
     SecurityState,
 };
 use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, pipe, read, write, ForkResult, Pid};
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::atomic::{AtomicI32, Ordering};
 use tempfile::Builder;
 use tracing::{debug, error, info, warn};
 
@@ -126,6 +126,8 @@ impl Container {
                 drop(ready_write);
                 info!("Forked child process: {}", child);
 
+                let target_pid = Self::wait_for_namespace_ready(&ready_read, child)?;
+
                 let cgroup_path = cgroup_opt
                     .as_ref()
                     .map(|_| format!("/sys/fs/cgroup/{}", cgroup_name));
@@ -136,7 +138,7 @@ impl Container {
                 let state = ContainerState::new(
                     config.id.clone(),
                     config.name.clone(),
-                    child.as_raw() as u32,
+                    target_pid,
                     config.command.clone(),
                     config.limits.memory_bytes,
                     cpu_millicores,
@@ -148,21 +150,20 @@ impl Container {
                 let mut bridge_net: Option<BridgeNetwork> = None;
                 let mut child_waited = false;
                 let run_result: Result<i32> = (|| {
-                    Self::wait_for_namespace_ready(&ready_read, child)?;
                     state_mgr.save_state(&state)?;
 
                     if let Some(ref mut cgroup) = cgroup_opt {
-                        cgroup.attach_process(child.as_raw() as u32)?;
+                        cgroup.attach_process(target_pid)?;
                     }
 
                     if let NetworkMode::Bridge(ref bridge_config) = config.network {
-                        match BridgeNetwork::setup(child.as_raw() as u32, bridge_config) {
+                        match BridgeNetwork::setup(target_pid, bridge_config) {
                             Ok(net) => bridge_net = Some(net),
                             Err(e) => warn!("Failed to set up bridge networking: {}", e),
                         }
                     }
 
-                    self.setup_signal_handlers(child)?;
+                    self.setup_signal_forwarding(Pid::from_raw(target_pid as i32))?;
                     let exit_code = self.wait_for_child(child)?;
                     child_waited = true;
                     Ok(exit_code)
@@ -234,10 +235,23 @@ impl Container {
             namespace_mgr = namespace_mgr.with_user_mapping(user_config.clone());
         }
         namespace_mgr.unshare_namespaces()?;
-        if let Some(fd) = ready_pipe.as_ref() {
-            write(fd, &[1u8]).map_err(|e| {
-                NucleusError::ExecError(format!("Failed to notify namespace readiness: {}", e))
-            })?;
+
+        // CLONE_NEWPID only applies to children created after unshare().
+        // Create a child that will become PID 1 in the new namespace and exec the workload.
+        if self.config.namespaces.pid {
+            match unsafe { fork() }? {
+                ForkResult::Parent { child } => {
+                    if let Some(fd) = ready_pipe {
+                        Self::notify_namespace_ready(&fd, child.as_raw() as u32)?;
+                    }
+                    std::process::exit(Self::wait_for_pid_namespace_child(child));
+                }
+                ForkResult::Child => {
+                    // Continue container setup as PID 1 in the new namespace.
+                }
+            }
+        } else if let Some(fd) = ready_pipe {
+            Self::notify_namespace_ready(&fd, std::process::id())?;
         }
 
         // 2. Set hostname if UTS namespace is enabled
@@ -292,7 +306,7 @@ impl Container {
 
         // 10. Switch root filesystem
         // Filesystem: Populated -> Pivoted
-        switch_root(&container_root, false)?;
+        switch_root(&container_root)?;
         fs_state = fs_state.transition(FilesystemState::Pivoted)?;
         debug!("Filesystem state: {:?}", fs_state);
 
@@ -338,9 +352,6 @@ impl Container {
             NucleusError::GVisorError(format!("Failed to initialize gVisor runtime: {}", e))
         })?;
 
-        if !self.config.use_oci_bundle {
-            info!("Security hardening enabled: forcing gVisor OCI bundle mode");
-        }
         self.setup_and_exec_gvisor_oci(&gvisor)
     }
 
@@ -408,53 +419,42 @@ impl Container {
 
         let env = vec![
             CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-                .unwrap(),
-            CString::new("TERM=xterm").unwrap(),
-            CString::new("HOME=/").unwrap(),
+                .map_err(|e| NucleusError::ExecError(format!("Invalid environment PATH: {}", e)))?,
+            CString::new("TERM=xterm")
+                .map_err(|e| NucleusError::ExecError(format!("Invalid environment TERM: {}", e)))?,
+            CString::new("HOME=/")
+                .map_err(|e| NucleusError::ExecError(format!("Invalid environment HOME: {}", e)))?,
         ];
         nix::unistd::execve(&program, &args, &env)?;
 
         Ok(())
     }
 
-    /// Set up signal handlers to forward signals to child process
-    fn setup_signal_handlers(&self, child: Pid) -> Result<()> {
-        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet};
-
-        static CHILD_PID: AtomicI32 = AtomicI32::new(0);
-        CHILD_PID.store(child.as_raw(), Ordering::SeqCst);
-
-        extern "C" fn forward_signal(sig: i32) {
-            let child_pid = CHILD_PID.load(Ordering::SeqCst);
-            if child_pid > 0 {
-                let pid = Pid::from_raw(child_pid);
-                let signal = Signal::try_from(sig).ok();
-                if let Some(signal) = signal {
-                    let _ = kill(pid, signal);
-                }
-            }
+    /// Forward selected signals to child process using sigwait (no async signal handlers).
+    fn setup_signal_forwarding(&self, child: Pid) -> Result<()> {
+        let mut set = SigSet::empty();
+        for signal in [
+            Signal::SIGTERM,
+            Signal::SIGINT,
+            Signal::SIGHUP,
+            Signal::SIGQUIT,
+            Signal::SIGUSR1,
+            Signal::SIGUSR2,
+        ] {
+            set.add(signal);
         }
 
-        let handler = SigHandler::Handler(forward_signal);
-        let action = SigAction::new(handler, SaFlags::empty(), SigSet::empty());
+        pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&set), None).map_err(|e| {
+            NucleusError::ExecError(format!("Failed to block forwarded signals: {}", e))
+        })?;
 
-        unsafe {
-            for (signal, name) in [
-                (Signal::SIGTERM, "SIGTERM"),
-                (Signal::SIGINT, "SIGINT"),
-                (Signal::SIGHUP, "SIGHUP"),
-                (Signal::SIGQUIT, "SIGQUIT"),
-                (Signal::SIGUSR1, "SIGUSR1"),
-                (Signal::SIGUSR2, "SIGUSR2"),
-            ] {
-                sigaction(signal, &action).map_err(|e| {
-                    NucleusError::ExecError(format!("Failed to set {} handler: {}", name, e))
-                })?;
+        std::thread::spawn(move || {
+            while let Ok(signal) = set.wait() {
+                let _ = kill(child, signal);
             }
-        }
+        });
 
-        info!("Signal handlers configured");
-
+        info!("Signal forwarding configured");
         Ok(())
     }
 
@@ -485,21 +485,41 @@ impl Container {
         }
     }
 
-    fn wait_for_namespace_ready(ready_read: &OwnedFd, child: Pid) -> Result<()> {
-        let mut byte = [0u8; 1];
-        match read(ready_read.as_raw_fd(), &mut byte) {
-            Ok(1) => Ok(()),
+    fn wait_for_namespace_ready(ready_read: &OwnedFd, child: Pid) -> Result<u32> {
+        let mut pid_buf = [0u8; 4];
+        match read(ready_read.as_raw_fd(), &mut pid_buf) {
+            Ok(4) => Ok(u32::from_ne_bytes(pid_buf)),
             Ok(0) => Err(NucleusError::ExecError(format!(
                 "Child {} exited before namespace initialization",
                 child
             ))),
             Ok(_) => Err(NucleusError::ExecError(
-                "Invalid namespace sync signal from child".to_string(),
+                "Invalid namespace sync payload from child".to_string(),
             )),
             Err(e) => Err(NucleusError::ExecError(format!(
                 "Failed waiting for child namespace setup: {}",
                 e
             ))),
+        }
+    }
+
+    fn notify_namespace_ready(fd: &OwnedFd, pid: u32) -> Result<()> {
+        let payload = pid.to_ne_bytes();
+        write(fd, &payload).map_err(|e| {
+            NucleusError::ExecError(format!("Failed to notify namespace readiness: {}", e))
+        })?;
+        Ok(())
+    }
+
+    fn wait_for_pid_namespace_child(child: Pid) -> i32 {
+        loop {
+            match waitpid(child, None) {
+                Ok(WaitStatus::Exited(_, code)) => return code,
+                Ok(WaitStatus::Signaled(_, signal, _)) => return 128 + signal as i32,
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(_) => return 1,
+                _ => continue,
+            }
         }
     }
 }

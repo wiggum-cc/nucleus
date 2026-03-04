@@ -86,63 +86,6 @@ impl GVisorRuntime {
         Ok(Some(canonical.to_string_lossy().to_string()))
     }
 
-    /// Execute a command using gVisor (runsc) - legacy non-OCI mode
-    ///
-    /// This implements the transition: native_kernel -> gvisor_kernel
-    pub fn exec_with_gvisor(
-        &self,
-        container_id: &str,
-        root_path: &Path,
-        command: &[String],
-    ) -> Result<()> {
-        if command.is_empty() {
-            return Err(NucleusError::GVisorError(
-                "No command specified".to_string(),
-            ));
-        }
-
-        info!(
-            "Executing command with gVisor: {:?} (root: {:?})",
-            command, root_path
-        );
-
-        // Build runsc run command
-        // runsc run --root <root> --bundle <bundle> <container-id>
-        let mut args = vec![
-            "run".to_string(),
-            "--root".to_string(),
-            root_path.to_string_lossy().to_string(),
-            "--network".to_string(),
-            "none".to_string(),
-            "--platform".to_string(),
-            "ptrace".to_string(), // Use ptrace platform (works without KVM)
-        ];
-
-        // Add container ID
-        args.push(container_id.to_string());
-
-        debug!("runsc args: {:?}", args);
-
-        // Convert to CStrings for exec
-        let program = CString::new(self.runsc_path.as_str())
-            .map_err(|e| NucleusError::GVisorError(format!("Invalid runsc path: {}", e)))?;
-
-        let c_args: Result<Vec<CString>> = args
-            .iter()
-            .map(|arg| {
-                CString::new(arg.as_str())
-                    .map_err(|e| NucleusError::GVisorError(format!("Invalid argument: {}", e)))
-            })
-            .collect();
-        let c_args = c_args?;
-
-        // execve - this replaces the current process with runsc
-        nix::unistd::execve::<std::ffi::CString, std::ffi::CString>(&program, &c_args, &[])?;
-
-        // Should never reach here
-        Ok(())
-    }
-
     /// Execute using gVisor with an OCI bundle
     ///
     /// This is the OCI-compliant way to run containers with gVisor

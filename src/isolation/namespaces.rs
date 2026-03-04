@@ -1,5 +1,6 @@
 use crate::error::{NucleusError, Result};
 use crate::isolation::usermap::{UserNamespaceConfig, UserNamespaceMapper};
+use nix::mount::MsFlags;
 use nix::sched::{unshare, CloneFlags};
 use nix::unistd::sethostname;
 use tracing::{debug, info};
@@ -123,6 +124,23 @@ impl NamespaceManager {
         unshare(flags).map_err(|e| {
             NucleusError::NamespaceError(format!("Failed to unshare namespaces: {}", e))
         })?;
+
+        // Ensure mount events do not propagate back to the host namespace.
+        if self.config.mnt {
+            nix::mount::mount(
+                None::<&str>,
+                "/",
+                None::<&str>,
+                MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+                None::<&str>,
+            )
+            .map_err(|e| {
+                NucleusError::NamespaceError(format!(
+                    "Failed to set mount propagation to private: {}",
+                    e
+                ))
+            })?;
+        }
 
         // If user namespace is enabled and we have a mapper, setup UID/GID mappings
         // This must be done immediately after unshare(CLONE_NEWUSER)

@@ -33,7 +33,7 @@ tempfile = "3"
 
 [dev-dependencies]
 proptest = "1"
-tla-connect = "0.0.1"
+tla-connect = "0.0.4"
 itf = "0.4"
 criterion = { version = "0.5", features = ["html_reports"] }
 

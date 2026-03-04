@@ -55,9 +55,6 @@ pub struct ContainerConfig {
     /// Whether to use gVisor runtime
     pub use_gvisor: bool,
 
-    /// Whether to use OCI bundle format (for gVisor)
-    pub use_oci_bundle: bool,
-
     /// Network mode
     pub network: crate::network::NetworkMode,
 
@@ -79,7 +76,6 @@ impl ContainerConfig {
             user_ns_config: None,
             hostname: Some(name),
             use_gvisor: false,
-            use_oci_bundle: false,
             network: crate::network::NetworkMode::None,
             context_mode: crate::filesystem::ContextMode::Copy,
         }
@@ -124,9 +120,8 @@ impl ContainerConfig {
         self
     }
 
-    /// Enable OCI bundle format (automatically enables gVisor)
+    /// Enable OCI bundle runtime path (always OCI for gVisor).
     pub fn with_oci_bundle(mut self) -> Self {
-        self.use_oci_bundle = true;
         self.use_gvisor = true;
         self
     }
