@@ -375,6 +375,10 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
 
+            if let Some(ref n) = name {
+                validate_container_name(n)?;
+            }
+
             // Build resource limits
             let mut limits = ResourceLimits::unlimited();
 
@@ -449,6 +453,7 @@ fn main() -> Result<()> {
             }
 
             if let Some(host) = hostname {
+                validate_hostname(&host)?;
                 config = config.with_hostname(Some(host));
             }
 
@@ -478,4 +483,43 @@ fn main() -> Result<()> {
             std::process::exit(exit_code);
         }
     }
+}
+
+fn validate_container_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 128 {
+        anyhow::bail!("Invalid container name: must be 1-128 characters");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        anyhow::bail!("Invalid container name: allowed characters are a-zA-Z0-9, '-', '_', '.'");
+    }
+    Ok(())
+}
+
+fn validate_hostname(hostname: &str) -> Result<()> {
+    if hostname.is_empty() || hostname.len() > 253 {
+        anyhow::bail!("Invalid hostname: must be 1-253 characters");
+    }
+
+    for label in hostname.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            anyhow::bail!("Invalid hostname label: '{}'", label);
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            anyhow::bail!(
+                "Invalid hostname label '{}': cannot start or end with '-'",
+                label
+            );
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            anyhow::bail!(
+                "Invalid hostname label '{}': allowed characters are a-zA-Z0-9 and '-'",
+                label
+            );
+        }
+    }
+
+    Ok(())
 }

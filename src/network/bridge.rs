@@ -35,6 +35,7 @@ impl BridgeNetwork {
             }
             None => Self::allocate_ip(&config.subnet)?,
         };
+        let prefix = Self::subnet_prefix(&config.subnet);
 
         // Linux interface names max 15 chars; truncate if needed
         let veth_host_full = format!("veth-{:x}", pid);
@@ -86,7 +87,7 @@ impl BridgeNetwork {
                 "ip",
                 "addr",
                 "add",
-                &format!("{}/24", container_ip),
+                &format!("{}/{}", container_ip, prefix),
                 "dev",
                 &veth_container,
             ],
@@ -215,7 +216,7 @@ impl BridgeNetwork {
             &[
                 "addr",
                 "add",
-                &format!("{}/24", gateway),
+                &format!("{}/{}", gateway, Self::subnet_prefix(subnet)),
                 "dev",
                 bridge_name,
             ],
@@ -307,6 +308,14 @@ impl BridgeNetwork {
         } else {
             "10.0.42.1".to_string()
         }
+    }
+
+    fn subnet_prefix(subnet: &str) -> u8 {
+        subnet
+            .split_once('/')
+            .and_then(|(_, p)| p.parse::<u8>().ok())
+            .filter(|p| *p <= 32)
+            .unwrap_or(24)
     }
 
     fn run_cmd(program: &str, args: &[&str]) -> Result<()> {

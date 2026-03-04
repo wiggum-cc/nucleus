@@ -2,6 +2,7 @@ use crate::container::{ContainerState, ContainerStateManager};
 use crate::error::{NucleusError, Result};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
+use nix::unistd::Uid;
 use std::thread;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -10,8 +11,22 @@ use tracing::{info, warn};
 pub struct ContainerLifecycle;
 
 impl ContainerLifecycle {
+    fn ensure_container_access(state: &ContainerState) -> Result<()> {
+        let current_uid = Uid::effective().as_raw();
+        if current_uid == 0 || current_uid == state.creator_uid {
+            return Ok(());
+        }
+
+        Err(NucleusError::ExecError(format!(
+            "Permission denied: container {} owned by UID {}, caller is UID {}",
+            state.id, state.creator_uid, current_uid
+        )))
+    }
+
     /// Stop a container gracefully: SIGTERM, wait for timeout, then SIGKILL
     pub fn stop(state: &ContainerState, timeout_secs: u64) -> Result<()> {
+        Self::ensure_container_access(state)?;
+
         if !state.is_running() {
             info!("Container {} is already stopped", state.id);
             return Ok(());
@@ -69,6 +84,8 @@ impl ContainerLifecycle {
 
     /// Send an arbitrary signal to a container
     pub fn kill_container(state: &ContainerState, signal: Signal) -> Result<()> {
+        Self::ensure_container_access(state)?;
+
         if !state.is_running() {
             return Err(NucleusError::ContainerNotFound(format!(
                 "Container {} is not running",
@@ -95,6 +112,8 @@ impl ContainerLifecycle {
         state: &ContainerState,
         force: bool,
     ) -> Result<()> {
+        Self::ensure_container_access(state)?;
+
         if state.is_running() {
             if force {
                 info!("Force removing running container {}", state.id);
@@ -187,5 +206,25 @@ mod tests {
     fn test_parse_signal_invalid() {
         assert!(parse_signal("INVALID").is_err());
         assert!(parse_signal("999").is_err());
+    }
+
+    #[test]
+    fn test_access_check_owner_allowed() {
+        let uid = Uid::effective().as_raw();
+        let state = ContainerState::new(
+            "testid".to_string(),
+            "testname".to_string(),
+            12345,
+            vec!["/bin/true".to_string()],
+            None,
+            None,
+            false,
+            true,
+            None,
+        );
+        // Override creator to match current caller for this test.
+        let mut state = state;
+        state.creator_uid = uid;
+        assert!(ContainerLifecycle::ensure_container_access(&state).is_ok());
     }
 }

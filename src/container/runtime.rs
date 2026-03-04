@@ -224,6 +224,7 @@ impl Container {
     /// Tracks FilesystemState and SecurityState machines to enforce correct ordering.
     fn setup_and_exec(&self, ready_pipe: Option<OwnedFd>) -> Result<()> {
         let is_rootless = self.config.user_ns_config.is_some();
+        let allow_degraded_security = Self::allow_degraded_security();
 
         // Initialize state machines
         let mut fs_state = FilesystemState::Unmounted;
@@ -310,34 +311,47 @@ impl Container {
         fs_state = fs_state.transition(FilesystemState::Pivoted)?;
         debug!("Filesystem state: {:?}", fs_state);
 
-        // 11. Drop capabilities
+        // 11. Ensure no_new_privs before applying additional hardening.
+        self.enforce_no_new_privs()?;
+
+        // 12. Drop capabilities
         // Security: Privileged -> CapabilitiesDropped
         let mut cap_mgr = CapabilityManager::new();
         cap_mgr.drop_all()?;
         sec_state = sec_state.transition(SecurityState::CapabilitiesDropped)?;
 
-        // 12. Apply seccomp filter
+        // 13. Apply seccomp filter
         // Security: CapabilitiesDropped -> SeccompApplied
         let mut seccomp_mgr = SeccompManager::new();
-        let seccomp_applied = seccomp_mgr.apply_minimal_filter_with_mode(is_rootless)?;
+        let seccomp_applied =
+            seccomp_mgr.apply_minimal_filter_with_mode(allow_degraded_security)?;
         if seccomp_applied {
             sec_state = sec_state.transition(SecurityState::SeccompApplied)?;
+        } else if !allow_degraded_security {
+            return Err(NucleusError::SeccompError(
+                "Seccomp filter is required but was not enforced".to_string(),
+            ));
         } else {
             warn!("Seccomp not enforced; container is running with degraded hardening");
         }
 
-        // 13. Apply Landlock filesystem policy
+        // 14. Apply Landlock filesystem policy
         let mut landlock_mgr = LandlockManager::new();
-        let landlock_applied = landlock_mgr.apply_container_policy_with_mode(is_rootless)?;
+        let landlock_applied =
+            landlock_mgr.apply_container_policy_with_mode(allow_degraded_security)?;
         if seccomp_applied && landlock_applied {
             sec_state = sec_state.transition(SecurityState::LandlockApplied)?;
             sec_state = sec_state.transition(SecurityState::Locked)?;
+        } else if !allow_degraded_security {
+            return Err(NucleusError::LandlockError(
+                "Landlock policy is required but was not enforced".to_string(),
+            ));
         } else {
             warn!("Security state not locked; one or more hardening controls are inactive");
         }
         debug!("Security state: {:?}", sec_state);
 
-        // 14. Exec target process
+        // 15. Exec target process
         self.exec_command()?;
 
         // Should never reach here
@@ -427,6 +441,17 @@ impl Container {
         ];
         nix::unistd::execve(&program, &args, &env)?;
 
+        Ok(())
+    }
+
+    fn enforce_no_new_privs(&self) -> Result<()> {
+        let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        if ret != 0 {
+            return Err(NucleusError::ExecError(format!(
+                "Failed to set PR_SET_NO_NEW_PRIVS: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
         Ok(())
     }
 
@@ -521,6 +546,12 @@ impl Container {
                 _ => continue,
             }
         }
+    }
+
+    fn allow_degraded_security() -> bool {
+        std::env::var("NUCLEUS_ALLOW_DEGRADED_SECURITY")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
     }
 }
 

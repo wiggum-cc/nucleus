@@ -6,6 +6,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tempfile::Builder;
 use tracing::info;
 
 /// CRIU runtime for checkpoint/restore
@@ -196,12 +197,23 @@ impl CriuRuntime {
             )));
         }
 
+        // Capture the restored init PID explicitly.
+        let pidfile = Builder::new()
+            .prefix("nucleus-criu-restore-")
+            .tempfile()
+            .map_err(|e| {
+                NucleusError::CheckpointError(format!("Failed to create CRIU pidfile: {}", e))
+            })?;
+        let pidfile_path = pidfile.path().to_path_buf();
+
         // Run criu restore
         let output = Command::new(&self.binary_path)
             .arg("restore")
             .arg("--images-dir")
             .arg(&images_dir)
             .arg("--shell-job")
+            .arg("--pidfile")
+            .arg(&pidfile_path)
             .output()
             .map_err(|e| {
                 NucleusError::CheckpointError(format!("Failed to run criu restore: {}", e))
@@ -215,16 +227,59 @@ impl CriuRuntime {
             )));
         }
 
-        // Parse PID from criu output (criu prints the restored PID)
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let pid: u32 = stdout.trim().parse().map_err(|_| {
-            NucleusError::CheckpointError(format!(
-                "Failed to parse restored PID from criu output: '{}'",
-                stdout.trim()
-            ))
-        })?;
+        // Parse restored PID from pidfile, with output fallback for compatibility.
+        let pid_text = fs::read_to_string(&pidfile_path).unwrap_or_default();
+        if let Some(pid) = Self::parse_pid_text(&pid_text) {
+            info!("Restore complete, new PID: {}", pid);
+            return Ok(pid);
+        }
 
-        info!("Restore complete, new PID: {}", pid);
-        Ok(pid)
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(pid) = Self::parse_pid_text(&stdout) {
+            info!("Restore complete, new PID: {}", pid);
+            return Ok(pid);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if let Some(pid) = Self::parse_pid_text(&stderr) {
+            info!("Restore complete, new PID: {}", pid);
+            return Ok(pid);
+        }
+
+        Err(NucleusError::CheckpointError(format!(
+            "Failed to parse restored PID from CRIU output (pidfile='{}', stdout='{}', stderr='{}')",
+            pid_text.trim(),
+            stdout.trim(),
+            stderr.trim()
+        )))
+    }
+
+    fn parse_pid_text(text: &str) -> Option<u32> {
+        text.split(|c: char| !c.is_ascii_digit())
+            .filter(|tok| !tok.is_empty())
+            .find_map(|tok| tok.parse::<u32>().ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CriuRuntime;
+
+    #[test]
+    fn test_parse_pid_text_plain() {
+        assert_eq!(CriuRuntime::parse_pid_text("1234\n"), Some(1234));
+    }
+
+    #[test]
+    fn test_parse_pid_text_embedded() {
+        assert_eq!(
+            CriuRuntime::parse_pid_text("restored successfully pid=5678"),
+            Some(5678)
+        );
+    }
+
+    #[test]
+    fn test_parse_pid_text_missing() {
+        assert_eq!(CriuRuntime::parse_pid_text("no pid here"), None);
     }
 }

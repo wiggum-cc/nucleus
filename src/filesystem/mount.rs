@@ -196,23 +196,34 @@ pub fn mount_procfs(proc_path: &Path, best_effort: bool) -> Result<()> {
 pub fn switch_root(new_root: &Path) -> Result<()> {
     info!("Switching root to {:?}", new_root);
 
-    // Try pivot_root first (preferred method)
-    // If it fails, fall back to chroot
-    // If chroot fails, just chdir (rootless mode)
-
     match pivot_root_impl(new_root) {
         Ok(()) => {
             info!("Successfully switched root using pivot_root");
             Ok(())
         }
         Err(e) => {
-            warn!("pivot_root failed ({}), falling back to chroot", e);
-            match chroot_impl(new_root) {
-                Ok(()) => Ok(()),
-                Err(e2) => Err(e2),
+            if allow_chroot_fallback() {
+                warn!(
+                    "pivot_root failed ({}), falling back to chroot because \
+                     NUCLEUS_ALLOW_CHROOT_FALLBACK is enabled",
+                    e
+                );
+                chroot_impl(new_root)
+            } else {
+                Err(NucleusError::PivotRootError(format!(
+                    "pivot_root failed: {}. chroot fallback is disabled by default; set \
+                     NUCLEUS_ALLOW_CHROOT_FALLBACK=1 to allow weaker isolation",
+                    e
+                )))
             }
         }
     }
+}
+
+fn allow_chroot_fallback() -> bool {
+    std::env::var("NUCLEUS_ALLOW_CHROOT_FALLBACK")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
 }
 
 /// Implement root switch using pivot_root(2)
