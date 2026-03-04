@@ -24,20 +24,8 @@ impl SeccompManager {
         Self { applied: false }
     }
 
-    /// Get minimal syscall whitelist for basic container operation
-    ///
-    /// This is a restrictive whitelist that blocks dangerous syscalls:
-    /// - ptrace (process tracing)
-    /// - kexec_load (kernel loading)
-    /// - add_key, request_key, keyctl (kernel keyring)
-    /// - bpf (eBPF programs)
-    /// - perf_event_open (performance monitoring)
-    /// - userfaultfd (user fault handling)
-    fn minimal_filter(allow_network: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
-        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
-
-        // Essential syscalls for basic operation
-        let allowed_syscalls = vec![
+    fn base_allowed_syscalls() -> Vec<i64> {
+        vec![
             // File I/O
             libc::SYS_read,
             libc::SYS_write,
@@ -77,18 +65,17 @@ impl SeccompManager {
             libc::SYS_chmod,
             libc::SYS_fchmod,
             libc::SYS_fchmodat,
-            libc::SYS_chown,
-            libc::SYS_fchown,
-            libc::SYS_lchown,
-            libc::SYS_fchownat,
             libc::SYS_truncate,
             libc::SYS_ftruncate,
             libc::SYS_fallocate,
             libc::SYS_fadvise64,
-            libc::SYS_sync,
             libc::SYS_fsync,
             libc::SYS_fdatasync,
-            libc::SYS_syncfs,
+            libc::SYS_flock,
+            libc::SYS_sendfile,
+            libc::SYS_copy_file_range,
+            libc::SYS_splice,
+            libc::SYS_tee,
             // Memory management
             libc::SYS_mmap,
             libc::SYS_munmap,
@@ -97,12 +84,8 @@ impl SeccompManager {
             libc::SYS_mremap,
             libc::SYS_madvise,
             libc::SYS_msync,
-            libc::SYS_mlock,
-            libc::SYS_munlock,
-            libc::SYS_mincore,
             // Process management
             libc::SYS_fork,
-            libc::SYS_vfork,
             libc::SYS_execve,
             libc::SYS_execveat,
             libc::SYS_wait4,
@@ -123,16 +106,22 @@ impl SeccompManager {
             libc::SYS_rt_sigaction,
             libc::SYS_rt_sigprocmask,
             libc::SYS_rt_sigreturn,
+            libc::SYS_rt_sigsuspend,
+            libc::SYS_sigaltstack,
             libc::SYS_kill,
-            libc::SYS_tkill,
+            libc::SYS_tgkill,
             // Time
             libc::SYS_clock_gettime,
+            libc::SYS_clock_getres,
+            libc::SYS_clock_nanosleep,
             libc::SYS_gettimeofday,
             libc::SYS_nanosleep,
             // Directories
             libc::SYS_getcwd,
             libc::SYS_chdir,
+            libc::SYS_fchdir,
             libc::SYS_mkdir,
+            libc::SYS_mkdirat,
             libc::SYS_rmdir,
             libc::SYS_getdents,
             libc::SYS_getdents64,
@@ -154,21 +143,16 @@ impl SeccompManager {
             libc::SYS_sched_getaffinity,
             libc::SYS_getcpu,
             libc::SYS_rseq,
-            // Socket/Network — ops on existing fds (safe regardless of network mode)
-            libc::SYS_connect,
-            libc::SYS_sendto,
-            libc::SYS_recvfrom,
-            libc::SYS_sendmsg,
-            libc::SYS_recvmsg,
-            libc::SYS_shutdown,
-            libc::SYS_bind,
-            libc::SYS_listen,
-            libc::SYS_accept,
-            libc::SYS_accept4,
+            libc::SYS_close_range,
+            libc::SYS_memfd_create,
+            // Landlock bootstrap (runtime applies seccomp before Landlock)
+            libc::SYS_landlock_create_ruleset,
+            libc::SYS_landlock_add_rule,
+            libc::SYS_landlock_restrict_self,
+            // Socket/Network (safe introspection + local socketpair)
             libc::SYS_getsockname,
             libc::SYS_getpeername,
             libc::SYS_socketpair,
-            libc::SYS_setsockopt,
             libc::SYS_getsockopt,
             // Poll/Select
             libc::SYS_poll,
@@ -187,7 +171,51 @@ impl SeccompManager {
             libc::SYS_timerfd_create,
             libc::SYS_timerfd_settime,
             libc::SYS_timerfd_gettime,
-        ];
+        ]
+    }
+
+    fn allowed_socket_domains(allow_network: bool) -> Vec<i32> {
+        if allow_network {
+            vec![libc::AF_UNIX, libc::AF_INET, libc::AF_INET6]
+        } else {
+            vec![libc::AF_UNIX]
+        }
+    }
+
+    fn network_mode_syscalls(allow_network: bool) -> Vec<i64> {
+        if allow_network {
+            vec![
+                libc::SYS_connect,
+                libc::SYS_sendto,
+                libc::SYS_recvfrom,
+                libc::SYS_sendmsg,
+                libc::SYS_recvmsg,
+                libc::SYS_shutdown,
+                libc::SYS_bind,
+                libc::SYS_listen,
+                libc::SYS_accept,
+                libc::SYS_accept4,
+                libc::SYS_setsockopt,
+            ]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Get minimal syscall whitelist for basic container operation
+    ///
+    /// This is a restrictive whitelist that blocks dangerous syscalls:
+    /// - ptrace (process tracing)
+    /// - kexec_load (kernel loading)
+    /// - add_key, request_key, keyctl (kernel keyring)
+    /// - bpf (eBPF programs)
+    /// - perf_event_open (performance monitoring)
+    /// - userfaultfd (user fault handling)
+    fn minimal_filter(allow_network: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
+        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+
+        // Essential syscalls for basic operation
+        let allowed_syscalls = Self::base_allowed_syscalls();
 
         // Allow all these syscalls unconditionally
         for syscall in allowed_syscalls {
@@ -196,17 +224,22 @@ impl SeccompManager {
             rules.insert(syscall, vec![rule]);
         }
 
-        // SYS_socket: when network is disabled, only allow AF_UNIX (domain == 1)
-        if allow_network {
+        // Add network-mode-specific syscalls
+        for syscall in Self::network_mode_syscalls(allow_network) {
             let rule = SeccompRule::new(vec![])
                 .map_err(|e| NucleusError::SeccompError(format!("Failed to create rule: {}", e)))?;
-            rules.insert(libc::SYS_socket, vec![rule]);
-        } else {
+            rules.insert(syscall, vec![rule]);
+        }
+
+        // Restrict socket() domains by network mode.
+        // none: AF_UNIX only; network-enabled: AF_UNIX/AF_INET/AF_INET6.
+        let mut socket_rules = Vec::new();
+        for domain in Self::allowed_socket_domains(allow_network) {
             let condition = SeccompCondition::new(
-                0, // arg0 is the domain for socket(domain, type, protocol)
+                0, // arg0 is socket(domain, type, protocol)
                 seccompiler::SeccompCmpArgLen::Dword,
                 seccompiler::SeccompCmpOp::Eq,
-                libc::AF_UNIX as u64,
+                domain as u64,
             )
             .map_err(|e| {
                 NucleusError::SeccompError(format!(
@@ -217,16 +250,25 @@ impl SeccompManager {
             let rule = SeccompRule::new(vec![condition]).map_err(|e| {
                 NucleusError::SeccompError(format!("Failed to create socket rule: {}", e))
             })?;
-            rules.insert(libc::SYS_socket, vec![rule]);
+            socket_rules.push(rule);
         }
+        rules.insert(libc::SYS_socket, socket_rules);
 
         // ioctl: allow only safe terminal operations (arg0 = request code)
         let ioctl_allowed: &[u64] = &[
-            0x5413, // TIOCGWINSZ
             0x5401, // TCGETS
             0x5402, // TCSETS
+            0x5403, // TCSETSW
+            0x5404, // TCSETSF
+            0x540B, // TCFLSH
+            0x540F, // TIOCGPGRP
+            0x5410, // TIOCSPGRP
+            0x5413, // TIOCGWINSZ
+            0x5429, // TIOCGSID
             0x541B, // FIONREAD
             0x5421, // FIONBIO
+            0x5451, // FIOCLEX
+            0x5450, // FIONCLEX
         ];
         let mut ioctl_rules = Vec::new();
         for &request in ioctl_allowed {
@@ -273,11 +315,16 @@ impl SeccompManager {
         }
         rules.insert(libc::SYS_prctl, prctl_rules);
 
-        // clone3: block entirely — clone3 passes flags via a struct pointer that seccomp
-        // cannot inspect, so we must deny it and force workloads through clone() which
-        // we can filter by flags above. glibc/musl fall back to clone() when clone3 returns EPERM.
-        // (clone3 is not in the allowlist, so it's already denied by the default action,
-        // but we add an explicit empty entry as documentation and defense-in-depth.)
+        // clone3: allow unconditionally — clone3 passes flags inside a struct pointer
+        // (arg0) that seccomp BPF cannot dereference, so arg-level namespace-flag
+        // filtering is not possible. Namespace creation is still blocked because all
+        // capabilities are dropped (CLONE_NEWUSER requires CAP_SYS_ADMIN on the host
+        // user namespace; other CLONE_NEW* require CAP_SYS_ADMIN). Blocking clone3
+        // entirely would break programs linked against modern glibc (≥2.34).
+        let clone3_rule = SeccompRule::new(vec![]).map_err(|e| {
+            NucleusError::SeccompError(format!("Failed to create clone3 rule: {}", e))
+        })?;
+        rules.insert(libc::SYS_clone3, vec![clone3_rule]);
 
         // clone: allow but deny namespace-creating flags to prevent nested namespace creation
         let clone_condition = SeccompCondition::new(
@@ -477,5 +524,108 @@ mod tests {
             DENIED_CLONE_NAMESPACE_FLAGS & libc::CLONE_NEWCGROUP as u64,
             0
         );
+    }
+
+    #[test]
+    fn test_network_none_socket_domains_are_unix_only() {
+        let domains = SeccompManager::allowed_socket_domains(false);
+        assert_eq!(domains, vec![libc::AF_UNIX]);
+    }
+
+    #[test]
+    fn test_network_enabled_socket_domains_exclude_netlink() {
+        let domains = SeccompManager::allowed_socket_domains(true);
+        assert!(domains.contains(&libc::AF_UNIX));
+        assert!(domains.contains(&libc::AF_INET));
+        assert!(domains.contains(&libc::AF_INET6));
+        assert!(!domains.contains(&libc::AF_NETLINK));
+    }
+
+    #[test]
+    fn test_network_mode_syscalls_only_enabled_when_network_allowed() {
+        let none = SeccompManager::network_mode_syscalls(false);
+        assert!(none.is_empty());
+
+        let enabled = SeccompManager::network_mode_syscalls(true);
+        assert!(enabled.contains(&libc::SYS_connect));
+        assert!(enabled.contains(&libc::SYS_bind));
+        assert!(enabled.contains(&libc::SYS_listen));
+        assert!(enabled.contains(&libc::SYS_accept));
+        assert!(enabled.contains(&libc::SYS_setsockopt));
+    }
+
+    #[test]
+    fn test_landlock_bootstrap_syscalls_present_in_base_allowlist() {
+        let base = SeccompManager::base_allowed_syscalls();
+        assert!(base.contains(&libc::SYS_landlock_create_ruleset));
+        assert!(base.contains(&libc::SYS_landlock_add_rule));
+        assert!(base.contains(&libc::SYS_landlock_restrict_self));
+    }
+
+    #[test]
+    fn test_x32_legacy_range_not_allowlisted() {
+        let base = SeccompManager::base_allowed_syscalls();
+        let net = SeccompManager::network_mode_syscalls(true);
+        for nr in 512_i64..=547_i64 {
+            assert!(
+                !base.contains(&nr) && !net.contains(&nr),
+                "x32 syscall number {} unexpectedly allowlisted",
+                nr
+            );
+        }
+    }
+
+    #[test]
+    fn test_i386_compat_socketcall_range_not_allowlisted() {
+        let base = SeccompManager::base_allowed_syscalls();
+        let net = SeccompManager::network_mode_syscalls(true);
+        // i386 compat per syscall_32.tbl: socket..shutdown live at 359..373.
+        // On x86_64 these numbers are outside our native allowlist surface.
+        for nr in 359_i64..=373_i64 {
+            assert!(
+                !base.contains(&nr) && !net.contains(&nr),
+                "i386 compat syscall number {} unexpectedly allowlisted",
+                nr
+            );
+        }
+    }
+
+    #[test]
+    fn test_minimal_filter_allowlist_counts_are_stable() {
+        let base = SeccompManager::base_allowed_syscalls();
+        let net = SeccompManager::network_mode_syscalls(true);
+
+        // Snapshot counts to catch unintended policy drift.
+        // +5 accounts for conditional rules inserted in minimal_filter(): socket/ioctl/prctl/clone/clone3.
+        assert_eq!(base.len(), 135);
+        assert_eq!(net.len(), 11);
+        assert_eq!(base.len() + 5, 140);
+        assert_eq!(base.len() + net.len() + 5, 151);
+    }
+
+    #[test]
+    fn test_high_risk_syscalls_removed_from_base_allowlist() {
+        let base = SeccompManager::base_allowed_syscalls();
+        let removed = [
+            libc::SYS_chown,
+            libc::SYS_fchown,
+            libc::SYS_lchown,
+            libc::SYS_fchownat,
+            libc::SYS_sync,
+            libc::SYS_syncfs,
+            libc::SYS_mlock,
+            libc::SYS_munlock,
+            libc::SYS_mincore,
+            libc::SYS_vfork,
+            libc::SYS_tkill,
+        ];
+
+        for syscall in removed {
+            assert!(
+                !base.contains(&syscall),
+                "syscall {} unexpectedly present in base allowlist",
+                syscall
+            );
+        }
     }
 }

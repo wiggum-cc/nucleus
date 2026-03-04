@@ -1,5 +1,6 @@
 use proptest::prelude::*;
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lifecycle {
@@ -51,6 +52,12 @@ enum NetworkMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustLevel {
+    Trusted,
+    Untrusted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpResult {
     Granted,
     Denied,
@@ -66,6 +73,9 @@ struct ContainerModel {
     sec: SecurityState,
     network_mode: NetworkMode,
     network_ready: bool,
+    trust_level: TrustLevel,
+    gvisor_available: bool,
+    use_gvisor: bool,
     allow_degraded: bool,
     caps_dropped: bool,
     seccomp_on: bool,
@@ -90,6 +100,9 @@ impl Default for ContainerModel {
             sec: SecurityState::Privileged,
             network_mode: NetworkMode::None,
             network_ready: false,
+            trust_level: TrustLevel::Untrusted,
+            gvisor_available: false,
+            use_gvisor: false,
             allow_degraded: false,
             caps_dropped: false,
             seccomp_on: false,
@@ -330,6 +343,42 @@ impl SystemModel {
         }
     }
 
+    fn set_trust_level(&mut self, id: &str, level: TrustLevel) {
+        let c = self.c_mut(id);
+        c.trust_level = level;
+    }
+
+    fn set_gvisor_available(&mut self, id: &str, available: bool) {
+        let c = self.c_mut(id);
+        c.gvisor_available = available;
+    }
+
+    /// Model the runtime trust-level guard logic.
+    /// Returns Ok(()) if the container may proceed, Err with reason otherwise.
+    fn apply_trust_level_policy(&mut self, id: &str) -> std::result::Result<(), &'static str> {
+        let c = self.c_mut(id);
+        match c.trust_level {
+            TrustLevel::Trusted => Ok(()),
+            TrustLevel::Untrusted => {
+                if c.network_mode == NetworkMode::Host {
+                    return Err("untrusted workloads cannot use host network");
+                }
+                if !c.use_gvisor {
+                    if c.gvisor_available {
+                        c.use_gvisor = true;
+                        Ok(())
+                    } else if c.allow_degraded {
+                        Ok(())
+                    } else {
+                        Err("untrusted workloads require gVisor")
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
     fn syscall_failure(&mut self, id: &str) {
         let c = self.c_mut(id);
         assert!(matches!(
@@ -547,6 +596,224 @@ fn test_partial_setup_failure_path() {
     assert_eq!(m.c("c1").lifecycle, Lifecycle::Removed);
 }
 
+#[test]
+fn test_adversarial_bridge_exec_without_network_setup_panics() {
+    let mut m = SystemModel::new(&["c1"]);
+    m.create("c1");
+    m.set_network_mode("c1", NetworkMode::Bridge);
+    m.setup_namespaces("c1");
+    m.setup_rootfs("c1");
+    m.setup_resources("c1");
+    m.drop_capabilities("c1");
+    m.apply_seccomp("c1");
+    m.apply_landlock("c1");
+    m.finalize_security("c1");
+
+    let result = catch_unwind(AssertUnwindSafe(|| m.exec_workload("c1")));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_adversarial_finalize_from_degraded_state_panics() {
+    let mut m = SystemModel::new(&["c1"]);
+    m.create("c1");
+    m.enable_degraded("c1");
+    m.drop_capabilities("c1");
+    m.set_seccomp_unsupported("c1");
+    m.apply_seccomp("c1");
+    assert_eq!(m.c("c1").sec, SecurityState::Degraded);
+
+    let result = catch_unwind(AssertUnwindSafe(|| m.finalize_security("c1")));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_adversarial_non_owner_cannot_kill_even_with_fresh_pid() {
+    let mut m = SystemModel::new(&["c1"]);
+    m.switch_caller("alice");
+    m.create("c1");
+    m.setup_namespaces("c1");
+    m.setup_rootfs("c1");
+    m.setup_resources("c1");
+    m.setup_network("c1");
+    m.drop_capabilities("c1");
+    m.apply_seccomp("c1");
+    m.apply_landlock("c1");
+    m.finalize_security("c1");
+    m.exec_workload("c1");
+
+    m.switch_caller("bob");
+    assert_eq!(m.kill("c1"), OpResult::Denied);
+    assert_eq!(m.c("c1").lifecycle, Lifecycle::Running);
+}
+
+#[test]
+fn test_adversarial_attach_denied_on_stale_pid_until_refresh() {
+    let mut m = SystemModel::new(&["c1"]);
+    m.switch_caller("alice");
+    m.create("c1");
+    m.setup_namespaces("c1");
+    m.setup_rootfs("c1");
+    m.setup_resources("c1");
+    m.setup_network("c1");
+    m.drop_capabilities("c1");
+    m.apply_seccomp("c1");
+    m.apply_landlock("c1");
+    m.finalize_security("c1");
+    m.exec_workload("c1");
+
+    m.pid_reuse_race("c1");
+    assert_eq!(m.attach("c1"), OpResult::Denied);
+
+    m.refresh_pid("c1");
+    assert_eq!(m.attach("c1"), OpResult::Granted);
+}
+
+#[test]
+fn test_adversarial_mount_escape_path_panics() {
+    let mut m = SystemModel::new(&["c1"]);
+    m.create("c1");
+
+    let result = catch_unwind(AssertUnwindSafe(|| m.bind_mount("c1", "/etc/../../root")));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_adversarial_fail_closed_prevents_exec_after_seccomp_failure() {
+    let mut m = SystemModel::new(&["c1"]);
+    m.create("c1");
+    m.setup_namespaces("c1");
+    m.setup_rootfs("c1");
+    m.setup_resources("c1");
+    m.drop_capabilities("c1");
+    m.set_seccomp_unsupported("c1");
+    m.apply_seccomp("c1");
+    assert_eq!(m.c("c1").lifecycle, Lifecycle::Failed);
+
+    let result = catch_unwind(AssertUnwindSafe(|| m.exec_workload("c1")));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_complex_attach_multi_container_authorization_matrix() {
+    let mut m = SystemModel::new(&["c1", "c2"]);
+
+    // c1 owned by alice
+    m.switch_caller("alice");
+    m.create("c1");
+    m.setup_namespaces("c1");
+    m.setup_rootfs("c1");
+    m.setup_resources("c1");
+    m.setup_network("c1");
+    m.drop_capabilities("c1");
+    m.apply_seccomp("c1");
+    m.apply_landlock("c1");
+    m.finalize_security("c1");
+    m.exec_workload("c1");
+
+    // c2 owned by bob
+    m.switch_caller("bob");
+    m.create("c2");
+    m.setup_namespaces("c2");
+    m.setup_rootfs("c2");
+    m.setup_resources("c2");
+    m.setup_network("c2");
+    m.drop_capabilities("c2");
+    m.apply_seccomp("c2");
+    m.apply_landlock("c2");
+    m.finalize_security("c2");
+    m.exec_workload("c2");
+
+    // alice can attach only to c1
+    m.switch_caller("alice");
+    assert_eq!(m.attach("c1"), OpResult::Granted);
+    assert_eq!(m.attach("c2"), OpResult::Denied);
+
+    // bob can attach only to c2
+    m.switch_caller("bob");
+    assert_eq!(m.attach("c1"), OpResult::Denied);
+    assert_eq!(m.attach("c2"), OpResult::Granted);
+
+    // root can attach to both
+    m.switch_caller("root");
+    assert_eq!(m.attach("c1"), OpResult::Granted);
+    assert_eq!(m.attach("c2"), OpResult::Granted);
+}
+
+#[test]
+fn test_complex_attach_denied_during_stopping_transition() {
+    let mut m = SystemModel::new(&["c1"]);
+    m.switch_caller("alice");
+    m.create("c1");
+    m.setup_namespaces("c1");
+    m.setup_rootfs("c1");
+    m.setup_resources("c1");
+    m.setup_network("c1");
+    m.drop_capabilities("c1");
+    m.apply_seccomp("c1");
+    m.apply_landlock("c1");
+    m.finalize_security("c1");
+    m.exec_workload("c1");
+
+    assert_eq!(m.stop("c1"), OpResult::Granted);
+    let result = catch_unwind(AssertUnwindSafe(|| m.attach("c1")));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_complex_attach_denied_after_kill_and_remove() {
+    let mut m = SystemModel::new(&["c1"]);
+    m.switch_caller("alice");
+    m.create("c1");
+    m.setup_namespaces("c1");
+    m.setup_rootfs("c1");
+    m.setup_resources("c1");
+    m.setup_network("c1");
+    m.drop_capabilities("c1");
+    m.apply_seccomp("c1");
+    m.apply_landlock("c1");
+    m.finalize_security("c1");
+    m.exec_workload("c1");
+
+    assert_eq!(m.kill("c1"), OpResult::Granted);
+    let stopped_attach = catch_unwind(AssertUnwindSafe(|| m.attach("c1")));
+    assert!(stopped_attach.is_err());
+
+    assert_eq!(m.remove("c1"), OpResult::Granted);
+    let removed_attach = catch_unwind(AssertUnwindSafe(|| m.attach("c1")));
+    assert!(removed_attach.is_err());
+}
+
+#[test]
+fn test_complex_attach_pid_reuse_multiple_cycles() {
+    let mut m = SystemModel::new(&["c1"]);
+    m.switch_caller("alice");
+    m.create("c1");
+    m.setup_namespaces("c1");
+    m.setup_rootfs("c1");
+    m.setup_resources("c1");
+    m.setup_network("c1");
+    m.drop_capabilities("c1");
+    m.apply_seccomp("c1");
+    m.apply_landlock("c1");
+    m.finalize_security("c1");
+    m.exec_workload("c1");
+
+    // Multiple PID reuse events keep attach denied until refreshed.
+    m.pid_reuse_race("c1");
+    m.pid_reuse_race("c1");
+    assert_eq!(m.attach("c1"), OpResult::Denied);
+
+    m.refresh_pid("c1");
+    assert_eq!(m.attach("c1"), OpResult::Granted);
+
+    // Another reuse invalidates authorization again.
+    m.pid_reuse_race("c1");
+    assert_eq!(m.attach("c1"), OpResult::Denied);
+    m.refresh_pid("c1");
+    assert_eq!(m.attach("c1"), OpResult::Granted);
+}
+
 proptest! {
     #[test]
     fn prop_security_chain_invariance(
@@ -607,4 +874,253 @@ proptest! {
         prop_assert!(c_final.seccomp_on);
         prop_assert!(c_final.landlock_on);
     }
+
+    #[test]
+    fn prop_control_ops_require_auth_and_fresh_pid(
+        op in 0u8..3,
+        caller_is_root in any::<bool>(),
+        caller_is_owner in any::<bool>(),
+        stale_pid in any::<bool>(),
+    ) {
+        let mut m = SystemModel::new(&["c1"]);
+        m.switch_caller("alice");
+        m.create("c1");
+        m.setup_namespaces("c1");
+        m.setup_rootfs("c1");
+        m.setup_resources("c1");
+        m.setup_network("c1");
+        m.drop_capabilities("c1");
+        m.apply_seccomp("c1");
+        m.apply_landlock("c1");
+        m.finalize_security("c1");
+        m.exec_workload("c1");
+
+        let caller = if caller_is_root {
+            "root"
+        } else if caller_is_owner {
+            "alice"
+        } else {
+            "bob"
+        };
+        m.switch_caller(caller);
+
+        if stale_pid {
+            m.pid_reuse_race("c1");
+        }
+
+        let should_grant = (caller == "root" || caller == "alice") && !stale_pid;
+        let before = m.c("c1").lifecycle;
+        let result = match op {
+            0 => m.stop("c1"),
+            1 => m.kill("c1"),
+            _ => m.attach("c1"),
+        };
+
+        if should_grant {
+            prop_assert_eq!(result, OpResult::Granted);
+            match op {
+                0 => prop_assert_eq!(m.c("c1").lifecycle, Lifecycle::Stopping),
+                1 => prop_assert_eq!(m.c("c1").lifecycle, Lifecycle::Stopped),
+                _ => prop_assert_eq!(m.c("c1").lifecycle, Lifecycle::Running),
+            }
+        } else {
+            prop_assert_eq!(result, OpResult::Denied);
+            prop_assert_eq!(before, Lifecycle::Running);
+            prop_assert_eq!(m.c("c1").lifecycle, Lifecycle::Running);
+        }
+    }
+
+    #[test]
+    fn prop_remove_requires_authorization(
+        caller_is_root in any::<bool>(),
+        caller_is_owner in any::<bool>(),
+        failed_path in any::<bool>(),
+    ) {
+        let mut m = SystemModel::new(&["c1"]);
+        m.switch_caller("alice");
+        m.create("c1");
+
+        if failed_path {
+            m.syscall_failure("c1");
+            prop_assert_eq!(m.c("c1").lifecycle, Lifecycle::Failed);
+        } else {
+            m.setup_namespaces("c1");
+            m.setup_rootfs("c1");
+            m.setup_resources("c1");
+            m.setup_network("c1");
+            m.drop_capabilities("c1");
+            m.apply_seccomp("c1");
+            m.apply_landlock("c1");
+            m.finalize_security("c1");
+            m.exec_workload("c1");
+            prop_assert_eq!(m.stop("c1"), OpResult::Granted);
+            m.complete_stop("c1");
+            prop_assert_eq!(m.c("c1").lifecycle, Lifecycle::Stopped);
+        }
+
+        let caller = if caller_is_root {
+            "root"
+        } else if caller_is_owner {
+            "alice"
+        } else {
+            "bob"
+        };
+        m.switch_caller(caller);
+
+        let result = m.remove("c1");
+        let should_grant = caller == "root" || caller == "alice";
+        if should_grant {
+            prop_assert_eq!(result, OpResult::Granted);
+            let c = m.c("c1");
+            prop_assert_eq!(c.lifecycle, Lifecycle::Removed);
+            prop_assert_eq!(c.ns, NamespaceState::Cleaned);
+            prop_assert_eq!(c.fs, FilesystemState::UnmountedFinal);
+            prop_assert_eq!(c.res, ResourceState::Removed);
+        } else {
+            prop_assert_eq!(result, OpResult::Denied);
+            prop_assert!(matches!(m.c("c1").lifecycle, Lifecycle::Stopped | Lifecycle::Failed));
+        }
+    }
+
+    #[test]
+    fn prop_trust_level_policy_invariants(
+        trust_trusted in any::<bool>(),
+        host_network in any::<bool>(),
+        gvisor_available in any::<bool>(),
+        allow_degraded in any::<bool>(),
+    ) {
+        let mut m = SystemModel::new(&["c1"]);
+        m.create("c1");
+
+        if trust_trusted {
+            m.set_trust_level("c1", TrustLevel::Trusted);
+        }
+        if host_network {
+            m.set_network_mode("c1", NetworkMode::Host);
+        }
+        m.set_gvisor_available("c1", gvisor_available);
+        if allow_degraded {
+            m.enable_degraded("c1");
+        }
+
+        let result = m.apply_trust_level_policy("c1");
+
+        if trust_trusted {
+            // Trusted always succeeds
+            prop_assert!(result.is_ok());
+        } else {
+            // Untrusted
+            if host_network {
+                // Always denied
+                prop_assert!(result.is_err());
+            } else if gvisor_available {
+                // Auto-enables gVisor → Ok
+                prop_assert!(result.is_ok());
+                prop_assert!(m.c("c1").use_gvisor);
+            } else if allow_degraded {
+                // Degraded → Ok but no gVisor
+                prop_assert!(result.is_ok());
+                prop_assert!(!m.c("c1").use_gvisor);
+            } else {
+                // No gVisor, no degraded → denied
+                prop_assert!(result.is_err());
+            }
+        }
+    }
+}
+
+// --- Trust-level deterministic model tests ---
+
+#[test]
+fn test_untrusted_host_network_always_denied() {
+    let mut m = SystemModel::new(&["c1"]);
+    m.create("c1");
+    m.set_trust_level("c1", TrustLevel::Untrusted);
+    m.set_network_mode("c1", NetworkMode::Host);
+    m.set_gvisor_available("c1", true);
+    m.enable_degraded("c1");
+
+    let result = m.apply_trust_level_policy("c1");
+    assert!(
+        result.is_err(),
+        "Untrusted + host network must always be denied"
+    );
+}
+
+#[test]
+fn test_untrusted_no_gvisor_no_degraded_fails() {
+    let mut m = SystemModel::new(&["c1"]);
+    m.create("c1");
+    m.set_trust_level("c1", TrustLevel::Untrusted);
+    m.set_gvisor_available("c1", false);
+    // allow_degraded defaults to false
+
+    let result = m.apply_trust_level_policy("c1");
+    assert!(
+        result.is_err(),
+        "Untrusted without gVisor or degraded must fail"
+    );
+}
+
+#[test]
+fn test_untrusted_gvisor_available_auto_enables() {
+    let mut m = SystemModel::new(&["c1"]);
+    m.create("c1");
+    m.set_trust_level("c1", TrustLevel::Untrusted);
+    m.set_gvisor_available("c1", true);
+
+    let result = m.apply_trust_level_policy("c1");
+    assert!(result.is_ok(), "Should succeed with gVisor available");
+    assert!(
+        m.c("c1").use_gvisor,
+        "gVisor should be auto-enabled for untrusted workloads"
+    );
+}
+
+#[test]
+fn test_untrusted_no_gvisor_degraded_continues() {
+    let mut m = SystemModel::new(&["c1"]);
+    m.create("c1");
+    m.set_trust_level("c1", TrustLevel::Untrusted);
+    m.set_gvisor_available("c1", false);
+    m.enable_degraded("c1");
+
+    let result = m.apply_trust_level_policy("c1");
+    assert!(
+        result.is_ok(),
+        "Should succeed in degraded mode without gVisor"
+    );
+    assert!(
+        !m.c("c1").use_gvisor,
+        "gVisor should not be enabled when unavailable"
+    );
+}
+
+#[test]
+fn test_trusted_does_not_enforce_gvisor() {
+    let mut m = SystemModel::new(&["c1"]);
+    m.create("c1");
+    m.set_trust_level("c1", TrustLevel::Trusted);
+    m.set_gvisor_available("c1", false);
+
+    let result = m.apply_trust_level_policy("c1");
+    assert!(result.is_ok(), "Trusted workloads should always pass");
+    assert!(
+        !m.c("c1").use_gvisor,
+        "Trusted should not force gVisor on"
+    );
+}
+
+#[test]
+fn test_trusted_host_network_not_denied_by_trust_policy() {
+    let mut m = SystemModel::new(&["c1"]);
+    m.create("c1");
+    m.set_trust_level("c1", TrustLevel::Trusted);
+    m.set_network_mode("c1", NetworkMode::Host);
+
+    let result = m.apply_trust_level_policy("c1");
+    assert!(
+        result.is_ok(),
+        "Trusted + host network should not be denied by trust policy"
+    );
 }

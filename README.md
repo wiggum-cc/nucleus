@@ -30,9 +30,9 @@ Container filesystem is backed by tmpfs/ramfs and pre-populated with context fil
 
 ## Platform Support
 
-- Linux (kernel 5.x+)
+- Linux (kernel 6.x+) on `x86_64` / `x86-64`
 - NixOS
-- **Not supported**: macOS, Windows, BSDs
+- **Not supported**: macOS, Windows, BSDs, 32-bit Linux userlands (`i386`/`x86`)
 
 This is a Linux-only tool by design – the isolation primitives are kernel-specific.
 

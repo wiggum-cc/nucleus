@@ -1,4 +1,4 @@
-use crate::container::{ContainerConfig, ContainerState, ContainerStateManager};
+use crate::container::{ContainerConfig, ContainerState, ContainerStateManager, TrustLevel};
 use crate::error::{NucleusError, Result};
 use crate::filesystem::{
     bind_mount_host_paths, create_dev_nodes, create_minimal_fs, mask_proc_paths, mount_procfs,
@@ -57,6 +57,7 @@ impl Container {
         }
 
         Self::apply_network_mode_guards(&mut config, is_root)?;
+        Self::apply_trust_level_guards(&mut config)?;
 
         // Bridge networking requires root
         if matches!(config.network, NetworkMode::Bridge(_)) && !is_root {
@@ -587,6 +588,49 @@ impl Container {
         config.allow_degraded_security
     }
 
+    fn apply_trust_level_guards(config: &mut ContainerConfig) -> Result<()> {
+        match config.trust_level {
+            TrustLevel::Trusted => Ok(()),
+            TrustLevel::Untrusted => {
+                // Untrusted workloads must never use host networking
+                if matches!(config.network, NetworkMode::Host) {
+                    return Err(NucleusError::ConfigError(
+                        "Untrusted workloads cannot use host network mode. \
+                         Set --trust-level trusted to override."
+                            .to_string(),
+                    ));
+                }
+
+                if !config.use_gvisor {
+                    if GVisorRuntime::is_available() {
+                        info!(
+                            "Untrusted workload: auto-enabling gVisor runtime \
+                             (runsc detected on PATH)"
+                        );
+                        config.use_gvisor = true;
+                    } else if config.allow_degraded_security {
+                        warn!(
+                            "Untrusted workload without gVisor: running with \
+                             degraded isolation (native kernel only). \
+                             Install runsc for full protection."
+                        );
+                    } else {
+                        return Err(NucleusError::ConfigError(
+                            "Untrusted workloads require gVisor (runsc). \
+                             Install runsc: https://gvisor.dev/docs/user_guide/install/ \
+                             — or pass --allow-degraded-security to run with native \
+                             kernel isolation only, or --trust-level trusted to skip \
+                             this check."
+                                .to_string(),
+                        ));
+                    }
+                }
+
+                Ok(())
+            }
+        }
+    }
+
     fn apply_network_mode_guards(config: &mut ContainerConfig, _is_root: bool) -> Result<()> {
         if let NetworkMode::Host = &config.network {
             if !config.allow_host_network {
@@ -639,6 +683,23 @@ mod tests {
     }
 
     #[test]
+    fn test_env_var_cannot_force_degraded_security_without_explicit_opt_in() {
+        let prev = std::env::var_os("NUCLEUS_ALLOW_DEGRADED_SECURITY");
+        std::env::set_var("NUCLEUS_ALLOW_DEGRADED_SECURITY", "1");
+
+        let strict = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
+        assert!(!Container::allow_degraded_security(&strict));
+
+        let explicit = strict.with_allow_degraded_security(true);
+        assert!(Container::allow_degraded_security(&explicit));
+
+        match prev {
+            Some(v) => std::env::set_var("NUCLEUS_ALLOW_DEGRADED_SECURITY", v),
+            None => std::env::remove_var("NUCLEUS_ALLOW_DEGRADED_SECURITY"),
+        }
+    }
+
+    #[test]
     fn test_host_network_requires_explicit_opt_in() {
         let mut config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
             .with_network(NetworkMode::Host)
@@ -655,5 +716,15 @@ mod tests {
         assert!(config.namespaces.net);
         Container::apply_network_mode_guards(&mut config, true).unwrap();
         assert!(!config.namespaces.net);
+    }
+
+    #[test]
+    fn test_non_host_network_does_not_require_host_opt_in() {
+        let mut config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_network(NetworkMode::None)
+            .with_allow_host_network(false);
+        assert!(config.namespaces.net);
+        Container::apply_network_mode_guards(&mut config, true).unwrap();
+        assert!(config.namespaces.net);
     }
 }

@@ -4,6 +4,8 @@
 
 Nucleus is a minimalist container runtime designed for AI agent workloads. Unlike Docker/containerd, it prioritizes minimal overhead, fast startup, and pre-populated context delivery over features like image layers or orchestration.
 
+Supported platform: Linux `x86_64` only. 32-bit Linux userlands (`i386`/`x86`) are not supported.
+
 ## Design Principles
 
 1. **Zero abstraction cost** - Direct syscalls to kernel primitives, no daemon

@@ -25,6 +25,23 @@ pub fn generate_container_id() -> String {
     )
 }
 
+/// Trust level for a container workload.
+///
+/// Determines the minimum isolation guarantees the runtime must enforce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustLevel {
+    /// Native kernel isolation (namespaces + seccomp + Landlock) is acceptable.
+    Trusted,
+    /// Requires gVisor; refuses to start without it unless degraded mode is allowed.
+    Untrusted,
+}
+
+impl Default for TrustLevel {
+    fn default() -> Self {
+        TrustLevel::Untrusted
+    }
+}
+
 /// Container configuration
 #[derive(Debug, Clone)]
 pub struct ContainerConfig {
@@ -54,6 +71,9 @@ pub struct ContainerConfig {
 
     /// Whether to use gVisor runtime
     pub use_gvisor: bool,
+
+    /// Trust level for this workload
+    pub trust_level: TrustLevel,
 
     /// Network mode
     pub network: crate::network::NetworkMode,
@@ -88,6 +108,7 @@ impl ContainerConfig {
             user_ns_config: None,
             hostname: Some(name),
             use_gvisor: false,
+            trust_level: TrustLevel::default(),
             network: crate::network::NetworkMode::None,
             context_mode: crate::filesystem::ContextMode::Copy,
             allow_degraded_security: false,
@@ -133,6 +154,11 @@ impl ContainerConfig {
 
     pub fn with_gvisor(mut self, enabled: bool) -> Self {
         self.use_gvisor = enabled;
+        self
+    }
+
+    pub fn with_trust_level(mut self, level: TrustLevel) -> Self {
+        self.trust_level = level;
         self
     }
 

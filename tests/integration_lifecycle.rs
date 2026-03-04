@@ -7,9 +7,11 @@
 /// test_start -> container_created -> container_running -> container_exited -> cleanup_done
 #[cfg(test)]
 mod tests {
-    use nucleus::container::{Container, ContainerConfig};
+    use nucleus::container::{Container, ContainerConfig, TrustLevel};
+    use nucleus::error::NucleusError;
     use nucleus::isolation::NamespaceConfig;
     use nucleus::resources::ResourceLimits;
+    use nucleus::security::GVisorRuntime;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -37,7 +39,8 @@ mod tests {
         )
         .with_context(context_path)
         .with_limits(limits)
-        .with_namespaces(NamespaceConfig::minimal());
+        .with_namespaces(NamespaceConfig::minimal())
+        .with_trust_level(TrustLevel::Trusted);
 
         // Run container
         let container = Container::new(config);
@@ -109,7 +112,8 @@ mod tests {
                 "test -c /dev/null && test -c /dev/zero && test -c /dev/random".to_string(),
             ],
         )
-        .with_namespaces(NamespaceConfig::minimal());
+        .with_namespaces(NamespaceConfig::minimal())
+        .with_trust_level(TrustLevel::Trusted);
 
         let container = Container::new(config);
         let result = container.run();
@@ -135,7 +139,8 @@ mod tests {
             ],
         )
         .with_namespaces(namespaces)
-        .with_hostname(Some("custom-hostname".to_string()));
+        .with_hostname(Some("custom-hostname".to_string()))
+        .with_trust_level(TrustLevel::Trusted);
 
         let container = Container::new(config);
         let result = container.run();
@@ -177,7 +182,8 @@ mod tests {
         .with_context(context_path)
         .with_limits(limits)
         .with_namespaces(namespaces)
-        .with_hostname(Some("nucleus-test".to_string()));
+        .with_hostname(Some("nucleus-test".to_string()))
+        .with_trust_level(TrustLevel::Trusted);
 
         let container = Container::new(config);
         let result = container.run();
@@ -253,5 +259,100 @@ mod tests {
         assert_eq!(stats.memory_limit, 536_870_912);
         assert_eq!(stats.cpu_usage_ns, 1_000_000_000); // 1_000_000 µs → ns
         assert_eq!(stats.pid_count, 5);
+    }
+
+    // --- Seccomp clone-flag integration test ---
+
+    #[test]
+    #[ignore] // Requires root privileges
+    fn test_seccomp_blocks_clone_newuser() {
+        // Verify that seccomp denies CLONE_NEWUSER inside the container.
+        // The shell script checks if `unshare -U true` succeeds:
+        //   - exit 0 = seccomp correctly blocked it (or unshare not available)
+        //   - exit 1 = filter is broken, unshare succeeded
+        let config = ContainerConfig::new(
+            Some("test-seccomp-clone".to_string()),
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "if ! command -v unshare >/dev/null 2>&1; then exit 0; fi; \
+                 if unshare -U true 2>/dev/null; then exit 1; else exit 0; fi"
+                    .to_string(),
+            ],
+        )
+        .with_namespaces(NamespaceConfig::minimal())
+        .with_trust_level(TrustLevel::Trusted);
+
+        let container = Container::new(config);
+        let result = container.run();
+
+        assert!(result.is_ok(), "Container should execute successfully");
+        let exit_code = result.unwrap();
+        assert_eq!(
+            exit_code, 0,
+            "Seccomp should deny CLONE_NEWUSER (exit 1 means filter is broken)"
+        );
+    }
+
+    // --- Trust-level tests ---
+
+    #[test]
+    fn test_trust_level_default_is_untrusted() {
+        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
+        assert_eq!(config.trust_level, TrustLevel::Untrusted);
+    }
+
+    #[test]
+    fn test_untrusted_workload_rejects_host_network() {
+        use nucleus::network::NetworkMode;
+
+        // Untrusted + host network should be rejected before fork (ConfigError)
+        let config = ContainerConfig::new(
+            Some("test-untrusted-host".to_string()),
+            vec!["/bin/sh".to_string()],
+        )
+        .with_trust_level(TrustLevel::Untrusted)
+        .with_network(NetworkMode::Host)
+        .with_allow_host_network(true)
+        .with_namespaces(NamespaceConfig::minimal());
+
+        let container = Container::new(config);
+        let result = container.run();
+        assert!(result.is_err(), "Untrusted + host network should fail");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, NucleusError::ConfigError(_)),
+            "Should be ConfigError, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_untrusted_workload_requires_gvisor_or_degraded() {
+        if GVisorRuntime::is_available() {
+            // gVisor is available: trust-level guard would auto-enable it,
+            // so we can't test the rejection path. Skip.
+            return;
+        }
+
+        let config = ContainerConfig::new(
+            Some("test-untrusted-no-gvisor".to_string()),
+            vec!["/bin/sh".to_string()],
+        )
+        .with_trust_level(TrustLevel::Untrusted)
+        .with_namespaces(NamespaceConfig::minimal());
+
+        let container = Container::new(config);
+        let result = container.run();
+        assert!(
+            result.is_err(),
+            "Untrusted without gVisor or degraded should fail"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, NucleusError::ConfigError(_)),
+            "Should be ConfigError, got: {:?}",
+            err
+        );
     }
 }

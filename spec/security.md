@@ -65,9 +65,10 @@ Allowed syscalls:
 ```
 read, write, open, openat, close, stat, fstat, lstat
 mmap, munmap, mprotect, brk
-clone, fork, vfork, execve, wait4, exit, exit_group
+clone, fork, execve, wait4, exit, exit_group
 getpid, gettid, getuid, getgid
 socket, connect, send, recv (if networking)
+landlock_create_ruleset, landlock_add_rule, landlock_restrict_self
 ...
 ```
 
@@ -83,6 +84,10 @@ perf_event_open # Performance monitoring
 userfaultfd     # User fault handling
 io_uring        # Async I/O (potential escape vector)
 ```
+
+Notes:
+- x32 legacy syscall numbers (512-547) are not allowlisted and are denied by default.
+- Landlock syscalls are allowlisted only to enable post-seccomp Landlock bootstrap in runtime setup.
 
 ### 4. Landlock (Filesystem Access Control)
 

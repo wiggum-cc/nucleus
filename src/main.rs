@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use nucleus::checkpoint::CriuRuntime;
 use nucleus::container::{
-    parse_signal, Container, ContainerConfig, ContainerLifecycle, ContainerStateManager,
+    parse_signal, Container, ContainerConfig, ContainerLifecycle, ContainerStateManager, TrustLevel,
 };
 use nucleus::filesystem::ContextMode;
 use nucleus::isolation::attach::ContainerAttach;
@@ -88,6 +88,10 @@ enum Commands {
         /// Allow chroot fallback if pivot_root fails (weaker than pivot_root)
         #[arg(long)]
         allow_chroot_fallback: bool,
+
+        /// Workload trust level: trusted (native isolation) or untrusted (requires gVisor)
+        #[arg(long, default_value = "untrusted")]
+        trust_level: String,
 
         /// Mount /proc writable (default is read-only for hardening)
         #[arg(long)]
@@ -390,6 +394,7 @@ fn main() -> Result<()> {
             allow_host_network,
             allow_degraded_security,
             allow_chroot_fallback,
+            trust_level,
             proc_rw,
             publish,
             context_mode,
@@ -476,6 +481,16 @@ fn main() -> Result<()> {
                 }
             };
 
+            // Parse trust level
+            let trust = match trust_level.as_str() {
+                "trusted" => TrustLevel::Trusted,
+                "untrusted" => TrustLevel::Untrusted,
+                other => {
+                    eprintln!("Unknown trust level: {}. Use trusted or untrusted.", other);
+                    std::process::exit(1);
+                }
+            };
+
             // Build configuration
             let mut config = ContainerConfig::new(name, command)
                 .with_limits(limits)
@@ -485,6 +500,7 @@ fn main() -> Result<()> {
                 .with_allow_host_network(allow_host_network)
                 .with_allow_degraded_security(allow_degraded_security)
                 .with_allow_chroot_fallback(allow_chroot_fallback)
+                .with_trust_level(trust)
                 .with_proc_readonly(!proc_rw);
 
             if let Some(ctx) = context {
