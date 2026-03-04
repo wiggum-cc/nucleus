@@ -161,6 +161,22 @@ Nucleus uses spec-driven development with comprehensive testing:
 
 All state machines are formally verified using TLA+ and Apalache model checker.
 
+### System-Level TLA+ Model
+
+In addition to subsystem specs, a composed system model is available:
+
+- `formal/tla/Nucleus_System.tla`
+- `formal/tla/Nucleus_System.cfg`
+
+This model verifies cross-subsystem ordering, authorization (owner/root control), and end-to-end
+progress properties over bounded container/user sets.
+
+Example Apalache run:
+
+```bash
+apalache-mc check --config=formal/tla/Nucleus_System.cfg formal/tla/Nucleus_System.tla
+```
+
 ## License
 
 Licensed under either of:
