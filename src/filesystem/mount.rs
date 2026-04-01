@@ -76,9 +76,87 @@ pub fn create_dev_nodes(dev_path: &Path, include_tty: bool) -> Result<()> {
     Ok(())
 }
 
+/// Bind mount a pre-built rootfs (e.g. a Nix store closure) into the container.
+///
+/// Instead of exposing the full host /bin, /usr, /lib, /lib64, /nix, this mounts
+/// a minimal, purpose-built root filesystem. Suitable for production services.
+pub fn bind_mount_rootfs(root: &Path, rootfs_path: &Path) -> Result<()> {
+    info!(
+        "Bind mounting production rootfs {:?} into container {:?}",
+        rootfs_path, root
+    );
+
+    if !rootfs_path.exists() {
+        return Err(NucleusError::FilesystemError(format!(
+            "Rootfs path does not exist: {:?}",
+            rootfs_path
+        )));
+    }
+
+    // Bind mount the rootfs contents into the container root.
+    // The rootfs is expected to contain a standard FHS layout (/bin, /lib, /etc, etc.)
+    // produced by a Nix buildEnv or similar.
+    let subdirs = ["bin", "sbin", "lib", "lib64", "usr", "etc", "nix"];
+
+    for subdir in &subdirs {
+        let source = rootfs_path.join(subdir);
+        if !source.exists() {
+            debug!("Rootfs subdir {} not present, skipping", subdir);
+            continue;
+        }
+
+        let target = root.join(subdir);
+        std::fs::create_dir_all(&target).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to create mount point {:?}: {}",
+                target, e
+            ))
+        })?;
+
+        mount(
+            Some(&source),
+            &target,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to bind mount rootfs {:?} -> {:?}: {}",
+                source, target, e
+            ))
+        })?;
+
+        // Remount read-only
+        mount(
+            None::<&str>,
+            &target,
+            None::<&str>,
+            MsFlags::MS_REMOUNT
+                | MsFlags::MS_BIND
+                | MsFlags::MS_RDONLY
+                | MsFlags::MS_REC
+                | MsFlags::MS_NOSUID
+                | MsFlags::MS_NODEV,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to remount rootfs {:?} read-only: {}",
+                target, e
+            ))
+        })?;
+
+        info!("Mounted rootfs/{} read-only", subdir);
+    }
+
+    Ok(())
+}
+
 /// Bind mount essential host directories into container
 ///
-/// This allows host binaries to be accessible inside the container
+/// This allows host binaries to be accessible inside the container.
+/// Used in agent mode. Production mode should use bind_mount_rootfs() instead.
 pub fn bind_mount_host_paths(root: &Path, best_effort: bool) -> Result<()> {
     info!("Bind mounting host paths into container");
 
@@ -346,6 +424,98 @@ fn chroot_impl(new_root: &Path) -> Result<()> {
         .map_err(|e| NucleusError::PivotRootError(format!("Failed to chdir to /: {}", e)))?;
 
     info!("Successfully switched root using chroot");
+
+    Ok(())
+}
+
+/// Mount secret files into the container root.
+///
+/// Each secret is bind-mounted read-only from its source to the destination
+/// path inside the container. Intermediate directories are created as needed.
+pub fn mount_secrets(
+    root: &Path,
+    secrets: &[crate::container::SecretMount],
+) -> Result<()> {
+    if secrets.is_empty() {
+        return Ok(());
+    }
+
+    info!("Mounting {} secret(s) into container", secrets.len());
+
+    for secret in secrets {
+        if !secret.source.exists() {
+            return Err(NucleusError::FilesystemError(format!(
+                "Secret source does not exist: {:?}",
+                secret.source
+            )));
+        }
+
+        // Destination inside container root
+        let dest = root.join(secret.dest.strip_prefix("/").unwrap_or(&secret.dest));
+
+        // Create parent directories
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to create secret mount parent {:?}: {}",
+                    parent, e
+                ))
+            })?;
+        }
+
+        // Create mount point file
+        if secret.source.is_file() {
+            std::fs::write(&dest, "").map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to create secret mount point {:?}: {}",
+                    dest, e
+                ))
+            })?;
+        } else {
+            std::fs::create_dir_all(&dest).map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to create secret mount dir {:?}: {}",
+                    dest, e
+                ))
+            })?;
+        }
+
+        // Bind mount read-only
+        mount(
+            Some(secret.source.as_path()),
+            &dest,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to bind mount secret {:?}: {}",
+                secret.source, e
+            ))
+        })?;
+
+        mount(
+            None::<&str>,
+            &dest,
+            None::<&str>,
+            MsFlags::MS_REMOUNT
+                | MsFlags::MS_BIND
+                | MsFlags::MS_RDONLY
+                | MsFlags::MS_NOSUID
+                | MsFlags::MS_NODEV
+                | MsFlags::MS_NOEXEC,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to remount secret {:?} read-only: {}",
+                dest, e
+            ))
+        })?;
+
+        debug!("Mounted secret {:?} -> {:?}", secret.source, secret.dest);
+    }
 
     Ok(())
 }

@@ -1,15 +1,18 @@
-use crate::container::{ContainerConfig, ContainerState, ContainerStateManager, TrustLevel};
+use crate::container::{
+    ContainerConfig, ContainerState, ContainerStateManager, ServiceMode, TrustLevel,
+};
 use crate::error::{NucleusError, Result};
 use crate::filesystem::{
-    bind_mount_host_paths, create_dev_nodes, create_minimal_fs, mask_proc_paths, mount_procfs,
-    switch_root, ContextPopulator, FilesystemState, LazyContextPopulator, TmpfsMount,
+    bind_mount_host_paths, bind_mount_rootfs, create_dev_nodes, create_minimal_fs, mask_proc_paths,
+    mount_procfs, mount_secrets, switch_root, ContextPopulator, FilesystemState,
+    LazyContextPopulator, TmpfsMount,
 };
 use crate::isolation::NamespaceManager;
 use crate::network::{BridgeNetwork, NetworkMode};
 use crate::resources::Cgroup;
 use crate::security::{
-    CapabilityManager, GVisorRuntime, LandlockManager, OciBundle, OciConfig, SeccompManager,
-    SecurityState,
+    CapabilityManager, GVisorNetworkMode, GVisorRuntime, LandlockManager, OciBundle, OciConfig,
+    SeccompManager, SecurityState,
 };
 use nix::sys::signal::{kill, Signal};
 use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
@@ -56,6 +59,9 @@ impl Container {
             config.user_ns_config = Some(crate::isolation::UserNamespaceConfig::rootless());
         }
 
+        // Validate production mode invariants before anything else.
+        config.validate_production_mode()?;
+
         Self::apply_network_mode_guards(&mut config, is_root)?;
         Self::apply_trust_level_guards(&mut config)?;
 
@@ -87,6 +93,14 @@ impl Container {
                 }
             }
             Err(e) => {
+                if config.service_mode == ServiceMode::Production {
+                    return Err(NucleusError::CgroupError(format!(
+                        "Production mode requires cgroup resource enforcement, but \
+                         cgroup creation failed: {}",
+                        e
+                    )));
+                }
+
                 if config.user_ns_config.is_some() {
                     if config.limits.memory_bytes.is_some()
                         || config.limits.cpu_quota_us.is_some()
@@ -153,12 +167,46 @@ impl Container {
 
                     if let NetworkMode::Bridge(ref bridge_config) = config.network {
                         match BridgeNetwork::setup(target_pid, bridge_config) {
-                            Ok(net) => bridge_net = Some(net),
-                            Err(e) => warn!("Failed to set up bridge networking: {}", e),
+                            Ok(net) => {
+                                // Apply egress policy if configured
+                                if let Some(ref egress) = config.egress_policy {
+                                    if let Err(e) =
+                                        net.apply_egress_policy(target_pid, egress)
+                                    {
+                                        if config.service_mode == ServiceMode::Production {
+                                            return Err(NucleusError::NetworkError(format!(
+                                                "Failed to apply egress policy: {}",
+                                                e
+                                            )));
+                                        }
+                                        warn!("Failed to apply egress policy: {}", e);
+                                    }
+                                }
+                                bridge_net = Some(net);
+                            }
+                            Err(e) => {
+                                if config.service_mode == ServiceMode::Production {
+                                    return Err(e);
+                                }
+                                warn!("Failed to set up bridge networking: {}", e);
+                            }
                         }
                     }
 
                     self.setup_signal_forwarding(Pid::from_raw(target_pid as i32))?;
+
+                    // Start health check thread if configured
+                    if let Some(ref hc) = config.health_check {
+                        if !hc.command.is_empty() {
+                            let hc = hc.clone();
+                            let pid = target_pid;
+                            let container_name = config.name.clone();
+                            std::thread::spawn(move || {
+                                Self::health_check_loop(pid, &container_name, &hc);
+                            });
+                        }
+                    }
+
                     let exit_code = self.wait_for_child(child)?;
                     child_waited = true;
                     Ok(exit_code)
@@ -288,8 +336,15 @@ impl Container {
         }
         fs_state = fs_state.transition(FilesystemState::Populated)?;
 
-        // 7. Bind mount host paths (for accessing host binaries)
-        bind_mount_host_paths(&container_root, is_rootless)?;
+        // 7. Mount runtime paths: either a pre-built rootfs or host bind mounts
+        if let Some(ref rootfs_path) = self.config.rootfs_path {
+            bind_mount_rootfs(&container_root, rootfs_path)?;
+        } else {
+            bind_mount_host_paths(&container_root, is_rootless)?;
+        }
+
+        // 7b. Mount secrets
+        mount_secrets(&container_root, &self.config.secrets)?;
 
         // 8. Mount procfs
         let proc_path = container_root.join("proc");
@@ -430,7 +485,14 @@ impl Container {
             populator.populate()?;
         }
 
-        gvisor.exec_with_oci_bundle(&self.config.id, &bundle)?;
+        // Select gVisor network mode based on container network config
+        let gvisor_net = match &self.config.network {
+            NetworkMode::None => GVisorNetworkMode::None,
+            NetworkMode::Host => GVisorNetworkMode::Host,
+            NetworkMode::Bridge(_) => GVisorNetworkMode::Sandbox,
+        };
+
+        gvisor.exec_with_oci_bundle_network(&self.config.id, &bundle, gvisor_net)?;
 
         Ok(())
     }
@@ -457,7 +519,7 @@ impl Container {
             .collect();
         let args = args?;
 
-        let env = vec![
+        let mut env = vec![
             CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
                 .map_err(|e| NucleusError::ExecError(format!("Invalid environment PATH: {}", e)))?,
             CString::new("TERM=xterm")
@@ -465,6 +527,25 @@ impl Container {
             CString::new("HOME=/")
                 .map_err(|e| NucleusError::ExecError(format!("Invalid environment HOME: {}", e)))?,
         ];
+
+        // Pass through sd_notify socket if enabled
+        if self.config.sd_notify {
+            if let Ok(notify_socket) = std::env::var("NOTIFY_SOCKET") {
+                env.push(
+                    CString::new(format!("NOTIFY_SOCKET={}", notify_socket)).map_err(|e| {
+                        NucleusError::ExecError(format!("Invalid NOTIFY_SOCKET: {}", e))
+                    })?,
+                );
+            }
+        }
+
+        // Append user-configured environment variables
+        for (key, value) in &self.config.environment {
+            env.push(CString::new(format!("{}={}", key, value)).map_err(|e| {
+                NucleusError::ExecError(format!("Invalid environment variable {}={}: {}", key, value, e))
+            })?);
+        }
+
         nix::unistd::execve(&program, &args, &env)?;
 
         Ok(())
@@ -571,6 +652,75 @@ impl Container {
                 Err(_) => return 1,
                 _ => continue,
             }
+        }
+    }
+
+    /// Run periodic health checks against the container via nsenter.
+    fn health_check_loop(
+        pid: u32,
+        container_name: &str,
+        hc: &crate::container::HealthCheck,
+    ) {
+        use std::process::Command;
+
+        // Wait for start_period before beginning checks
+        std::thread::sleep(hc.start_period);
+
+        let mut consecutive_failures: u32 = 0;
+
+        loop {
+            // Check if the container process is still alive
+            let proc_path = format!("/proc/{}", pid);
+            if !std::path::Path::new(&proc_path).exists() {
+                debug!("Health check: container process {} gone, stopping", pid);
+                return;
+            }
+
+            let pid_str = pid.to_string();
+            let mut cmd = Command::new("nsenter");
+            cmd.arg("-t").arg(&pid_str).arg("-m").arg("-p");
+            for arg in &hc.command {
+                cmd.arg(arg);
+            }
+
+            let result = cmd
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+
+            match result {
+                Ok(status) if status.success() => {
+                    if consecutive_failures > 0 {
+                        info!(
+                            "Health check passed for {} after {} failures",
+                            container_name, consecutive_failures
+                        );
+                    }
+                    consecutive_failures = 0;
+                }
+                _ => {
+                    consecutive_failures += 1;
+                    warn!(
+                        "Health check failed for {} ({}/{})",
+                        container_name, consecutive_failures, hc.retries
+                    );
+
+                    if consecutive_failures >= hc.retries {
+                        error!(
+                            "Container {} is unhealthy after {} consecutive failures",
+                            container_name, consecutive_failures
+                        );
+                        // Signal the container to stop — the parent will handle cleanup
+                        let _ = kill(
+                            Pid::from_raw(pid as i32),
+                            Signal::SIGTERM,
+                        );
+                        return;
+                    }
+                }
+            }
+
+            std::thread::sleep(hc.interval);
         }
     }
 

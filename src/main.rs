@@ -2,12 +2,13 @@ use anyhow::Result;
 use clap::Parser;
 use nucleus::checkpoint::CriuRuntime;
 use nucleus::container::{
-    parse_signal, Container, ContainerConfig, ContainerLifecycle, ContainerStateManager, TrustLevel,
+    parse_signal, Container, ContainerConfig, ContainerLifecycle, ContainerStateManager,
+    HealthCheck, SecretMount, ServiceMode, TrustLevel,
 };
 use nucleus::filesystem::ContextMode;
 use nucleus::isolation::attach::ContainerAttach;
 use nucleus::isolation::NamespaceConfig;
-use nucleus::network::{BridgeConfig, NetworkMode, PortForward};
+use nucleus::network::{BridgeConfig, EgressPolicy, NetworkMode, PortForward};
 use nucleus::resources::{IoDeviceLimit, ResourceLimits, ResourceStats};
 use std::path::PathBuf;
 use tracing::info;
@@ -104,6 +105,58 @@ enum Commands {
         /// Context population mode: copy or bind (default: copy)
         #[arg(long = "context-mode", default_value = "copy")]
         context_mode: String,
+
+        /// Service mode: agent (default) or production (strict security invariants)
+        #[arg(long, default_value = "agent")]
+        service_mode: String,
+
+        /// Pre-built rootfs path (Nix store closure). Replaces host bind mounts.
+        #[arg(long)]
+        rootfs: Option<String>,
+
+        /// Allowed egress CIDRs (repeatable). Enables egress policy when set.
+        #[arg(long = "egress-allow")]
+        egress_allow: Vec<String>,
+
+        /// Allowed egress TCP ports (repeatable, used with --egress-allow)
+        #[arg(long = "egress-tcp-port")]
+        egress_tcp_ports: Vec<u16>,
+
+        /// Allowed egress UDP ports (repeatable, used with --egress-allow)
+        #[arg(long = "egress-udp-port")]
+        egress_udp_ports: Vec<u16>,
+
+        /// DNS servers (repeatable). Required for bridge mode in production.
+        #[arg(long)]
+        dns: Vec<String>,
+
+        /// Health check command (run inside container)
+        #[arg(long = "health-cmd")]
+        health_cmd: Option<String>,
+
+        /// Health check interval in seconds (default: 30)
+        #[arg(long = "health-interval")]
+        health_interval: Option<u64>,
+
+        /// Health check retries before unhealthy (default: 3)
+        #[arg(long = "health-retries")]
+        health_retries: Option<u32>,
+
+        /// Health check start period in seconds (default: 5)
+        #[arg(long = "health-start-period")]
+        health_start_period: Option<u64>,
+
+        /// Mount a secret file: SOURCE:DEST (repeatable)
+        #[arg(long = "secret")]
+        secrets: Vec<String>,
+
+        /// Set environment variable: KEY=VALUE (repeatable)
+        #[arg(short = 'e', long = "env")]
+        env_vars: Vec<String>,
+
+        /// Enable sd_notify integration (pass NOTIFY_SOCKET into container)
+        #[arg(long)]
+        sd_notify: bool,
 
         /// Command to run in container
         #[arg(last = true, required = true)]
@@ -398,6 +451,19 @@ fn main() -> Result<()> {
             proc_rw,
             publish,
             context_mode,
+            service_mode,
+            rootfs,
+            egress_allow,
+            egress_tcp_ports,
+            egress_udp_ports,
+            dns,
+            health_cmd,
+            health_interval,
+            health_retries,
+            health_start_period,
+            secrets,
+            env_vars,
+            sd_notify,
             command,
         } => {
             if command.is_empty() {
@@ -453,7 +519,16 @@ fn main() -> Result<()> {
                 "none" => NetworkMode::None,
                 "host" => NetworkMode::Host,
                 "bridge" => {
-                    let mut bridge_config = BridgeConfig::default();
+                    let mut bridge_config = if dns.is_empty() {
+                        // Agent mode gets public DNS by default; production must configure explicitly
+                        if service_mode == "production" {
+                            BridgeConfig::default()
+                        } else {
+                            BridgeConfig::default().with_public_dns()
+                        }
+                    } else {
+                        BridgeConfig::default().with_dns(dns.clone())
+                    };
                     // Parse port forwards
                     for spec in &publish {
                         let pf = PortForward::parse(spec)
@@ -491,6 +566,16 @@ fn main() -> Result<()> {
                 }
             };
 
+            // Parse service mode
+            let svc_mode = match service_mode.as_str() {
+                "agent" => ServiceMode::Agent,
+                "production" => ServiceMode::Production,
+                other => {
+                    eprintln!("Unknown service mode: {}. Use agent or production.", other);
+                    std::process::exit(1);
+                }
+            };
+
             // Build configuration
             let mut config = ContainerConfig::new(name, command)
                 .with_limits(limits)
@@ -501,7 +586,9 @@ fn main() -> Result<()> {
                 .with_allow_degraded_security(allow_degraded_security)
                 .with_allow_chroot_fallback(allow_chroot_fallback)
                 .with_trust_level(trust)
-                .with_proc_readonly(!proc_rw);
+                .with_proc_readonly(!proc_rw)
+                .with_service_mode(svc_mode)
+                .with_sd_notify(sd_notify);
 
             if let Some(ctx) = context {
                 config = config.with_context(PathBuf::from(ctx));
@@ -528,6 +615,64 @@ fn main() -> Result<()> {
             if oci {
                 info!("Enabling OCI bundle mode");
                 config = config.with_oci_bundle();
+            }
+
+            // Rootfs path
+            if let Some(rootfs_dir) = rootfs {
+                config = config.with_rootfs_path(PathBuf::from(rootfs_dir));
+            }
+
+            // Egress policy
+            if !egress_allow.is_empty() {
+                let policy = EgressPolicy::default()
+                    .with_allowed_cidrs(egress_allow)
+                    .with_allowed_tcp_ports(egress_tcp_ports)
+                    .with_allowed_udp_ports(egress_udp_ports);
+                config = config.with_egress_policy(policy);
+            }
+
+            // Health check
+            if let Some(cmd) = health_cmd {
+                let hc = HealthCheck {
+                    command: vec!["/bin/sh".to_string(), "-c".to_string(), cmd],
+                    interval: std::time::Duration::from_secs(health_interval.unwrap_or(30)),
+                    retries: health_retries.unwrap_or(3),
+                    start_period: std::time::Duration::from_secs(
+                        health_start_period.unwrap_or(5),
+                    ),
+                    timeout: std::time::Duration::from_secs(5),
+                };
+                config = config.with_health_check(hc);
+            }
+
+            // Secrets
+            for spec in &secrets {
+                let parts: Vec<&str> = spec.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    eprintln!(
+                        "Invalid secret format '{}', expected SOURCE:DEST",
+                        spec
+                    );
+                    std::process::exit(1);
+                }
+                config = config.with_secret(SecretMount {
+                    source: PathBuf::from(parts[0]),
+                    dest: PathBuf::from(parts[1]),
+                    mode: 0o400,
+                });
+            }
+
+            // Environment variables
+            for spec in &env_vars {
+                if let Some((key, value)) = spec.split_once('=') {
+                    config = config.with_env(key.to_string(), value.to_string());
+                } else {
+                    eprintln!(
+                        "Invalid env var format '{}', expected KEY=VALUE",
+                        spec
+                    );
+                    std::process::exit(1);
+                }
             }
 
             println!("{}", config.id);

@@ -30,9 +30,76 @@ impl Default for BridgeConfig {
             bridge_name: "nucleus0".to_string(),
             subnet: "10.0.42.0/24".to_string(),
             container_ip: None,
-            dns: vec!["8.8.8.8".to_string(), "8.8.4.4".to_string()],
+            // Empty by default — production services must configure DNS explicitly.
+            // Agent mode callers can use BridgeConfig::with_public_dns() for convenience.
+            dns: Vec::new(),
             port_forwards: Vec::new(),
         }
+    }
+}
+
+impl BridgeConfig {
+    /// Convenience: populate with public Google DNS resolvers.
+    /// Suitable for agent/sandbox workloads, NOT for production services.
+    pub fn with_public_dns(mut self) -> Self {
+        self.dns = vec!["8.8.8.8".to_string(), "8.8.4.4".to_string()];
+        self
+    }
+
+    pub fn with_dns(mut self, servers: Vec<String>) -> Self {
+        self.dns = servers;
+        self
+    }
+}
+
+/// Egress policy for audited outbound network access.
+///
+/// When set, iptables OUTPUT chain rules restrict which destinations the
+/// container process can connect to. An empty allowed list means no
+/// outbound connections are permitted (deny-all egress).
+#[derive(Debug, Clone)]
+pub struct EgressPolicy {
+    /// Allowed destination CIDRs (e.g., "10.0.0.0/8", "192.168.1.0/24").
+    pub allowed_cidrs: Vec<String>,
+    /// Allowed destination TCP ports. Empty means all ports on allowed CIDRs.
+    pub allowed_tcp_ports: Vec<u16>,
+    /// Allowed destination UDP ports.
+    pub allowed_udp_ports: Vec<u16>,
+    /// Whether to log denied egress attempts (rate-limited).
+    pub log_denied: bool,
+}
+
+impl Default for EgressPolicy {
+    fn default() -> Self {
+        Self {
+            allowed_cidrs: Vec::new(),
+            allowed_tcp_ports: Vec::new(),
+            allowed_udp_ports: Vec::new(),
+            log_denied: true,
+        }
+    }
+}
+
+impl EgressPolicy {
+    /// Create a deny-all egress policy.
+    pub fn deny_all() -> Self {
+        Self::default()
+    }
+
+    /// Allow egress to the given CIDRs on any port.
+    pub fn with_allowed_cidrs(mut self, cidrs: Vec<String>) -> Self {
+        self.allowed_cidrs = cidrs;
+        self
+    }
+
+    pub fn with_allowed_tcp_ports(mut self, ports: Vec<u16>) -> Self {
+        self.allowed_tcp_ports = ports;
+        self
+    }
+
+    pub fn with_allowed_udp_ports(mut self, ports: Vec<u16>) -> Self {
+        self.allowed_udp_ports = ports;
+        self
     }
 }
 

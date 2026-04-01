@@ -1,7 +1,8 @@
 use crate::isolation::{NamespaceConfig, UserNamespaceConfig};
+use crate::network::EgressPolicy;
 use crate::resources::ResourceLimits;
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Generate a unique 12-hex-char container ID using /dev/urandom
 pub fn generate_container_id() -> String {
@@ -28,18 +29,79 @@ pub fn generate_container_id() -> String {
 /// Trust level for a container workload.
 ///
 /// Determines the minimum isolation guarantees the runtime must enforce.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrustLevel {
     /// Native kernel isolation (namespaces + seccomp + Landlock) is acceptable.
     Trusted,
     /// Requires gVisor; refuses to start without it unless degraded mode is allowed.
+    #[default]
     Untrusted,
 }
 
-impl Default for TrustLevel {
+/// Service mode for the container.
+///
+/// Determines whether the container runs as an ephemeral agent sandbox
+/// or a long-running production service with stricter requirements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ServiceMode {
+    /// Ephemeral agent workload (default). Allows degraded fallbacks.
+    #[default]
+    Agent,
+    /// Long-running production service. Enforces strict security invariants:
+    /// - Forbids degraded security, chroot fallback, and host networking
+    /// - Requires cgroup resource limits
+    /// - Requires pivot_root (no chroot fallback)
+    /// - Requires explicit rootfs path (no host bind mounts)
+    Production,
+}
+
+/// Health check configuration for long-running services.
+#[derive(Debug, Clone)]
+pub struct HealthCheck {
+    /// Command to run inside the container to check health.
+    pub command: Vec<String>,
+    /// Interval between health checks.
+    pub interval: Duration,
+    /// Number of consecutive failures before marking unhealthy.
+    pub retries: u32,
+    /// Grace period after start before health checks begin.
+    pub start_period: Duration,
+    /// Timeout for each health check execution.
+    pub timeout: Duration,
+}
+
+impl Default for HealthCheck {
     fn default() -> Self {
-        TrustLevel::Untrusted
+        Self {
+            command: Vec::new(),
+            interval: Duration::from_secs(30),
+            retries: 3,
+            start_period: Duration::from_secs(5),
+            timeout: Duration::from_secs(5),
+        }
     }
+}
+
+/// Secrets configuration for mounting secret files into the container.
+#[derive(Debug, Clone)]
+pub struct SecretMount {
+    /// Source path on the host (or Nix store path).
+    pub source: PathBuf,
+    /// Destination path inside the container.
+    pub dest: PathBuf,
+    /// File mode (default: 0o400, read-only by owner).
+    pub mode: u32,
+}
+
+/// Readiness probe configuration.
+#[derive(Debug, Clone)]
+pub enum ReadinessProbe {
+    /// Run a command; ready when it exits 0.
+    Exec { command: Vec<String> },
+    /// Check TCP port connectivity.
+    TcpPort(u16),
+    /// Use sd_notify protocol (service sends READY=1).
+    SdNotify,
 }
 
 /// Container configuration
@@ -92,6 +154,31 @@ pub struct ContainerConfig {
 
     /// Mount /proc read-only inside the container
     pub proc_readonly: bool,
+
+    /// Service mode (agent vs production)
+    pub service_mode: ServiceMode,
+
+    /// Pre-built rootfs path (Nix store path). When set, this is bind-mounted
+    /// as the container root instead of bind-mounting host /bin, /usr, /lib, etc.
+    pub rootfs_path: Option<PathBuf>,
+
+    /// Egress policy for audited outbound network access.
+    pub egress_policy: Option<EgressPolicy>,
+
+    /// Health check configuration for long-running services.
+    pub health_check: Option<HealthCheck>,
+
+    /// Readiness probe for service startup detection.
+    pub readiness_probe: Option<ReadinessProbe>,
+
+    /// Secret files to mount into the container.
+    pub secrets: Vec<SecretMount>,
+
+    /// Environment variables to pass to the container process.
+    pub environment: Vec<(String, String)>,
+
+    /// Enable sd_notify integration (pass NOTIFY_SOCKET into container).
+    pub sd_notify: bool,
 }
 
 impl ContainerConfig {
@@ -115,6 +202,14 @@ impl ContainerConfig {
             allow_chroot_fallback: false,
             allow_host_network: false,
             proc_readonly: true,
+            service_mode: ServiceMode::default(),
+            rootfs_path: None,
+            egress_policy: None,
+            health_check: None,
+            readiness_probe: None,
+            secrets: Vec::new(),
+            environment: Vec::new(),
+            sd_notify: false,
         }
     }
 
@@ -197,6 +292,87 @@ impl ContainerConfig {
         self.proc_readonly = proc_readonly;
         self
     }
+
+    pub fn with_service_mode(mut self, mode: ServiceMode) -> Self {
+        self.service_mode = mode;
+        self
+    }
+
+    pub fn with_rootfs_path(mut self, path: PathBuf) -> Self {
+        self.rootfs_path = Some(path);
+        self
+    }
+
+    pub fn with_egress_policy(mut self, policy: EgressPolicy) -> Self {
+        self.egress_policy = Some(policy);
+        self
+    }
+
+    pub fn with_health_check(mut self, hc: HealthCheck) -> Self {
+        self.health_check = Some(hc);
+        self
+    }
+
+    pub fn with_readiness_probe(mut self, probe: ReadinessProbe) -> Self {
+        self.readiness_probe = Some(probe);
+        self
+    }
+
+    pub fn with_secret(mut self, secret: SecretMount) -> Self {
+        self.secrets.push(secret);
+        self
+    }
+
+    pub fn with_env(mut self, key: String, value: String) -> Self {
+        self.environment.push((key, value));
+        self
+    }
+
+    pub fn with_sd_notify(mut self, enabled: bool) -> Self {
+        self.sd_notify = enabled;
+        self
+    }
+
+    /// Validate that production mode invariants are satisfied.
+    /// Called before container startup when service_mode == Production.
+    pub fn validate_production_mode(&self) -> crate::error::Result<()> {
+        if self.service_mode != ServiceMode::Production {
+            return Ok(());
+        }
+
+        if self.allow_degraded_security {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Production mode forbids --allow-degraded-security".to_string(),
+            ));
+        }
+
+        if self.allow_chroot_fallback {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Production mode forbids --allow-chroot-fallback".to_string(),
+            ));
+        }
+
+        if self.allow_host_network {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Production mode forbids --allow-host-network".to_string(),
+            ));
+        }
+
+        if matches!(self.network, crate::network::NetworkMode::Host) {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Production mode forbids host network mode".to_string(),
+            ));
+        }
+
+        // Production mode requires explicit resource limits
+        if self.limits.memory_bytes.is_none() {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Production mode requires explicit --memory limit".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -211,6 +387,32 @@ mod tests {
         assert!(!cfg.allow_chroot_fallback);
         assert!(!cfg.allow_host_network);
         assert!(cfg.proc_readonly);
+        assert_eq!(cfg.service_mode, ServiceMode::Agent);
+        assert!(cfg.rootfs_path.is_none());
+        assert!(cfg.egress_policy.is_none());
+        assert!(cfg.secrets.is_empty());
+        assert!(!cfg.sd_notify);
+    }
+
+    #[test]
+    fn test_production_mode_rejects_degraded_flags() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_service_mode(ServiceMode::Production)
+            .with_allow_degraded_security(true)
+            .with_limits(
+                crate::resources::ResourceLimits::default()
+                    .with_memory("512M")
+                    .unwrap(),
+            );
+        assert!(cfg.validate_production_mode().is_err());
+    }
+
+    #[test]
+    fn test_production_mode_requires_memory_limit() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_service_mode(ServiceMode::Production);
+        let err = cfg.validate_production_mode().unwrap_err();
+        assert!(err.to_string().contains("--memory"));
     }
 
     #[test]

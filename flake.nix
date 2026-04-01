@@ -20,6 +20,22 @@
   };
 
   outputs = { self, nixpkgs, crane, flake-utils, rust-overlay, advisory-db, ... }:
+    {
+      # NixOS module for declarative Nucleus service management
+      nixosModules.default = import ./nix/module.nix;
+      nixosModules.nucleus = self.nixosModules.default;
+
+      # Helper: build a minimal rootfs for a Nucleus production container.
+      # Usage in a flake:
+      #   nucleus.lib.mkRootfs { pkgs = import nixpkgs { system = "x86_64-linux"; };
+      #     packages = [ pkgs.coreutils pkgs.curl pkgs.cacert ]; }
+      lib.mkRootfs = { pkgs, packages ? [ ], name ? "nucleus-rootfs" }:
+        pkgs.buildEnv {
+          inherit name;
+          paths = [ pkgs.coreutils pkgs.bashInteractive ] ++ packages;
+          pathsToLink = [ "/bin" "/sbin" "/lib" "/lib64" "/usr" "/etc" "/nix" ];
+        };
+    } //
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {

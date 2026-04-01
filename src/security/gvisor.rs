@@ -7,6 +7,18 @@ use std::path::Path;
 use std::process::Command;
 use tracing::{debug, info};
 
+/// Network mode for gVisor runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GVisorNetworkMode {
+    /// No networking (fully isolated). Default for agent workloads.
+    None,
+    /// gVisor user-space network stack. Suitable for networked production services
+    /// that need gVisor isolation with network access.
+    Sandbox,
+    /// Share host network namespace. Use with caution.
+    Host,
+}
+
 /// GVisor runtime manager
 ///
 /// Implements the gVisor state machine from
@@ -97,12 +109,37 @@ impl GVisorRuntime {
 
     /// Execute using gVisor with an OCI bundle
     ///
-    /// This is the OCI-compliant way to run containers with gVisor
-    pub fn exec_with_oci_bundle(&self, container_id: &str, bundle: &OciBundle) -> Result<()> {
+    /// This is the OCI-compliant way to run containers with gVisor.
+    /// The `network_mode` parameter controls gVisor's --network flag:
+    /// - `GVisorNetworkMode::None` → `--network none` (fully isolated, original behavior)
+    /// - `GVisorNetworkMode::Sandbox` → `--network sandbox` (gVisor user-space network stack)
+    /// - `GVisorNetworkMode::Host` → `--network host` (share host network namespace)
+    pub fn exec_with_oci_bundle(
+        &self,
+        container_id: &str,
+        bundle: &OciBundle,
+    ) -> Result<()> {
+        self.exec_with_oci_bundle_network(container_id, bundle, GVisorNetworkMode::None)
+    }
+
+    /// Execute using gVisor with an OCI bundle and explicit network mode.
+    pub fn exec_with_oci_bundle_network(
+        &self,
+        container_id: &str,
+        bundle: &OciBundle,
+        network_mode: GVisorNetworkMode,
+    ) -> Result<()> {
         info!(
-            "Executing with gVisor using OCI bundle at {:?}",
-            bundle.bundle_path()
+            "Executing with gVisor using OCI bundle at {:?} (network: {:?})",
+            bundle.bundle_path(),
+            network_mode,
         );
+
+        let network_flag = match network_mode {
+            GVisorNetworkMode::None => "none",
+            GVisorNetworkMode::Sandbox => "sandbox",
+            GVisorNetworkMode::Host => "host",
+        };
 
         // Build runsc run command with OCI bundle
         // runsc run --bundle <bundle-path> <container-id>
@@ -112,7 +149,7 @@ impl GVisorRuntime {
             "--bundle".to_string(),
             bundle.bundle_path().to_string_lossy().to_string(),
             "--network".to_string(),
-            "none".to_string(),
+            network_flag.to_string(),
             "--platform".to_string(),
             "ptrace".to_string(), // Use ptrace platform (works without KVM)
             container_id.to_string(),

@@ -1,8 +1,8 @@
 use crate::error::{NucleusError, Result};
-use crate::network::config::{BridgeConfig, PortForward};
+use crate::network::config::{BridgeConfig, EgressPolicy, PortForward};
 use crate::network::NetworkState;
 use std::process::Command;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Bridge network manager
 pub struct BridgeNetwork {
@@ -162,6 +162,151 @@ impl BridgeNetwork {
             veth_host,
             state: net_state,
         })
+    }
+
+    /// Apply egress policy rules inside the container's network namespace.
+    ///
+    /// Uses iptables OUTPUT chain to restrict outbound connections.
+    /// Must be called after bridge setup while the container netns is reachable.
+    pub fn apply_egress_policy(&self, pid: u32, policy: &EgressPolicy) -> Result<()> {
+        let pid_str = pid.to_string();
+
+        // Default policy: drop all OUTPUT (except established/related and loopback)
+        Self::run_cmd(
+            "nsenter",
+            &[
+                "-t", &pid_str, "-n", "iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT",
+            ],
+        )?;
+
+        Self::run_cmd(
+            "nsenter",
+            &[
+                "-t",
+                &pid_str,
+                "-n",
+                "iptables",
+                "-A",
+                "OUTPUT",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "ESTABLISHED,RELATED",
+                "-j",
+                "ACCEPT",
+            ],
+        )?;
+
+        // Allow DNS to configured resolvers
+        for dns in &self.config.dns {
+            Self::run_cmd(
+                "nsenter",
+                &[
+                    "-t", &pid_str, "-n", "iptables", "-A", "OUTPUT", "-p", "udp", "-d", dns,
+                    "--dport", "53", "-j", "ACCEPT",
+                ],
+            )?;
+            Self::run_cmd(
+                "nsenter",
+                &[
+                    "-t", &pid_str, "-n", "iptables", "-A", "OUTPUT", "-p", "tcp", "-d", dns,
+                    "--dport", "53", "-j", "ACCEPT",
+                ],
+            )?;
+        }
+
+        // Allow traffic to each permitted CIDR
+        for cidr in &policy.allowed_cidrs {
+            if policy.allowed_tcp_ports.is_empty() && policy.allowed_udp_ports.is_empty() {
+                // Allow all ports to this CIDR
+                Self::run_cmd(
+                    "nsenter",
+                    &[
+                        "-t", &pid_str, "-n", "iptables", "-A", "OUTPUT", "-d", cidr, "-j",
+                        "ACCEPT",
+                    ],
+                )?;
+            } else {
+                for port in &policy.allowed_tcp_ports {
+                    Self::run_cmd(
+                        "nsenter",
+                        &[
+                            "-t",
+                            &pid_str,
+                            "-n",
+                            "iptables",
+                            "-A",
+                            "OUTPUT",
+                            "-p",
+                            "tcp",
+                            "-d",
+                            cidr,
+                            "--dport",
+                            &port.to_string(),
+                            "-j",
+                            "ACCEPT",
+                        ],
+                    )?;
+                }
+                for port in &policy.allowed_udp_ports {
+                    Self::run_cmd(
+                        "nsenter",
+                        &[
+                            "-t",
+                            &pid_str,
+                            "-n",
+                            "iptables",
+                            "-A",
+                            "OUTPUT",
+                            "-p",
+                            "udp",
+                            "-d",
+                            cidr,
+                            "--dport",
+                            &port.to_string(),
+                            "-j",
+                            "ACCEPT",
+                        ],
+                    )?;
+                }
+            }
+        }
+
+        // Log denied packets (rate-limited)
+        if policy.log_denied {
+            Self::run_cmd(
+                "nsenter",
+                &[
+                    "-t",
+                    &pid_str,
+                    "-n",
+                    "iptables",
+                    "-A",
+                    "OUTPUT",
+                    "-m",
+                    "limit",
+                    "--limit",
+                    "5/min",
+                    "-j",
+                    "LOG",
+                    "--log-prefix",
+                    "nucleus-egress-denied: ",
+                ],
+            )?;
+        }
+
+        // Drop everything else
+        Self::run_cmd(
+            "nsenter",
+            &[
+                "-t", &pid_str, "-n", "iptables", "-P", "OUTPUT", "DROP",
+            ],
+        )?;
+
+        info!("Egress policy applied: {} allowed CIDRs", policy.allowed_cidrs.len());
+        debug!("Egress policy details: {:?}", policy);
+
+        Ok(())
     }
 
     /// Clean up bridge networking
