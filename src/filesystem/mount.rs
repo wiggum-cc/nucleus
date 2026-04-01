@@ -514,7 +514,19 @@ pub fn mount_secrets(
             ))
         })?;
 
-        debug!("Mounted secret {:?} -> {:?}", secret.source, secret.dest);
+        // Apply configured file permissions on the mount point
+        if secret.source.is_file() {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(secret.mode);
+            if let Err(e) = std::fs::set_permissions(&dest, perms) {
+                warn!(
+                    "Failed to set mode {:04o} on secret {:?}: {} (bind mount may override)",
+                    secret.mode, dest, e
+                );
+            }
+        }
+
+        debug!("Mounted secret {:?} -> {:?} (mode {:04o})", secret.source, secret.dest, secret.mode);
     }
 
     Ok(())

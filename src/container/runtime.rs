@@ -67,12 +67,30 @@ impl Container {
 
         // Bridge networking requires root
         if matches!(config.network, NetworkMode::Bridge(_)) && !is_root {
+            if config.service_mode == ServiceMode::Production {
+                return Err(NucleusError::NetworkError(
+                    "Production mode with bridge networking requires root (cannot silently \
+                     degrade to no networking)"
+                        .to_string(),
+                ));
+            }
             warn!("Bridge networking requires root, degrading to no networking");
             config.network = NetworkMode::None;
         }
 
         // Create state manager
         let state_mgr = ContainerStateManager::new()?;
+
+        // Enforce name uniqueness among running containers
+        if let Ok(all_states) = state_mgr.list_states() {
+            if all_states.iter().any(|s| s.name == config.name) {
+                return Err(NucleusError::ConfigError(format!(
+                    "A container named '{}' already exists; use a different --name, \
+                     or remove the stale state with 'nucleus rm'",
+                    config.name
+                )));
+            }
+        }
 
         // Try to create cgroup (optional for rootless mode)
         let cgroup_name = format!("nucleus-{}", config.id);
@@ -85,6 +103,14 @@ impl Container {
                         Some(cgroup)
                     }
                     Err(e) => {
+                        if config.service_mode == ServiceMode::Production {
+                            let _ = cgroup.cleanup();
+                            return Err(NucleusError::CgroupError(format!(
+                                "Production mode requires cgroup resource enforcement, but \
+                                 applying limits failed: {}",
+                                e
+                            )));
+                        }
                         warn!("Failed to set cgroup limits: {}", e);
                         // Cleanup the cgroup we created
                         let _ = cgroup.cleanup();
@@ -166,7 +192,7 @@ impl Container {
                     }
 
                     if let NetworkMode::Bridge(ref bridge_config) = config.network {
-                        match BridgeNetwork::setup(target_pid, bridge_config) {
+                        match BridgeNetwork::setup_with_id(target_pid, bridge_config, &config.id) {
                             Ok(net) => {
                                 // Apply egress policy if configured
                                 if let Some(ref egress) = config.egress_policy {
@@ -194,6 +220,21 @@ impl Container {
                     }
 
                     self.setup_signal_forwarding(Pid::from_raw(target_pid as i32))?;
+
+                    // Run readiness probe before declaring service ready
+                    if let Some(ref probe) = config.readiness_probe {
+                        let notify_socket = if config.sd_notify {
+                            std::env::var("NOTIFY_SOCKET").ok()
+                        } else {
+                            None
+                        };
+                        Self::run_readiness_probe(
+                            target_pid,
+                            &config.name,
+                            probe,
+                            notify_socket.as_deref(),
+                        )?;
+                    }
 
                     // Start health check thread if configured
                     if let Some(ref hc) = config.health_check {
@@ -343,7 +384,18 @@ impl Container {
             bind_mount_host_paths(&container_root, is_rootless)?;
         }
 
-        // 7b. Mount secrets
+        // 7b. Write resolv.conf for bridge networking.
+        // When rootfs is mounted, /etc is read-only, so we bind-mount a writable
+        // resolv.conf over the top (same technique as secrets).
+        if let NetworkMode::Bridge(ref bridge_config) = self.config.network {
+            if self.config.rootfs_path.is_some() {
+                BridgeNetwork::bind_mount_resolv_conf(&container_root, &bridge_config.dns)?;
+            } else {
+                BridgeNetwork::write_resolv_conf(&container_root, &bridge_config.dns)?;
+            }
+        }
+
+        // 7c. Mount secrets
         mount_secrets(&container_root, &self.config.secrets)?;
 
         // 8. Mount procfs
@@ -352,11 +404,6 @@ impl Container {
 
         // 8b. Mask sensitive /proc paths to reduce kernel info leakage
         mask_proc_paths(&proc_path)?;
-
-        // 9. Write resolv.conf for bridge networking (before pivot_root)
-        if let NetworkMode::Bridge(ref bridge_config) = self.config.network {
-            BridgeNetwork::write_resolv_conf(&container_root, &bridge_config.dns)?;
-        }
 
         // 10. Switch root filesystem
         // Filesystem: Populated -> Pivoted
@@ -459,6 +506,26 @@ impl Container {
 
         oci_config = oci_config.with_resources(&self.config.limits);
 
+        // Inject user-configured environment variables
+        if !self.config.environment.is_empty() {
+            oci_config = oci_config.with_env(&self.config.environment);
+        }
+
+        // Pass through sd_notify socket
+        if self.config.sd_notify {
+            oci_config = oci_config.with_sd_notify();
+        }
+
+        // Mount pre-built rootfs if provided
+        if let Some(ref rootfs_path) = self.config.rootfs_path {
+            oci_config = oci_config.with_rootfs_binds(rootfs_path);
+        }
+
+        // Mount secrets into OCI bundle
+        if !self.config.secrets.is_empty() {
+            oci_config = oci_config.with_secret_mounts(&self.config.secrets);
+        }
+
         if self.config.user_ns_config.is_some() {
             oci_config = oci_config.with_user_namespace();
         }
@@ -483,6 +550,11 @@ impl Container {
             let context_dest = rootfs.join("context");
             let populator = ContextPopulator::new(context_dir, &context_dest);
             populator.populate()?;
+        }
+
+        // Write resolv.conf for bridge networking into the OCI rootfs
+        if let NetworkMode::Bridge(ref bridge_config) = self.config.network {
+            BridgeNetwork::write_resolv_conf(&rootfs, &bridge_config.dns)?;
         }
 
         // Select gVisor network mode based on container network config
@@ -655,6 +727,126 @@ impl Container {
         }
     }
 
+    /// Resolve nsenter to an absolute path when running as root.
+    fn resolve_nsenter() -> String {
+        if nix::unistd::Uid::effective().is_root() {
+            for path in &["/usr/bin/nsenter", "/usr/sbin/nsenter", "/bin/nsenter"] {
+                if std::path::Path::new(path).exists() {
+                    return path.to_string();
+                }
+            }
+        }
+        "nsenter".to_string()
+    }
+
+    /// Run a readiness probe and, if sd_notify is active, send READY=1.
+    fn run_readiness_probe(
+        pid: u32,
+        container_name: &str,
+        probe: &crate::container::ReadinessProbe,
+        notify_socket: Option<&str>,
+    ) -> Result<()> {
+        use crate::container::ReadinessProbe;
+        use std::process::Command;
+
+        info!("Running readiness probe for {}", container_name);
+
+        let max_attempts = 60u32; // ~60s total with 1s sleep
+        let poll_interval = std::time::Duration::from_secs(1);
+
+        for attempt in 1..=max_attempts {
+            // Check that the container is still alive
+            let proc_path = format!("/proc/{}", pid);
+            if !std::path::Path::new(&proc_path).exists() {
+                return Err(NucleusError::ExecError(format!(
+                    "Container process {} exited before becoming ready",
+                    pid
+                )));
+            }
+
+            let nsenter_bin = Self::resolve_nsenter();
+            let ready = match probe {
+                ReadinessProbe::Exec { command } => {
+                    let pid_str = pid.to_string();
+                    let mut cmd = Command::new(&nsenter_bin);
+                    cmd.arg("-t").arg(&pid_str).arg("-m").arg("-p").arg("-n");
+                    for arg in command {
+                        cmd.arg(arg);
+                    }
+                    cmd.stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false)
+                }
+                ReadinessProbe::TcpPort(port) => {
+                    // Probe TCP connectivity via the container's network namespace
+                    let pid_str = pid.to_string();
+                    Command::new(&nsenter_bin)
+                        .args(["-t", &pid_str, "-n", "--", "sh", "-c"])
+                        .arg(format!(
+                            "cat < /dev/tcp/127.0.0.1/{} > /dev/null 2>&1 || \
+                             exec 3<>/dev/tcp/127.0.0.1/{} 2>/dev/null",
+                            port, port
+                        ))
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false)
+                }
+                ReadinessProbe::SdNotify => {
+                    // For SdNotify probe type, the container itself sends READY=1.
+                    // We just pass through; the systemd integration handles it.
+                    info!("Readiness probe is SdNotify; deferring to container process");
+                    return Ok(());
+                }
+            };
+
+            if ready {
+                info!(
+                    "Readiness probe passed for {} (attempt {})",
+                    container_name, attempt
+                );
+
+                // Bridge to sd_notify if configured
+                if let Some(socket_path) = notify_socket {
+                    Self::send_sd_notify(socket_path, "READY=1")?;
+                    info!("Sent READY=1 to sd_notify for {}", container_name);
+                }
+
+                return Ok(());
+            }
+
+            debug!(
+                "Readiness probe attempt {}/{} failed for {}",
+                attempt, max_attempts, container_name
+            );
+            std::thread::sleep(poll_interval);
+        }
+
+        Err(NucleusError::ExecError(format!(
+            "Readiness probe timed out after {} attempts for {}",
+            max_attempts, container_name
+        )))
+    }
+
+    /// Send a notification to the systemd notify socket.
+    fn send_sd_notify(socket_path: &str, message: &str) -> Result<()> {
+        use std::os::unix::net::UnixDatagram;
+
+        let sock = UnixDatagram::unbound().map_err(|e| {
+            NucleusError::ExecError(format!("Failed to create notify socket: {}", e))
+        })?;
+        sock.send_to(message.as_bytes(), socket_path).map_err(|e| {
+            NucleusError::ExecError(format!(
+                "Failed to send to notify socket {}: {}",
+                socket_path, e
+            ))
+        })?;
+        Ok(())
+    }
+
     /// Run periodic health checks against the container via nsenter.
     fn health_check_loop(
         pid: u32,
@@ -667,6 +859,7 @@ impl Container {
         std::thread::sleep(hc.start_period);
 
         let mut consecutive_failures: u32 = 0;
+        let nsenter_bin = Self::resolve_nsenter();
 
         loop {
             // Check if the container process is still alive
@@ -677,8 +870,8 @@ impl Container {
             }
 
             let pid_str = pid.to_string();
-            let mut cmd = Command::new("nsenter");
-            cmd.arg("-t").arg(&pid_str).arg("-m").arg("-p");
+            let mut cmd = Command::new(&nsenter_bin);
+            cmd.arg("-t").arg(&pid_str).arg("-m").arg("-p").arg("-n");
             for arg in &hc.command {
                 cmd.arg(arg);
             }
@@ -686,7 +879,32 @@ impl Container {
             let result = cmd
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .status();
+                .spawn()
+                .and_then(|mut child| {
+                    let timeout = hc.timeout;
+                    let start = std::time::Instant::now();
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(status)) => return Ok(status),
+                            Ok(None) => {
+                                if start.elapsed() >= timeout {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                    warn!(
+                                        "Health check timed out after {:?} for {}",
+                                        timeout, container_name
+                                    );
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "health check timed out",
+                                    ));
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                });
 
             match result {
                 Ok(status) if status.success() => {

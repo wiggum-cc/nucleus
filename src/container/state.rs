@@ -214,9 +214,20 @@ impl ContainerStateManager {
             return Ok(state.clone());
         }
 
-        // Try exact name match
-        if let Some(state) = states.iter().find(|s| s.name == reference) {
-            return Ok(state.clone());
+        // Try exact name match (must be unambiguous)
+        let name_matches: Vec<&ContainerState> = states
+            .iter()
+            .filter(|s| s.name == reference)
+            .collect();
+        match name_matches.len() {
+            1 => return Ok(name_matches[0].clone()),
+            n if n > 1 => {
+                return Err(NucleusError::AmbiguousContainer(format!(
+                    "Name '{}' matches {} containers; use container ID instead",
+                    reference, n
+                )))
+            }
+            _ => {}
         }
 
         // Try ID prefix match

@@ -9,6 +9,8 @@ pub struct BridgeNetwork {
     config: BridgeConfig,
     container_ip: String,
     veth_host: String,
+    container_id: String,
+    prev_ip_forward: Option<String>,
     state: NetworkState,
 }
 
@@ -20,12 +22,22 @@ impl BridgeNetwork {
     ///
     /// State transitions: Unconfigured -> Configuring -> Active
     pub fn setup(pid: u32, config: &BridgeConfig) -> Result<Self> {
+        Self::setup_for(pid, config, &format!("{:x}", pid))
+    }
+
+    /// Set up bridge networking with an explicit container ID for IP tracking.
+    pub fn setup_with_id(pid: u32, config: &BridgeConfig, container_id: &str) -> Result<Self> {
+        Self::setup_for(pid, config, container_id)
+    }
+
+    fn setup_for(pid: u32, config: &BridgeConfig, container_id: &str) -> Result<Self> {
         let mut net_state = NetworkState::Unconfigured;
         net_state = net_state.transition(NetworkState::Configuring)?;
 
+        let reserved = Self::collect_reserved_ips();
         let container_ip = match &config.container_ip {
             Some(ip) => {
-                if Self::is_ip_in_use(ip)? {
+                if Self::is_ip_in_use(ip)? || reserved.contains(ip) {
                     return Err(NucleusError::NetworkError(format!(
                         "Requested container IP {} is already in use",
                         ip
@@ -35,6 +47,7 @@ impl BridgeNetwork {
             }
             None => Self::allocate_ip(&config.subnet)?,
         };
+        Self::record_allocated_ip(container_id, &container_ip)?;
         let prefix = Self::subnet_prefix(&config.subnet);
 
         // Linux interface names max 15 chars; truncate if needed
@@ -135,7 +148,12 @@ impl BridgeNetwork {
         )?;
         rollback.nat_added = true;
 
-        // 8. Enable IP forwarding
+        // 8. Enable IP forwarding (save previous value for restore on cleanup)
+        let prev_ip_forward = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        rollback.prev_ip_forward = Some(prev_ip_forward);
         std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").map_err(|e| {
             NucleusError::NetworkError(format!("Failed to enable IP forwarding: {}", e))
         })?;
@@ -154,12 +172,15 @@ impl BridgeNetwork {
             "Bridge network configured: {} -> {} (IP: {})",
             veth_host, veth_container, container_ip
         );
+        let prev_ip_forward = rollback.prev_ip_forward.clone();
         rollback.disarm();
 
         Ok(Self {
             config: config.clone(),
             container_ip,
             veth_host,
+            container_id: container_id.to_string(),
+            prev_ip_forward,
             state: net_state,
         })
     }
@@ -197,22 +218,24 @@ impl BridgeNetwork {
             ],
         )?;
 
-        // Allow DNS to configured resolvers
-        for dns in &self.config.dns {
-            Self::run_cmd(
-                "nsenter",
-                &[
-                    "-t", &pid_str, "-n", "iptables", "-A", "OUTPUT", "-p", "udp", "-d", dns,
-                    "--dport", "53", "-j", "ACCEPT",
-                ],
-            )?;
-            Self::run_cmd(
-                "nsenter",
-                &[
-                    "-t", &pid_str, "-n", "iptables", "-A", "OUTPUT", "-p", "tcp", "-d", dns,
-                    "--dport", "53", "-j", "ACCEPT",
-                ],
-            )?;
+        // Allow DNS to configured resolvers (only when policy permits it)
+        if policy.allow_dns {
+            for dns in &self.config.dns {
+                Self::run_cmd(
+                    "nsenter",
+                    &[
+                        "-t", &pid_str, "-n", "iptables", "-A", "OUTPUT", "-p", "udp", "-d", dns,
+                        "--dport", "53", "-j", "ACCEPT",
+                    ],
+                )?;
+                Self::run_cmd(
+                    "nsenter",
+                    &[
+                        "-t", &pid_str, "-n", "iptables", "-A", "OUTPUT", "-p", "tcp", "-d", dns,
+                        "--dport", "53", "-j", "ACCEPT",
+                    ],
+                )?;
+            }
         }
 
         // Allow traffic to each permitted CIDR
@@ -314,6 +337,10 @@ impl BridgeNetwork {
     /// State transition: Active -> Cleaned
     pub fn cleanup(mut self) -> Result<()> {
         self.state = self.state.transition(NetworkState::Cleaned)?;
+
+        // Release the IP allocation
+        Self::release_allocated_ip(&self.container_id);
+
         // Remove port forwarding rules
         for pf in &self.config.port_forwards {
             if let Err(e) = self.cleanup_port_forward(pf) {
@@ -338,6 +365,17 @@ impl BridgeNetwork {
 
         // Delete veth pair (deleting one end removes both)
         let _ = Self::run_cmd("ip", &["link", "del", &self.veth_host]);
+
+        // Restore previous ip_forward state if we changed it
+        if let Some(ref prev) = self.prev_ip_forward {
+            if prev == "0" {
+                if let Err(e) = std::fs::write("/proc/sys/net/ipv4/ip_forward", "0") {
+                    warn!("Failed to restore ip_forward to 0: {}", e);
+                } else {
+                    info!("Restored net.ipv4.ip_forward to 0");
+                }
+            }
+        }
 
         info!("Bridge network cleaned up");
         Ok(())
@@ -419,7 +457,11 @@ impl BridgeNetwork {
         Ok(())
     }
 
-    /// Allocate a container IP from the subnet using /dev/urandom
+    /// Allocate a container IP from the subnet using /dev/urandom.
+    ///
+    /// Checks both host-visible interfaces (via `ip addr`) and IPs assigned to
+    /// other Nucleus containers (via state files) to avoid duplicates. Container
+    /// IPs inside network namespaces are invisible to `ip addr show` on the host.
     fn allocate_ip(subnet: &str) -> Result<String> {
         let base = subnet.split('/').next().unwrap_or("10.0.42.0");
         let parts: Vec<&str> = base.split('.').collect();
@@ -427,12 +469,18 @@ impl BridgeNetwork {
             return Ok("10.0.42.2".to_string());
         }
 
+        // Collect IPs already assigned to other Nucleus containers from state dir
+        let reserved = Self::collect_reserved_ips();
+
         let mut buf = [0u8; 1];
         for _ in 0..32 {
             let _ = std::fs::File::open("/dev/urandom")
                 .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf));
             let offset = (buf[0] as u32 % 253) + 2;
             let candidate = format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], offset);
+            if reserved.contains(&candidate) {
+                continue;
+            }
             if !Self::is_ip_in_use(&candidate)? {
                 return Ok(candidate);
             }
@@ -442,6 +490,56 @@ impl BridgeNetwork {
             "Failed to allocate free IP in subnet {}",
             subnet
         )))
+    }
+
+    /// Scan the Nucleus IP allocation directory for IPs already assigned.
+    fn collect_reserved_ips() -> std::collections::HashSet<String> {
+        let alloc_dir = Self::ip_alloc_dir();
+        let mut ips = std::collections::HashSet::new();
+        if let Ok(entries) = std::fs::read_dir(&alloc_dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.ends_with(".ip") {
+                        if let Ok(ip) = std::fs::read_to_string(entry.path()) {
+                            let ip = ip.trim().to_string();
+                            if !ip.is_empty() {
+                                ips.insert(ip);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ips
+    }
+
+    /// Persist the allocated IP for this container so other containers can see it.
+    fn record_allocated_ip(container_id: &str, ip: &str) -> Result<()> {
+        let alloc_dir = Self::ip_alloc_dir();
+        std::fs::create_dir_all(&alloc_dir).map_err(|e| {
+            NucleusError::NetworkError(format!("Failed to create IP alloc dir: {}", e))
+        })?;
+        let path = alloc_dir.join(format!("{}.ip", container_id));
+        std::fs::write(&path, ip).map_err(|e| {
+            NucleusError::NetworkError(format!("Failed to record IP allocation: {}", e))
+        })?;
+        Ok(())
+    }
+
+    /// Remove the persisted IP allocation for a container.
+    fn release_allocated_ip(container_id: &str) {
+        let path = Self::ip_alloc_dir().join(format!("{}.ip", container_id));
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn ip_alloc_dir() -> std::path::PathBuf {
+        if nix::unistd::Uid::effective().is_root() {
+            std::path::PathBuf::from("/var/run/nucleus/ip-alloc")
+        } else {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .join("nucleus/ip-alloc")
+        }
     }
 
     /// Get gateway IP from subnet (first usable address)
@@ -463,10 +561,40 @@ impl BridgeNetwork {
             .unwrap_or(24)
     }
 
+    /// Resolve a system binary to an absolute path when running as root.
+    /// When unprivileged, falls back to bare name (PATH-based resolution).
+    fn resolve_bin(name: &str) -> String {
+        if nix::unistd::Uid::effective().is_root() {
+            let search_dirs: &[&str] = match name {
+                "ip" => &["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"],
+                "iptables" => &[
+                    "/usr/sbin/iptables",
+                    "/sbin/iptables",
+                    "/usr/bin/iptables",
+                ],
+                "nsenter" => &["/usr/bin/nsenter", "/usr/sbin/nsenter", "/bin/nsenter"],
+                _ => &[],
+            };
+            for path in search_dirs {
+                if std::path::Path::new(path).exists() {
+                    return path.to_string();
+                }
+            }
+        }
+        name.to_string()
+    }
+
     fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
-        let output = Command::new(program).args(args).output().map_err(|e| {
-            NucleusError::NetworkError(format!("Failed to run {} {:?}: {}", program, args, e))
-        })?;
+        let resolved = Self::resolve_bin(program);
+        let output = Command::new(&resolved)
+            .args(args)
+            .output()
+            .map_err(|e| {
+                NucleusError::NetworkError(format!(
+                    "Failed to run {} {:?}: {}",
+                    resolved, args, e
+                ))
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -480,7 +608,8 @@ impl BridgeNetwork {
     }
 
     fn is_ip_in_use(ip: &str) -> Result<bool> {
-        let output = Command::new("ip")
+        let ip_bin = Self::resolve_bin("ip");
+        let output = Command::new(&ip_bin)
             .args(["-4", "addr", "show"])
             .output()
             .map_err(|e| {
@@ -499,7 +628,7 @@ impl BridgeNetwork {
         Ok(stdout.contains(&format!(" {}/", ip)))
     }
 
-    /// Write resolv.conf inside container
+    /// Write resolv.conf inside container (for writable /etc, e.g. agent mode)
     pub fn write_resolv_conf(root: &std::path::Path, dns: &[String]) -> Result<()> {
         let resolv_path = root.join("etc/resolv.conf");
         let content: String = dns
@@ -511,6 +640,50 @@ impl BridgeNetwork {
         })?;
         Ok(())
     }
+
+    /// Bind-mount a resolv.conf over a read-only /etc (for production rootfs mode).
+    ///
+    /// Writes the resolver config to a tmpfile then bind-mounts it over
+    /// /etc/resolv.conf so it works even when the rootfs /etc is read-only.
+    pub fn bind_mount_resolv_conf(root: &std::path::Path, dns: &[String]) -> Result<()> {
+        use nix::mount::{mount, MsFlags};
+
+        let content: String = dns
+            .iter()
+            .map(|server| format!("nameserver {}\n", server))
+            .collect();
+
+        // Write to a staging file outside /etc
+        let staging = root.join("tmp/.resolv.conf.nucleus");
+        std::fs::write(&staging, content).map_err(|e| {
+            NucleusError::NetworkError(format!("Failed to write staging resolv.conf: {}", e))
+        })?;
+
+        // Ensure the mount target exists (rootfs should provide /etc/resolv.conf,
+        // but create an empty file if not)
+        let target = root.join("etc/resolv.conf");
+        if !target.exists() {
+            let _ = std::fs::write(&target, "");
+        }
+
+        // Bind mount the staging file over the read-only resolv.conf
+        mount(
+            Some(staging.as_path()),
+            &target,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            NucleusError::NetworkError(format!(
+                "Failed to bind mount resolv.conf: {}",
+                e
+            ))
+        })?;
+
+        info!("Bind-mounted resolv.conf for bridge networking (rootfs mode)");
+        Ok(())
+    }
 }
 
 struct SetupRollback {
@@ -519,6 +692,7 @@ struct SetupRollback {
     veth_created: bool,
     nat_added: bool,
     port_forwards: Vec<(String, PortForward)>,
+    prev_ip_forward: Option<String>,
     armed: bool,
 }
 
@@ -530,6 +704,7 @@ impl SetupRollback {
             veth_created: false,
             nat_added: false,
             port_forwards: Vec::new(),
+            prev_ip_forward: None,
             armed: true,
         }
     }

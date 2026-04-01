@@ -2,8 +2,8 @@ use anyhow::Result;
 use clap::Parser;
 use nucleus::checkpoint::CriuRuntime;
 use nucleus::container::{
-    parse_signal, Container, ContainerConfig, ContainerLifecycle, ContainerStateManager,
-    HealthCheck, SecretMount, ServiceMode, TrustLevel,
+    parse_signal, Container, ContainerConfig, ContainerLifecycle, ContainerState,
+    ContainerStateManager, HealthCheck, ReadinessProbe, SecretMount, ServiceMode, TrustLevel,
 };
 use nucleus::filesystem::ContextMode;
 use nucleus::isolation::attach::ContainerAttach;
@@ -157,6 +157,18 @@ enum Commands {
         /// Enable sd_notify integration (pass NOTIFY_SOCKET into container)
         #[arg(long)]
         sd_notify: bool,
+
+        /// Readiness probe: exec command (ready when it exits 0)
+        #[arg(long = "readiness-exec")]
+        readiness_exec: Option<String>,
+
+        /// Readiness probe: TCP port (ready when port accepts connections)
+        #[arg(long = "readiness-tcp")]
+        readiness_tcp: Option<u16>,
+
+        /// Readiness probe: sd_notify (container sends READY=1 itself)
+        #[arg(long = "readiness-sd-notify")]
+        readiness_sd_notify: bool,
 
         /// Command to run in container
         #[arg(last = true, required = true)]
@@ -417,6 +429,15 @@ fn main() -> Result<()> {
         } => {
             let state_mgr = ContainerStateManager::new()?;
             let state = state_mgr.resolve_container(&container)?;
+
+            if state.using_gvisor {
+                return Err(anyhow::anyhow!(
+                    "Container {} uses gVisor runtime; CRIU checkpoint is not supported \
+                     (gVisor manages its own sandbox state)",
+                    state.id
+                ));
+            }
+
             let criu = CriuRuntime::new()?;
             criu.checkpoint(&state, &PathBuf::from(&output), leave_running)?;
             println!("Checkpoint saved to {}", output);
@@ -425,8 +446,34 @@ fn main() -> Result<()> {
 
         Commands::Restore { input } => {
             let criu = CriuRuntime::new()?;
-            let pid = criu.restore(&PathBuf::from(&input))?;
-            println!("Restored container with PID {}", pid);
+            let input_path = PathBuf::from(&input);
+            let pid = criu.restore(&input_path)?;
+
+            // Register restored container in state manager so ps/stop/kill/attach work.
+            // Generate a NEW container ID to avoid overwriting the original state file
+            // (the original container may still be running with --leave-running).
+            let metadata = nucleus::checkpoint::CheckpointMetadata::load(&input_path)?;
+            let new_id = nucleus::container::generate_container_id();
+            let new_name = format!("{}-restored", metadata.container_name);
+            let state_mgr = ContainerStateManager::new()?;
+            let state = ContainerState::new(
+                new_id.clone(),
+                new_name,
+                pid,
+                metadata.command,
+                None, // memory limit unknown after restore
+                None, // cpu limit unknown after restore
+                metadata.using_gvisor,
+                metadata.rootless,
+                None, // cgroup path unknown after restore
+            );
+            state_mgr.save_state(&state)?;
+            info!(
+                "Registered restored container {} (was {}, PID {})",
+                new_id, metadata.container_id, pid
+            );
+
+            println!("{}", new_id);
             Ok(())
         }
 
@@ -464,6 +511,9 @@ fn main() -> Result<()> {
             secrets,
             env_vars,
             sd_notify,
+            readiness_exec,
+            readiness_tcp,
+            readiness_sd_notify,
             command,
         } => {
             if command.is_empty() {
@@ -519,13 +569,16 @@ fn main() -> Result<()> {
                 "none" => NetworkMode::None,
                 "host" => NetworkMode::Host,
                 "bridge" => {
+                    // Production mode requires explicit DNS to avoid silent empty resolv.conf
+                    if service_mode == "production" && dns.is_empty() {
+                        eprintln!(
+                            "Error: Production mode with bridge networking requires explicit \
+                             --dns servers"
+                        );
+                        std::process::exit(1);
+                    }
                     let mut bridge_config = if dns.is_empty() {
-                        // Agent mode gets public DNS by default; production must configure explicitly
-                        if service_mode == "production" {
-                            BridgeConfig::default()
-                        } else {
-                            BridgeConfig::default().with_public_dns()
-                        }
+                        BridgeConfig::default().with_public_dns()
                     } else {
                         BridgeConfig::default().with_dns(dns.clone())
                     };
@@ -599,11 +652,20 @@ fn main() -> Result<()> {
                 config = config.with_hostname(Some(host));
             }
 
-            if runtime == "gvisor" {
-                config = config.with_gvisor(true);
-                if !oci {
-                    info!("Security hardening: enabling OCI bundle mode for gVisor runtime");
-                    config = config.with_oci_bundle();
+            match runtime.as_str() {
+                "native" => {} // default, nothing to do
+                "gvisor" => {
+                    config = config.with_gvisor(true);
+                    if !oci {
+                        info!("Security hardening: enabling OCI bundle mode for gVisor runtime");
+                        config = config.with_oci_bundle();
+                    }
+                }
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "Unknown runtime '{}'; supported values are 'native' and 'gvisor'",
+                        other
+                    ));
                 }
             }
 
@@ -622,13 +684,40 @@ fn main() -> Result<()> {
                 config = config.with_rootfs_path(PathBuf::from(rootfs_dir));
             }
 
-            // Egress policy
+            // Egress policy: in production mode, always set a policy (deny-all if no
+            // --egress-allow given); in agent mode, only set when explicitly configured.
             if !egress_allow.is_empty() {
                 let policy = EgressPolicy::default()
                     .with_allowed_cidrs(egress_allow)
                     .with_allowed_tcp_ports(egress_tcp_ports)
                     .with_allowed_udp_ports(egress_udp_ports);
                 config = config.with_egress_policy(policy);
+            } else if service_mode == "production" {
+                // Default deny-all egress for production services
+                config = config.with_egress_policy(EgressPolicy::deny_all());
+            }
+
+            // Readiness probe (mutually exclusive options)
+            {
+                let probe_count = readiness_exec.is_some() as u8
+                    + readiness_tcp.is_some() as u8
+                    + readiness_sd_notify as u8;
+                if probe_count > 1 {
+                    eprintln!(
+                        "Error: Only one readiness probe type may be set \
+                         (--readiness-exec, --readiness-tcp, --readiness-sd-notify)"
+                    );
+                    std::process::exit(1);
+                }
+                if let Some(cmd) = readiness_exec {
+                    config = config.with_readiness_probe(ReadinessProbe::Exec {
+                        command: vec!["/bin/sh".to_string(), "-c".to_string(), cmd],
+                    });
+                } else if let Some(port) = readiness_tcp {
+                    config = config.with_readiness_probe(ReadinessProbe::TcpPort(port));
+                } else if readiness_sd_notify {
+                    config = config.with_readiness_probe(ReadinessProbe::SdNotify);
+                }
             }
 
             // Health check

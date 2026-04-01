@@ -67,6 +67,10 @@ pub struct EgressPolicy {
     pub allowed_udp_ports: Vec<u16>,
     /// Whether to log denied egress attempts (rate-limited).
     pub log_denied: bool,
+    /// Whether to allow DNS (port 53 UDP/TCP) to configured resolvers even in
+    /// deny-all mode. Defaults to `true` for usability; set to `false` for
+    /// strict deny-all egress (containers must use pre-resolved addresses).
+    pub allow_dns: bool,
 }
 
 impl Default for EgressPolicy {
@@ -76,6 +80,7 @@ impl Default for EgressPolicy {
             allowed_tcp_ports: Vec::new(),
             allowed_udp_ports: Vec::new(),
             log_denied: true,
+            allow_dns: true,
         }
     }
 }

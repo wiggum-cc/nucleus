@@ -152,7 +152,12 @@ impl ResourceLimits {
             NucleusError::InvalidResourceLimit(format!("Invalid memory value: {}", s))
         })?;
 
-        Ok(num * multiplier)
+        num.checked_mul(multiplier).ok_or_else(|| {
+            NucleusError::InvalidResourceLimit(format!(
+                "Memory value overflows u64: {}",
+                s
+            ))
+        })
     }
 
     /// Set memory limit from string (e.g., "512M", "1G")
@@ -251,6 +256,14 @@ mod tests {
         assert!(ResourceLimits::parse_memory("").is_err());
         assert!(ResourceLimits::parse_memory("abc").is_err());
         assert!(ResourceLimits::parse_memory("M").is_err());
+    }
+
+    #[test]
+    fn test_parse_memory_overflow_rejected() {
+        // 18446744073709551615T would overflow u64
+        assert!(ResourceLimits::parse_memory("99999999999999T").is_err());
+        // Just under u64::MAX in bytes should work
+        assert!(ResourceLimits::parse_memory("16383P").is_err()); // not a valid suffix, treated as bytes
     }
 
     #[test]

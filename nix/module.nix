@@ -56,7 +56,10 @@ let
         type = types.listOf types.str;
         default = [ ];
         example = [ "10.0.0.0/8" "192.168.1.0/24" ];
-        description = "Allowed egress CIDRs. Empty means deny-all outbound.";
+        description = ''
+          Allowed egress CIDRs. Empty means deny-all outbound.
+          Production mode always enforces an egress policy (deny-all when empty).
+        '';
       };
 
       egressTcpPorts = mkOption {
@@ -138,10 +141,44 @@ let
         description = "Environment variables to set in the container.";
       };
 
+      readinessExec = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "curl -sf http://localhost:8080/ready";
+        description = ''
+          Readiness probe command. Service is ready when this exits 0.
+          When sdNotify is true, nucleus sends READY=1 to systemd on probe success.
+          Mutually exclusive with readinessTcp and readinessSdNotify.
+        '';
+      };
+
+      readinessTcp = mkOption {
+        type = types.nullOr types.port;
+        default = null;
+        example = 8080;
+        description = ''
+          Readiness probe TCP port. Service is ready when this port accepts connections.
+          Mutually exclusive with readinessExec and readinessSdNotify.
+        '';
+      };
+
+      readinessSdNotify = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Readiness probe: the container process sends READY=1 via sd_notify itself.
+          Mutually exclusive with readinessExec and readinessTcp.
+        '';
+      };
+
       sdNotify = mkOption {
         type = types.bool;
-        default = true;
-        description = "Enable sd_notify integration for systemd readiness.";
+        default = false;
+        description = ''
+          Enable sd_notify integration for systemd readiness.
+          Only enable if the container process (or a readiness probe) sends READY=1.
+          When false, systemd uses Type=simple (ready immediately after exec).
+        '';
       };
 
       context = mkOption {
@@ -160,35 +197,37 @@ let
 
   mkContainerService = name: containerCfg:
     let
+      e = lib.escapeShellArg;
       nucleusArgs = lib.concatStringsSep " " (
         [
-          "--service-mode production"
-          "--trust-level ${containerCfg.trustLevel}"
-          "--memory ${containerCfg.memory}"
-          "--pids ${toString containerCfg.pids}"
-          "--network ${containerCfg.network}"
-          "--rootfs ${containerCfg.rootfs}"
-          "--name ${name}"
+          "--service-mode" "production"
+          "--trust-level" (e containerCfg.trustLevel)
+          "--memory" (e containerCfg.memory)
+          "--pids" (e (toString containerCfg.pids))
+          "--network" (e containerCfg.network)
+          "--rootfs" (e (toString containerCfg.rootfs))
+          "--name" (e name)
         ]
-        ++ optional (containerCfg.cpus != null) "--cpus ${toString containerCfg.cpus}"
+        ++ lib.optionals (containerCfg.cpus != null) [ "--cpus" (e (toString containerCfg.cpus)) ]
         ++ optional (containerCfg.runtime == "gvisor") "--runtime gvisor"
         ++ optional containerCfg.sdNotify "--sd-notify"
-        ++ (map (d: "--dns ${d}") containerCfg.dns)
-        ++ (map (c: "--egress-allow ${c}") containerCfg.egressAllow)
-        ++ (map (p: "--egress-tcp-port ${toString p}") containerCfg.egressTcpPorts)
-        ++ (map (p: "--egress-udp-port ${toString p}") containerCfg.egressUdpPorts)
-        ++ (map (p: "-p ${p}") containerCfg.portForwards)
-        ++ (map (s: "--secret ${s.source}:${s.dest}") containerCfg.secrets)
-        ++ (lib.mapAttrsToList (k: v: "-e ${k}=${v}") containerCfg.environment)
-        ++ optional (containerCfg.healthCheck != null)
-          "--health-cmd '${containerCfg.healthCheck}'"
-        ++ optional (containerCfg.healthCheck != null)
-          "--health-interval ${toString containerCfg.healthInterval}"
-        ++ optional (containerCfg.healthCheck != null)
-          "--health-retries ${toString containerCfg.healthRetries}"
-        ++ optional (containerCfg.healthCheck != null)
-          "--health-start-period ${toString containerCfg.healthStartPeriod}"
-        ++ optional (containerCfg.context != null) "--context ${containerCfg.context}"
+        ++ (lib.concatMap (d: [ "--dns" (e d) ]) containerCfg.dns)
+        ++ (lib.concatMap (c: [ "--egress-allow" (e c) ]) containerCfg.egressAllow)
+        ++ (lib.concatMap (p: [ "--egress-tcp-port" (e (toString p)) ]) containerCfg.egressTcpPorts)
+        ++ (lib.concatMap (p: [ "--egress-udp-port" (e (toString p)) ]) containerCfg.egressUdpPorts)
+        ++ (lib.concatMap (p: [ "-p" (e p) ]) containerCfg.portForwards)
+        ++ (lib.concatMap (s: [ "--secret" (e "${toString s.source}:${s.dest}") ]) containerCfg.secrets)
+        ++ (lib.concatLists (lib.mapAttrsToList (k: v: [ "-e" (e "${k}=${v}") ]) containerCfg.environment))
+        ++ lib.optionals (containerCfg.readinessExec != null) [ "--readiness-exec" (e containerCfg.readinessExec) ]
+        ++ lib.optionals (containerCfg.readinessTcp != null) [ "--readiness-tcp" (e (toString containerCfg.readinessTcp)) ]
+        ++ optional containerCfg.readinessSdNotify "--readiness-sd-notify"
+        ++ lib.optionals (containerCfg.healthCheck != null) [
+          "--health-cmd" (e containerCfg.healthCheck)
+          "--health-interval" (e (toString containerCfg.healthInterval))
+          "--health-retries" (e (toString containerCfg.healthRetries))
+          "--health-start-period" (e (toString containerCfg.healthStartPeriod))
+        ]
+        ++ lib.optionals (containerCfg.context != null) [ "--context" (e (toString containerCfg.context)) ]
         ++ containerCfg.extraArgs
       );
       commandStr = lib.concatStringsSep " " (map lib.escapeShellArg containerCfg.command);
@@ -210,6 +249,12 @@ let
         StandardOutput = "journal";
         StandardError = "journal";
         SyslogIdentifier = "nucleus-${name}";
+
+        # Cgroup delegation: nucleus creates child cgroups for resource limits.
+        # Without Delegate=yes, systemd owns the cgroup tree and the runtime's
+        # cgroup operations conflict with systemd's controller model.
+        # See https://systemd.io/CONTROL_GROUP_INTERFACE/
+        Delegate = true;
 
         # Hardening at the systemd level (defense-in-depth)
         ProtectSystem = "strict";

@@ -32,17 +32,31 @@ impl ContainerAttach {
             )));
         }
 
+        // gVisor containers run under runsc; the host PID is the gVisor sandbox
+        // supervisor, not the guest workload. nsenter cannot reach the guest.
+        if state.using_gvisor {
+            return Err(NucleusError::AttachError(format!(
+                "Container {} uses gVisor runtime; attach is not supported \
+                 (use 'runsc exec' to interact with the guest workload)",
+                state.id
+            )));
+        }
+
         let pid = state.pid;
         info!("Attaching to container {} (PID {})", state.id, pid);
 
-        // Open namespace file descriptors
-        let ns_types = ["pid", "mnt", "net", "uts", "ipc"];
+        // Open namespace file descriptors (include user namespace when present)
+        let ns_types = if state.rootless {
+            &["user", "pid", "mnt", "net", "uts", "ipc"][..]
+        } else {
+            &["pid", "mnt", "net", "uts", "ipc"][..]
+        };
         let mut ns_fds: Vec<(String, File)> = Vec::new();
 
-        for ns in &ns_types {
+        for ns in ns_types {
             let ns_path = format!("/proc/{}/ns/{}", pid, ns);
             match File::open(&ns_path) {
-                Ok(f) => ns_fds.push((ns.to_string(), f)),
+                Ok(f) => ns_fds.push(((*ns).to_string(), f)),
                 Err(e) => {
                     // Some namespaces may not be available
                     info!("Skipping namespace {}: {}", ns, e);
@@ -84,13 +98,34 @@ impl ContainerAttach {
             ));
         }
 
-        // Enter non-PID namespaces first.
+        // Enter user namespace first (required before other setns calls in
+        // rootless containers), then non-PID namespaces.
         // PID namespace membership only applies to future children after setns().
         let mut pid_ns_fd: Option<&File> = None;
+
+        // Phase 1: user namespace (must be first)
+        for (ns_name, fd) in ns_fds {
+            if ns_name == "user" {
+                let ret = unsafe { libc::setns(fd.as_raw_fd(), 0) };
+                if ret != 0 {
+                    let err = std::io::Error::last_os_error();
+                    return Err(NucleusError::AttachError(format!(
+                        "setns(user) failed: {}",
+                        err
+                    )));
+                }
+                info!("Entered user namespace");
+            }
+        }
+
+        // Phase 2: non-PID, non-user namespaces
         for (ns_name, fd) in ns_fds {
             if ns_name == "pid" {
                 pid_ns_fd = Some(fd);
                 continue;
+            }
+            if ns_name == "user" {
+                continue; // already joined above
             }
 
             let raw_fd = fd.as_raw_fd();

@@ -273,6 +273,65 @@ impl OciConfig {
         self
     }
 
+    /// Add environment variables to the OCI process config.
+    pub fn with_env(mut self, vars: &[(String, String)]) -> Self {
+        for (key, value) in vars {
+            self.process.env.push(format!("{}={}", key, value));
+        }
+        self
+    }
+
+    /// Add sd_notify socket passthrough.
+    pub fn with_sd_notify(mut self) -> Self {
+        if let Ok(notify_socket) = std::env::var("NOTIFY_SOCKET") {
+            self.process
+                .env
+                .push(format!("NOTIFY_SOCKET={}", notify_socket));
+        }
+        self
+    }
+
+    /// Add bind mounts for secrets.
+    pub fn with_secret_mounts(mut self, secrets: &[crate::container::SecretMount]) -> Self {
+        for secret in secrets {
+            self.mounts.push(OciMount {
+                destination: secret.dest.to_string_lossy().to_string(),
+                source: secret.source.to_string_lossy().to_string(),
+                mount_type: "bind".to_string(),
+                options: vec![
+                    "bind".to_string(),
+                    "ro".to_string(),
+                    "nosuid".to_string(),
+                    "nodev".to_string(),
+                    "noexec".to_string(),
+                ],
+            });
+        }
+        self
+    }
+
+    /// Add rootfs bind mounts from a pre-built rootfs path.
+    pub fn with_rootfs_binds(mut self, rootfs_path: &std::path::Path) -> Self {
+        let subdirs = ["bin", "sbin", "lib", "lib64", "usr", "etc", "nix"];
+        for subdir in &subdirs {
+            let source = rootfs_path.join(subdir);
+            if source.exists() {
+                self.mounts.push(OciMount {
+                    destination: format!("/{}", subdir),
+                    source: source.to_string_lossy().to_string(),
+                    mount_type: "bind".to_string(),
+                    options: vec![
+                        "bind".to_string(),
+                        "ro".to_string(),
+                        "nosuid".to_string(),
+                        "nodev".to_string(),
+                    ],
+                });
+            }
+        }
+        self
+    }
+
     /// Add user namespace configuration
     pub fn with_user_namespace(mut self) -> Self {
         if let Some(linux) = &mut self.linux {

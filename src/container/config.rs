@@ -364,6 +364,13 @@ impl ContainerConfig {
             ));
         }
 
+        // Production mode requires explicit rootfs (no host bind mount fallback)
+        if self.rootfs_path.is_none() {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Production mode requires explicit --rootfs path (no host bind mounts)".to_string(),
+            ));
+        }
+
         // Production mode requires explicit resource limits
         if self.limits.memory_bytes.is_none() {
             return Err(crate::error::NucleusError::ConfigError(
@@ -399,6 +406,7 @@ mod tests {
         let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
             .with_service_mode(ServiceMode::Production)
             .with_allow_degraded_security(true)
+            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
             .with_limits(
                 crate::resources::ResourceLimits::default()
                     .with_memory("512M")
@@ -408,11 +416,38 @@ mod tests {
     }
 
     #[test]
+    fn test_production_mode_requires_rootfs() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_service_mode(ServiceMode::Production)
+            .with_limits(
+                crate::resources::ResourceLimits::default()
+                    .with_memory("512M")
+                    .unwrap(),
+            );
+        let err = cfg.validate_production_mode().unwrap_err();
+        assert!(err.to_string().contains("--rootfs"));
+    }
+
+    #[test]
     fn test_production_mode_requires_memory_limit() {
         let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
-            .with_service_mode(ServiceMode::Production);
+            .with_service_mode(ServiceMode::Production)
+            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"));
         let err = cfg.validate_production_mode().unwrap_err();
         assert!(err.to_string().contains("--memory"));
+    }
+
+    #[test]
+    fn test_production_mode_valid_config() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_service_mode(ServiceMode::Production)
+            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
+            .with_limits(
+                crate::resources::ResourceLimits::default()
+                    .with_memory("512M")
+                    .unwrap(),
+            );
+        assert!(cfg.validate_production_mode().is_ok());
     }
 
     #[test]
