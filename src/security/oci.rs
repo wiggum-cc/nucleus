@@ -1,5 +1,6 @@
+use crate::filesystem::normalize_container_destination;
 use crate::error::{NucleusError, Result};
-use crate::isolation::{IdMapping, UserNamespaceConfig};
+use crate::isolation::{IdMapping, NamespaceConfig, UserNamespaceConfig};
 use crate::resources::ResourceLimits;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -151,12 +152,9 @@ impl OciConfig {
                     additional_gids: None,
                 },
                 args: command,
-                env: vec![format!(
-                    "PATH={}",
-                    std::env::var("PATH").unwrap_or_else(|_| {
-                        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
-                    })
-                )],
+                env: vec![
+                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+                ],
                 cwd: "/".to_string(),
                 no_new_privileges: true,
                 capabilities: Some(OciCapabilities {
@@ -330,6 +328,52 @@ impl OciConfig {
         self
     }
 
+    /// Add a read-only bind mount of an in-memory secret staging directory at
+    /// `/run/secrets`, plus compatibility bind mounts for each staged secret to
+    /// its requested container destination.
+    pub fn with_inmemory_secret_mounts(
+        mut self,
+        stage_dir: &Path,
+        secrets: &[crate::container::SecretMount],
+    ) -> Result<Self> {
+        self.mounts.push(OciMount {
+            destination: "/run/secrets".to_string(),
+            source: stage_dir.to_string_lossy().to_string(),
+            mount_type: "bind".to_string(),
+            options: vec![
+                "bind".to_string(),
+                "ro".to_string(),
+                "nosuid".to_string(),
+                "nodev".to_string(),
+                "noexec".to_string(),
+            ],
+        });
+
+        for secret in secrets {
+            let dest = normalize_container_destination(&secret.dest)?;
+            if !secret.source.starts_with(stage_dir) {
+                return Err(NucleusError::ConfigError(format!(
+                    "Staged secret source {:?} must live under {:?}",
+                    secret.source, stage_dir
+                )));
+            }
+            self.mounts.push(OciMount {
+                destination: dest.to_string_lossy().to_string(),
+                source: secret.source.to_string_lossy().to_string(),
+                mount_type: "bind".to_string(),
+                options: vec![
+                    "bind".to_string(),
+                    "ro".to_string(),
+                    "nosuid".to_string(),
+                    "nodev".to_string(),
+                    "noexec".to_string(),
+                ],
+            });
+        }
+
+        Ok(self)
+    }
+
     /// Bind mount the host context directory into the container.
     ///
     /// The gVisor integration path expects `/context` to be writable so test
@@ -341,7 +385,7 @@ impl OciConfig {
             mount_type: "bind".to_string(),
             options: vec![
                 "bind".to_string(),
-                "rw".to_string(),
+                "ro".to_string(),
                 "nosuid".to_string(),
                 "nodev".to_string(),
             ],
@@ -368,6 +412,58 @@ impl OciConfig {
                 });
             }
         }
+        self
+    }
+
+    /// Replace the default namespace list with an explicit configuration.
+    pub fn with_namespace_config(mut self, config: &NamespaceConfig) -> Self {
+        let mut namespaces = Vec::new();
+
+        if config.pid {
+            namespaces.push(OciNamespace {
+                namespace_type: "pid".to_string(),
+            });
+        }
+        if config.net {
+            namespaces.push(OciNamespace {
+                namespace_type: "network".to_string(),
+            });
+        }
+        if config.ipc {
+            namespaces.push(OciNamespace {
+                namespace_type: "ipc".to_string(),
+            });
+        }
+        if config.uts {
+            namespaces.push(OciNamespace {
+                namespace_type: "uts".to_string(),
+            });
+        }
+        if config.mnt {
+            namespaces.push(OciNamespace {
+                namespace_type: "mount".to_string(),
+            });
+        }
+        if config.cgroup {
+            namespaces.push(OciNamespace {
+                namespace_type: "cgroup".to_string(),
+            });
+        }
+        if config.time {
+            namespaces.push(OciNamespace {
+                namespace_type: "time".to_string(),
+            });
+        }
+        if config.user {
+            namespaces.push(OciNamespace {
+                namespace_type: "user".to_string(),
+            });
+        }
+
+        if let Some(linux) = &mut self.linux {
+            linux.namespaces = Some(namespaces);
+        }
+
         self
     }
 
@@ -623,5 +719,28 @@ mod tests {
         let deserialized: OciConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.oci_version, config.oci_version);
         assert_eq!(deserialized.process.args, config.process.args);
+    }
+
+    #[test]
+    fn test_oci_config_uses_hardcoded_path_not_host() {
+        // C-3: PATH must be a hardcoded minimal value, never the host's PATH.
+        // This prevents leaking host filesystem layout into the container.
+        std::env::set_var("PATH", "/nix/store/secret-hash/bin:/home/user/.local/bin");
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None);
+        let path_env = config
+            .process
+            .env
+            .iter()
+            .find(|e| e.starts_with("PATH="))
+            .expect("PATH env must be set");
+        assert_eq!(
+            path_env,
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "OCI config must not leak host PATH"
+        );
+        assert!(
+            !path_env.contains("/nix/store/secret"),
+            "Host PATH must not leak into container"
+        );
     }
 }

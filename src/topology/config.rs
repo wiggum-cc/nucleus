@@ -1,0 +1,384 @@
+//! Topology configuration: declarative multi-container definitions.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::Path;
+
+/// A complete topology definition (equivalent to docker-compose.yml).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyConfig {
+    /// Topology name (used as systemd unit prefix and bridge name)
+    pub name: String,
+
+    /// Network definitions
+    #[serde(default)]
+    pub networks: BTreeMap<String, NetworkDef>,
+
+    /// Volume definitions
+    #[serde(default)]
+    pub volumes: BTreeMap<String, VolumeDef>,
+
+    /// Service (container) definitions
+    pub services: BTreeMap<String, ServiceDef>,
+}
+
+/// Network definition within a topology.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkDef {
+    /// Subnet CIDR (e.g. "10.42.0.0/24")
+    #[serde(default = "default_subnet")]
+    pub subnet: String,
+
+    /// Enable WireGuard encryption for east-west traffic
+    #[serde(default)]
+    pub encrypted: bool,
+}
+
+fn default_subnet() -> String {
+    "10.42.0.0/24".to_string()
+}
+
+/// Volume definition within a topology.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeDef {
+    /// Volume type: "persistent" (host path) or "ephemeral" (tmpfs)
+    #[serde(default = "default_volume_type")]
+    pub volume_type: String,
+
+    /// Host path for persistent volumes
+    pub path: Option<String>,
+
+    /// Owner UID:GID for the volume
+    pub owner: Option<String>,
+
+    /// Size limit (e.g. "1G") for ephemeral volumes
+    pub size: Option<String>,
+}
+
+fn default_volume_type() -> String {
+    "ephemeral".to_string()
+}
+
+/// Service (container) definition within a topology.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceDef {
+    /// Nix store path to rootfs derivation
+    pub rootfs: String,
+
+    /// Command to run
+    pub command: Vec<String>,
+
+    /// Memory limit (e.g. "512M", "2G")
+    pub memory: String,
+
+    /// CPU core limit
+    #[serde(default = "default_cpus")]
+    pub cpus: f64,
+
+    /// PID limit
+    #[serde(default = "default_pids")]
+    pub pids: u64,
+
+    /// Networks this service connects to
+    #[serde(default)]
+    pub networks: Vec<String>,
+
+    /// Volume mounts (format: "volume-name:/mount/path")
+    #[serde(default)]
+    pub volumes: Vec<String>,
+
+    /// Services this depends on, with optional health condition
+    #[serde(default)]
+    pub depends_on: Vec<DependsOn>,
+
+    /// Health check command
+    pub health_check: Option<String>,
+
+    /// Health check interval in seconds
+    #[serde(default = "default_health_interval")]
+    pub health_interval: u64,
+
+    /// Allowed egress CIDRs
+    #[serde(default)]
+    pub egress_allow: Vec<String>,
+
+    /// Allowed egress TCP ports
+    #[serde(default)]
+    pub egress_tcp_ports: Vec<u16>,
+
+    /// Port forwards (format: "HOST:CONTAINER")
+    #[serde(default)]
+    pub port_forwards: Vec<String>,
+
+    /// Environment variables
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+
+    /// Secret mounts (format: "source:dest")
+    #[serde(default)]
+    pub secrets: Vec<String>,
+
+    /// DNS servers
+    #[serde(default)]
+    pub dns: Vec<String>,
+
+    /// Number of replicas for scaling
+    #[serde(default = "default_replicas")]
+    pub replicas: u32,
+
+    /// Container runtime
+    #[serde(default = "default_runtime")]
+    pub runtime: String,
+}
+
+fn default_cpus() -> f64 {
+    1.0
+}
+
+fn default_pids() -> u64 {
+    512
+}
+
+fn default_health_interval() -> u64 {
+    30
+}
+
+fn default_replicas() -> u32 {
+    1
+}
+
+fn default_runtime() -> String {
+    "native".to_string()
+}
+
+/// Dependency specification with optional health condition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependsOn {
+    /// Service name
+    pub service: String,
+
+    /// Condition: "started" (default) or "healthy"
+    #[serde(default = "default_condition")]
+    pub condition: String,
+}
+
+fn default_condition() -> String {
+    "started".to_string()
+}
+
+impl TopologyConfig {
+    /// Load a topology from a TOML file.
+    pub fn from_file(path: &Path) -> crate::error::Result<Self> {
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            crate::error::NucleusError::ConfigError(format!(
+                "Failed to read topology file {:?}: {}",
+                path, e
+            ))
+        })?;
+        Self::from_toml(&content)
+    }
+
+    /// Parse a topology from a TOML string.
+    pub fn from_toml(content: &str) -> crate::error::Result<Self> {
+        toml::from_str(content).map_err(|e| {
+            crate::error::NucleusError::ConfigError(format!("Failed to parse topology: {}", e))
+        })
+    }
+
+    /// Validate the topology configuration.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.name.is_empty() {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Topology name cannot be empty".to_string(),
+            ));
+        }
+
+        if self.services.is_empty() {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Topology must have at least one service".to_string(),
+            ));
+        }
+
+        // Validate dependencies reference existing services
+        for (name, svc) in &self.services {
+            for dep in &svc.depends_on {
+                if !self.services.contains_key(&dep.service) {
+                    return Err(crate::error::NucleusError::ConfigError(format!(
+                        "Service '{}' depends on unknown service '{}'",
+                        name, dep.service
+                    )));
+                }
+                if dep.condition != "started" && dep.condition != "healthy" {
+                    return Err(crate::error::NucleusError::ConfigError(format!(
+                        "Invalid dependency condition '{}' for service '{}'",
+                        dep.condition, name
+                    )));
+                }
+                if dep.condition == "healthy" {
+                    let dep_service = self.services.get(&dep.service).ok_or_else(|| {
+                        crate::error::NucleusError::ConfigError(format!(
+                            "Service '{}' depends on unknown service '{}'",
+                            name, dep.service
+                        ))
+                    })?;
+                    if dep_service.health_check.is_none() {
+                        return Err(crate::error::NucleusError::ConfigError(format!(
+                            "Service '{}' depends on '{}' being healthy, but '{}' has no health_check",
+                            name, dep.service, dep.service
+                        )));
+                    }
+                }
+            }
+
+            // Validate networks reference existing network defs
+            for net in &svc.networks {
+                if !self.networks.contains_key(net) {
+                    return Err(crate::error::NucleusError::ConfigError(format!(
+                        "Service '{}' references unknown network '{}'",
+                        name, net
+                    )));
+                }
+            }
+
+            // Validate volume mounts reference existing volume defs
+            for vol_mount in &svc.volumes {
+                let vol_name = vol_mount.split(':').next().unwrap_or("");
+                if !self.volumes.contains_key(vol_name) {
+                    return Err(crate::error::NucleusError::ConfigError(format!(
+                        "Service '{}' references unknown volume '{}'",
+                        name, vol_name
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get the config hash for change detection (using service definitions).
+    pub fn service_config_hash(&self, service_name: &str) -> Option<u64> {
+        self.services.get(service_name).map(|svc| {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let json = serde_json::to_string(svc).unwrap_or_default();
+            let mut hasher = DefaultHasher::new();
+            json.hash(&mut hasher);
+            hasher.finish()
+        })
+    }
+}
+
+impl Default for NetworkDef {
+    fn default() -> Self {
+        Self {
+            subnet: default_subnet(),
+            encrypted: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_minimal_topology() {
+        let toml = r#"
+name = "test-stack"
+
+[services.web]
+rootfs = "/nix/store/abc-web"
+command = ["/bin/web-server"]
+memory = "512M"
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        assert_eq!(config.name, "test-stack");
+        assert_eq!(config.services.len(), 1);
+        assert!(config.services.contains_key("web"));
+    }
+
+    #[test]
+    fn test_parse_full_topology() {
+        let toml = r#"
+name = "myapp"
+
+[networks.internal]
+subnet = "10.42.0.0/24"
+encrypted = true
+
+[volumes.db-data]
+volume_type = "persistent"
+path = "/var/lib/nucleus/myapp/db"
+owner = "70:70"
+
+[services.postgres]
+rootfs = "/nix/store/abc-postgres"
+command = ["postgres", "-D", "/var/lib/postgresql/data"]
+memory = "2G"
+cpus = 2.0
+networks = ["internal"]
+volumes = ["db-data:/var/lib/postgresql/data"]
+health_check = "pg_isready -U myapp"
+
+[services.web]
+rootfs = "/nix/store/abc-web"
+command = ["/bin/web-server"]
+memory = "512M"
+cpus = 1.0
+networks = ["internal"]
+port_forwards = ["8443:8443"]
+egress_allow = ["10.42.0.0/24"]
+
+[[services.web.depends_on]]
+service = "postgres"
+condition = "healthy"
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        assert_eq!(config.name, "myapp");
+        assert_eq!(config.services.len(), 2);
+        assert_eq!(config.networks.len(), 1);
+        assert_eq!(config.volumes.len(), 1);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_missing_dependency() {
+        let toml = r#"
+name = "bad"
+
+[services.web]
+rootfs = "/nix/store/abc"
+command = ["/bin/web"]
+memory = "256M"
+
+[[services.web.depends_on]]
+service = "nonexistent"
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_healthy_dependency_requires_health_check() {
+        let toml = r#"
+name = "bad"
+
+[services.db]
+rootfs = "/nix/store/db"
+command = ["postgres"]
+memory = "512M"
+
+[services.web]
+rootfs = "/nix/store/web"
+command = ["/bin/web"]
+memory = "256M"
+
+[[services.web.depends_on]]
+service = "db"
+condition = "healthy"
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("health_check"));
+    }
+}

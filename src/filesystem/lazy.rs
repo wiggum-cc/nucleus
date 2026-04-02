@@ -32,19 +32,7 @@ impl LazyContextPopulator {
 
     /// Bind mount source directory to destination (read-only)
     fn bind_mount_context(source: &Path, dest: &Path) -> Result<()> {
-        if !source.exists() {
-            return Err(NucleusError::ContextError(format!(
-                "Source directory does not exist: {:?}",
-                source
-            )));
-        }
-
-        if !source.is_dir() {
-            return Err(NucleusError::ContextError(format!(
-                "Source is not a directory: {:?}",
-                source
-            )));
-        }
+        ContextPopulator::new(source, dest).validate_source_tree()?;
 
         // Ensure destination exists
         std::fs::create_dir_all(dest).map_err(|e| {

@@ -19,6 +19,28 @@ pub enum GVisorNetworkMode {
     Host,
 }
 
+/// Platform backend for gVisor's Sentry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GVisorPlatform {
+    /// systrap backend, the current default and most broadly compatible option.
+    #[default]
+    Systrap,
+    /// KVM-backed sandboxing for the Sentry itself.
+    Kvm,
+    /// ptrace backend for maximal compatibility where systrap/KVM are unavailable.
+    Ptrace,
+}
+
+impl GVisorPlatform {
+    pub fn as_flag(self) -> &'static str {
+        match self {
+            Self::Systrap => "systrap",
+            Self::Kvm => "kvm",
+            Self::Ptrace => "ptrace",
+        }
+    }
+}
+
 /// GVisor runtime manager
 ///
 /// Implements the gVisor state machine from
@@ -127,7 +149,27 @@ impl GVisorRuntime {
             return Ok(None);
         }
 
+        // Reject binaries owned by other non-root users — a malicious user
+        // could place a trojan runsc earlier in PATH.
+        use std::os::unix::fs::MetadataExt;
+        let owner = metadata.uid();
+        let current_uid = nix::unistd::Uid::effective().as_raw();
+        if !Self::is_trusted_runsc_owner(&resolved, owner, current_uid) {
+            return Err(NucleusError::GVisorError(format!(
+                "Refusing runsc binary at {:?} owned by uid {} (expected root, current user {}, or immutable /nix/store artifact)",
+                resolved, owner, current_uid
+            )));
+        }
+
         Ok(Some(resolved.to_string_lossy().to_string()))
+    }
+
+    fn is_trusted_runsc_owner(path: &Path, owner: u32, current_uid: u32) -> bool {
+        owner == 0
+            || owner == current_uid
+            // Nix store artifacts are immutable content-addressed paths and are
+            // commonly owned by `nobody` rather than root/current user.
+            || path.starts_with("/nix/store")
     }
 
     /// If `path` is a Nix wrapper script, extract the real binary path.
@@ -170,7 +212,13 @@ impl GVisorRuntime {
     /// - `GVisorNetworkMode::Sandbox` → `--network sandbox` (gVisor user-space network stack)
     /// - `GVisorNetworkMode::Host` → `--network host` (share host network namespace)
     pub fn exec_with_oci_bundle(&self, container_id: &str, bundle: &OciBundle) -> Result<()> {
-        self.exec_with_oci_bundle_network(container_id, bundle, GVisorNetworkMode::None, false)
+        self.exec_with_oci_bundle_network(
+            container_id,
+            bundle,
+            GVisorNetworkMode::None,
+            false,
+            GVisorPlatform::Systrap,
+        )
     }
 
     /// Execute using gVisor with an OCI bundle and explicit network mode.
@@ -187,11 +235,13 @@ impl GVisorRuntime {
         bundle: &OciBundle,
         network_mode: GVisorNetworkMode,
         rootless: bool,
+        platform: GVisorPlatform,
     ) -> Result<()> {
         info!(
-            "Executing with gVisor using OCI bundle at {:?} (network: {:?})",
+            "Executing with gVisor using OCI bundle at {:?} (network: {:?}, platform: {:?})",
             bundle.bundle_path(),
             network_mode,
+            platform,
         );
 
         let network_flag = match network_mode {
@@ -207,10 +257,30 @@ impl GVisorRuntime {
             .bundle_path()
             .parent()
             .unwrap_or(bundle.bundle_path())
-            .join(format!("runsc-root-{}", container_id));
+            .join("runsc-root");
         std::fs::create_dir_all(&runsc_root).map_err(|e| {
             NucleusError::GVisorError(format!("Failed to create runsc root directory: {}", e))
         })?;
+        std::fs::set_permissions(&runsc_root, std::fs::Permissions::from_mode(0o700)).map_err(
+            |e| {
+                NucleusError::GVisorError(format!(
+                    "Failed to secure runsc root directory permissions: {}",
+                    e
+                ))
+            },
+        )?;
+
+        let runsc_runtime_dir = runsc_root.join("runtime");
+        std::fs::create_dir_all(&runsc_runtime_dir).map_err(|e| {
+            NucleusError::GVisorError(format!("Failed to create runsc runtime directory: {}", e))
+        })?;
+        std::fs::set_permissions(&runsc_runtime_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| {
+                NucleusError::GVisorError(format!(
+                    "Failed to secure runsc runtime directory permissions: {}",
+                    e
+                ))
+            })?;
 
         // Build runsc command with OCI bundle.
         // Global flags (--root, --network, --platform) must come BEFORE the subcommand.
@@ -231,7 +301,7 @@ impl GVisorRuntime {
             "--network".to_string(),
             network_flag.to_string(),
             "--platform".to_string(),
-            "systrap".to_string(), // Use systrap platform (works without KVM)
+            platform.as_flag().to_string(),
             "run".to_string(),
             "--bundle".to_string(),
             bundle.bundle_path().to_string_lossy().to_string(),
@@ -253,7 +323,7 @@ impl GVisorRuntime {
             .collect();
         let c_args = c_args?;
 
-        let c_env = self.exec_environment()?;
+        let c_env = self.exec_environment(&runsc_runtime_dir)?;
 
         // execve - this replaces the current process with runsc
         nix::unistd::execve::<std::ffi::CString, std::ffi::CString>(&program, &c_args, &c_env)?;
@@ -284,7 +354,7 @@ impl GVisorRuntime {
         Ok(version.trim().to_string())
     }
 
-    fn exec_environment(&self) -> Result<Vec<CString>> {
+    fn exec_environment(&self, runtime_dir: &Path) -> Result<Vec<CString>> {
         let mut env = Vec::new();
         let mut push = |key: &str, value: String| -> Result<()> {
             env.push(
@@ -298,8 +368,11 @@ impl GVisorRuntime {
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
         });
         push("PATH", path)?;
+        let runtime_dir = runtime_dir.to_string_lossy().to_string();
+        push("TMPDIR", runtime_dir.clone())?;
+        push("XDG_RUNTIME_DIR", runtime_dir)?;
 
-        for key in ["HOME", "TMPDIR", "XDG_RUNTIME_DIR", "USER", "LOGNAME"] {
+        for key in ["HOME", "USER", "LOGNAME"] {
             if let Ok(value) = std::env::var(key) {
                 push(key, value)?;
             }
@@ -312,6 +385,7 @@ impl GVisorRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn test_gvisor_availability() {
@@ -345,5 +419,53 @@ mod tests {
                 println!("runsc not found (expected if gVisor not installed): {}", e);
             }
         }
+    }
+
+    #[test]
+    fn test_validate_runsc_rejects_world_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_runsc = dir.path().join("runsc");
+        std::fs::write(&fake_runsc, "#!/bin/sh\necho fake").unwrap();
+        // Make world-writable
+        std::fs::set_permissions(&fake_runsc, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let result = GVisorRuntime::validate_runsc_path(&fake_runsc);
+        assert!(
+            result.is_err(),
+            "validate_runsc_path must reject world-writable binaries"
+        );
+    }
+
+    #[test]
+    fn test_validate_runsc_rejects_group_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_runsc = dir.path().join("runsc");
+        std::fs::write(&fake_runsc, "#!/bin/sh\necho fake").unwrap();
+        // Make group-writable
+        std::fs::set_permissions(&fake_runsc, std::fs::Permissions::from_mode(0o775)).unwrap();
+
+        let result = GVisorRuntime::validate_runsc_path(&fake_runsc);
+        assert!(
+            result.is_err(),
+            "validate_runsc_path must reject group-writable binaries"
+        );
+    }
+
+    #[test]
+    fn test_runsc_owner_accepts_nix_store_artifact_owner() {
+        assert!(GVisorRuntime::is_trusted_runsc_owner(
+            Path::new("/nix/store/fake-runsc/bin/runsc"),
+            65534,
+            1000
+        ));
+    }
+
+    #[test]
+    fn test_runsc_owner_rejects_untrusted_non_store_owner() {
+        assert!(!GVisorRuntime::is_trusted_runsc_owner(
+            Path::new("/tmp/runsc"),
+            4242,
+            1000
+        ));
     }
 }

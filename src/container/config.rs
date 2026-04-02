@@ -1,28 +1,24 @@
+use crate::filesystem::normalize_container_destination;
 use crate::isolation::{NamespaceConfig, UserNamespaceConfig};
 use crate::network::EgressPolicy;
 use crate::resources::ResourceLimits;
+use crate::security::GVisorPlatform;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-/// Generate a unique 32-hex-char container ID (128-bit) using /dev/urandom
+/// Generate a unique 32-hex-char container ID (128-bit) using /dev/urandom.
+///
+/// Panics if /dev/urandom is unavailable. A system without /dev/urandom has
+/// bigger problems than container IDs, and a predictable ID could allow an
+/// attacker to pre-create state files or guess container references.
 pub fn generate_container_id() -> String {
     use std::io::Read;
 
     let mut buf = [0u8; 16];
-    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf).map(|_| ())) {
-        Ok(()) => {}
-        Err(_) => {
-            // Fallback to timestamp + pid if /dev/urandom unavailable
-            let nanos = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            buf[..16].copy_from_slice(&nanos.to_le_bytes());
-        }
-    }
-    // Use first 12 hex chars for display (48 bits from 128-bit source)
-    // but store the full 128-bit ID for uniqueness
-    buf.iter().map(|b| format!("{:02x}", b)).collect::<String>()[..12].to_string()
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .expect("/dev/urandom must be available for secure container ID generation");
+    hex::encode(buf)
 }
 
 /// Trust level for a container workload.
@@ -52,6 +48,31 @@ pub enum ServiceMode {
     /// - Requires pivot_root (no chroot fallback)
     /// - Requires explicit rootfs path (no host bind mounts)
     Production,
+}
+
+/// Required host kernel lockdown mode, when asserted by the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelLockdownMode {
+    /// Integrity mode blocks kernel writes from privileged userspace.
+    Integrity,
+    /// Confidentiality mode additionally blocks kernel data disclosure paths.
+    Confidentiality,
+}
+
+impl KernelLockdownMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Integrity => "integrity",
+            Self::Confidentiality => "confidentiality",
+        }
+    }
+
+    pub fn accepts(self, active: Self) -> bool {
+        match self {
+            Self::Integrity => matches!(active, Self::Integrity | Self::Confidentiality),
+            Self::Confidentiality => matches!(active, Self::Confidentiality),
+        }
+    }
 }
 
 /// Health check configuration for long-running services.
@@ -106,7 +127,7 @@ pub enum ReadinessProbe {
 /// Container configuration
 #[derive(Debug, Clone)]
 pub struct ContainerConfig {
-    /// Unique container ID (auto-generated 12 hex chars)
+    /// Unique container ID (auto-generated 32 hex chars, 128-bit)
     pub id: String,
 
     /// User-supplied container name (optional, defaults to ID)
@@ -176,8 +197,62 @@ pub struct ContainerConfig {
     /// Environment variables to pass to the container process.
     pub environment: Vec<(String, String)>,
 
+    /// Desired topology config hash for reconciliation change detection.
+    pub config_hash: Option<u64>,
+
     /// Enable sd_notify integration (pass NOTIFY_SOCKET into container).
     pub sd_notify: bool,
+
+    /// Require the host kernel to be in at least this lockdown mode.
+    pub required_kernel_lockdown: Option<KernelLockdownMode>,
+
+    /// Verify context contents before executing the workload.
+    pub verify_context_integrity: bool,
+
+    /// Verify rootfs attestation manifest before mounting it.
+    pub verify_rootfs_attestation: bool,
+
+    /// Request kernel logging for denied seccomp decisions when supported.
+    pub seccomp_log_denied: bool,
+
+    /// Select the gVisor platform backend.
+    pub gvisor_platform: GVisorPlatform,
+
+    /// Path to a per-service seccomp profile (JSON, OCI subset format).
+    /// When set, this profile is used instead of the built-in allowlist.
+    pub seccomp_profile: Option<PathBuf>,
+
+    /// Expected SHA-256 hash of the seccomp profile file for integrity verification.
+    pub seccomp_profile_sha256: Option<String>,
+
+    /// Seccomp operating mode.
+    pub seccomp_mode: SeccompMode,
+
+    /// Path to write seccomp trace log (NDJSON) when seccomp_mode == Trace.
+    pub seccomp_trace_log: Option<PathBuf>,
+
+    /// Path to capability policy file (TOML).
+    pub caps_policy: Option<PathBuf>,
+
+    /// Expected SHA-256 hash of the capability policy file.
+    pub caps_policy_sha256: Option<String>,
+
+    /// Path to Landlock policy file (TOML).
+    pub landlock_policy: Option<PathBuf>,
+
+    /// Expected SHA-256 hash of the Landlock policy file.
+    pub landlock_policy_sha256: Option<String>,
+}
+
+/// Seccomp operating mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SeccompMode {
+    /// Normal enforcement — deny unlisted syscalls.
+    #[default]
+    Enforce,
+    /// Trace mode — allow all syscalls but log them for profile generation.
+    /// Development only; rejected in production mode.
+    Trace,
 }
 
 impl ContainerConfig {
@@ -208,7 +283,21 @@ impl ContainerConfig {
             readiness_probe: None,
             secrets: Vec::new(),
             environment: Vec::new(),
+            config_hash: None,
             sd_notify: false,
+            required_kernel_lockdown: None,
+            verify_context_integrity: false,
+            verify_rootfs_attestation: false,
+            seccomp_log_denied: false,
+            gvisor_platform: GVisorPlatform::default(),
+            seccomp_profile: None,
+            seccomp_profile_sha256: None,
+            seccomp_mode: SeccompMode::default(),
+            seccomp_trace_log: None,
+            caps_policy: None,
+            caps_policy_sha256: None,
+            landlock_policy: None,
+            landlock_policy_sha256: None,
         }
     }
 
@@ -327,8 +416,78 @@ impl ContainerConfig {
         self
     }
 
+    pub fn with_config_hash(mut self, hash: u64) -> Self {
+        self.config_hash = Some(hash);
+        self
+    }
+
     pub fn with_sd_notify(mut self, enabled: bool) -> Self {
         self.sd_notify = enabled;
+        self
+    }
+
+    pub fn with_required_kernel_lockdown(mut self, mode: KernelLockdownMode) -> Self {
+        self.required_kernel_lockdown = Some(mode);
+        self
+    }
+
+    pub fn with_verify_context_integrity(mut self, enabled: bool) -> Self {
+        self.verify_context_integrity = enabled;
+        self
+    }
+
+    pub fn with_verify_rootfs_attestation(mut self, enabled: bool) -> Self {
+        self.verify_rootfs_attestation = enabled;
+        self
+    }
+
+    pub fn with_seccomp_log_denied(mut self, enabled: bool) -> Self {
+        self.seccomp_log_denied = enabled;
+        self
+    }
+
+    pub fn with_gvisor_platform(mut self, platform: GVisorPlatform) -> Self {
+        self.gvisor_platform = platform;
+        self
+    }
+
+    pub fn with_seccomp_profile(mut self, path: PathBuf) -> Self {
+        self.seccomp_profile = Some(path);
+        self
+    }
+
+    pub fn with_seccomp_profile_sha256(mut self, hash: String) -> Self {
+        self.seccomp_profile_sha256 = Some(hash);
+        self
+    }
+
+    pub fn with_seccomp_mode(mut self, mode: SeccompMode) -> Self {
+        self.seccomp_mode = mode;
+        self
+    }
+
+    pub fn with_seccomp_trace_log(mut self, path: PathBuf) -> Self {
+        self.seccomp_trace_log = Some(path);
+        self
+    }
+
+    pub fn with_caps_policy(mut self, path: PathBuf) -> Self {
+        self.caps_policy = Some(path);
+        self
+    }
+
+    pub fn with_caps_policy_sha256(mut self, hash: String) -> Self {
+        self.caps_policy_sha256 = Some(hash);
+        self
+    }
+
+    pub fn with_landlock_policy(mut self, path: PathBuf) -> Self {
+        self.landlock_policy = Some(path);
+        self
+    }
+
+    pub fn with_landlock_policy_sha256(mut self, hash: String) -> Self {
+        self.landlock_policy_sha256 = Some(hash);
         self
     }
 
@@ -370,6 +529,12 @@ impl ContainerConfig {
             ));
         }
 
+        if self.seccomp_mode == SeccompMode::Trace {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Production mode forbids --seccomp-mode trace".to_string(),
+            ));
+        }
+
         // Production mode requires explicit resource limits
         if self.limits.memory_bytes.is_none() {
             return Err(crate::error::NucleusError::ConfigError(
@@ -385,12 +550,87 @@ impl ContainerConfig {
 
         Ok(())
     }
+
+    /// Validate runtime-specific feature support.
+    pub fn validate_runtime_support(&self) -> crate::error::Result<()> {
+        if self.seccomp_mode == SeccompMode::Trace && self.seccomp_trace_log.is_none() {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Seccomp trace mode requires --seccomp-log / seccomp_trace_log".to_string(),
+            ));
+        }
+
+        for secret in &self.secrets {
+            normalize_container_destination(&secret.dest)?;
+        }
+
+        if !self.use_gvisor {
+            return Ok(());
+        }
+
+        if self.seccomp_mode == SeccompMode::Trace {
+            return Err(crate::error::NucleusError::ConfigError(
+                "gVisor runtime does not support --seccomp-mode trace; use --runtime native"
+                    .to_string(),
+            ));
+        }
+
+        if self.seccomp_profile.is_some() || self.seccomp_log_denied {
+            return Err(crate::error::NucleusError::ConfigError(
+                "gVisor runtime does not support custom seccomp profiles or seccomp deny logging; use --runtime native"
+                    .to_string(),
+            ));
+        }
+
+        if self.caps_policy.is_some() {
+            return Err(crate::error::NucleusError::ConfigError(
+                "gVisor runtime does not support capability policy files; use --runtime native"
+                    .to_string(),
+            ));
+        }
+
+        if self.landlock_policy.is_some() {
+            return Err(crate::error::NucleusError::ConfigError(
+                "gVisor runtime does not support Landlock policy files; use --runtime native"
+                    .to_string(),
+            ));
+        }
+
+        if self.verify_context_integrity
+            && self.context_dir.is_some()
+            && matches!(self.context_mode, crate::filesystem::ContextMode::BindMount)
+        {
+            return Err(crate::error::NucleusError::ConfigError(
+                "gVisor runtime cannot verify bind-mounted context integrity; use --context-mode copy or disable --verify-context-integrity"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::network::NetworkMode;
+
+    #[test]
+    fn test_generate_container_id_is_32_hex_chars() {
+        let id = generate_container_id();
+        assert_eq!(id.len(), 32, "Container ID must be full 128-bit (32 hex chars), got {}", id.len());
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit()),
+            "Container ID must be hex: {}",
+            id
+        );
+    }
+
+    #[test]
+    fn test_generate_container_id_is_unique() {
+        let id1 = generate_container_id();
+        let id2 = generate_container_id();
+        assert_ne!(id1, id2, "Two consecutive IDs must differ");
+    }
 
     #[test]
     fn test_config_security_defaults_are_hardened() {
@@ -404,6 +644,11 @@ mod tests {
         assert!(cfg.egress_policy.is_none());
         assert!(cfg.secrets.is_empty());
         assert!(!cfg.sd_notify);
+        assert!(cfg.required_kernel_lockdown.is_none());
+        assert!(!cfg.verify_context_integrity);
+        assert!(!cfg.verify_rootfs_attestation);
+        assert!(!cfg.seccomp_log_denied);
+        assert_eq!(cfg.gvisor_platform, GVisorPlatform::Systrap);
     }
 
     #[test]
@@ -420,6 +665,26 @@ mod tests {
                     .unwrap(),
             );
         assert!(cfg.validate_production_mode().is_err());
+    }
+
+    #[test]
+    fn test_production_mode_rejects_chroot_fallback() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_service_mode(ServiceMode::Production)
+            .with_allow_chroot_fallback(true)
+            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
+            .with_limits(
+                crate::resources::ResourceLimits::default()
+                    .with_memory("512M")
+                    .unwrap()
+                    .with_cpu_cores(2.0)
+                    .unwrap(),
+            );
+        let err = cfg.validate_production_mode().unwrap_err();
+        assert!(
+            err.to_string().contains("chroot"),
+            "Production mode must reject chroot fallback"
+        );
     }
 
     #[test]
@@ -460,6 +725,26 @@ mod tests {
     }
 
     #[test]
+    fn test_production_mode_rejects_seccomp_trace() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_service_mode(ServiceMode::Production)
+            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
+            .with_seccomp_mode(SeccompMode::Trace)
+            .with_limits(
+                crate::resources::ResourceLimits::default()
+                    .with_memory("512M")
+                    .unwrap()
+                    .with_cpu_cores(2.0)
+                    .unwrap(),
+            );
+        let err = cfg.validate_production_mode().unwrap_err();
+        assert!(
+            err.to_string().contains("trace"),
+            "Production mode must reject seccomp trace mode"
+        );
+    }
+
+    #[test]
     fn test_production_mode_requires_cpu_limit() {
         let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
             .with_service_mode(ServiceMode::Production)
@@ -487,5 +772,129 @@ mod tests {
         assert!(cfg.allow_host_network);
         assert!(!cfg.proc_readonly);
         assert!(matches!(cfg.network, NetworkMode::Host));
+    }
+
+    #[test]
+    fn test_hardening_builders_override_defaults() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_required_kernel_lockdown(KernelLockdownMode::Confidentiality)
+            .with_verify_context_integrity(true)
+            .with_verify_rootfs_attestation(true)
+            .with_seccomp_log_denied(true)
+            .with_gvisor_platform(GVisorPlatform::Kvm);
+
+        assert_eq!(
+            cfg.required_kernel_lockdown,
+            Some(KernelLockdownMode::Confidentiality)
+        );
+        assert!(cfg.verify_context_integrity);
+        assert!(cfg.verify_rootfs_attestation);
+        assert!(cfg.seccomp_log_denied);
+        assert_eq!(cfg.gvisor_platform, GVisorPlatform::Kvm);
+    }
+
+    #[test]
+    fn test_seccomp_trace_requires_log_path() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_gvisor(false)
+            .with_seccomp_mode(SeccompMode::Trace);
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("seccomp-log"));
+    }
+
+    #[test]
+    fn test_gvisor_rejects_native_security_policy_files() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_seccomp_profile(PathBuf::from("/tmp/seccomp.json"))
+            .with_caps_policy(PathBuf::from("/tmp/caps.toml"));
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("gVisor runtime"));
+    }
+
+    #[test]
+    fn test_gvisor_rejects_landlock_policy_file() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_landlock_policy(PathBuf::from("/tmp/landlock.toml"));
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("Landlock"));
+    }
+
+    #[test]
+    fn test_gvisor_rejects_trace_mode_even_with_log_path() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_seccomp_mode(SeccompMode::Trace)
+            .with_seccomp_trace_log(PathBuf::from("/tmp/trace.ndjson"));
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("gVisor runtime"));
+    }
+
+    #[test]
+    fn test_secret_dest_must_be_absolute() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()]).with_secret(
+            crate::container::SecretMount {
+                source: PathBuf::from("/run/secrets/api-key"),
+                dest: PathBuf::from("secrets/api-key"),
+                mode: 0o400,
+            },
+        );
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn test_secret_dest_rejects_parent_traversal() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()]).with_secret(
+            crate::container::SecretMount {
+                source: PathBuf::from("/run/secrets/api-key"),
+                dest: PathBuf::from("/../../etc/passwd"),
+                mode: 0o400,
+            },
+        );
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("parent traversal"));
+    }
+
+    #[test]
+    fn test_gvisor_rejects_bind_mount_context_integrity_verification() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_context(PathBuf::from("/tmp/context"))
+            .with_context_mode(crate::filesystem::ContextMode::BindMount)
+            .with_verify_context_integrity(true);
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("context integrity"));
+    }
+
+    #[test]
+    fn test_gvisor_allows_copy_mode_context_integrity_verification() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_context(PathBuf::from("/tmp/context"))
+            .with_context_mode(crate::filesystem::ContextMode::Copy)
+            .with_verify_context_integrity(true);
+
+        assert!(cfg.validate_runtime_support().is_ok());
+    }
+
+    #[test]
+    fn test_native_runtime_disables_gvisor() {
+        // --runtime native must explicitly disable gVisor and set Trusted trust level
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_gvisor(false)
+            .with_trust_level(TrustLevel::Trusted);
+        assert!(!cfg.use_gvisor, "native runtime must disable gVisor");
+        assert_eq!(cfg.trust_level, TrustLevel::Trusted, "native runtime must set Trusted trust level");
+    }
+
+    #[test]
+    fn test_default_config_has_gvisor_enabled() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
+        assert!(cfg.use_gvisor, "default must have gVisor enabled");
+        assert_eq!(cfg.trust_level, TrustLevel::Untrusted, "default must be Untrusted");
     }
 }

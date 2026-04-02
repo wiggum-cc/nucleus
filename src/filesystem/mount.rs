@@ -2,8 +2,163 @@ use crate::error::{NucleusError, Result};
 use nix::mount::{mount, MsFlags};
 use nix::sys::stat::{makedev, mknod, Mode, SFlag};
 use nix::unistd::chroot;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use tracing::{debug, info, warn};
+
+/// Expected mount flags for audit verification.
+struct ExpectedMount {
+    path: &'static str,
+    required_flags: &'static [&'static str],
+}
+
+/// Known mount paths and the flags they must carry in production mode.
+const PRODUCTION_MOUNT_EXPECTATIONS: &[ExpectedMount] = &[
+    ExpectedMount {
+        path: "/bin",
+        required_flags: &["ro", "nosuid", "nodev"],
+    },
+    ExpectedMount {
+        path: "/usr",
+        required_flags: &["ro", "nosuid", "nodev"],
+    },
+    ExpectedMount {
+        path: "/lib",
+        required_flags: &["ro", "nosuid", "nodev"],
+    },
+    ExpectedMount {
+        path: "/lib64",
+        required_flags: &["ro", "nosuid", "nodev"],
+    },
+    ExpectedMount {
+        path: "/etc",
+        required_flags: &["ro", "nosuid", "nodev"],
+    },
+    ExpectedMount {
+        path: "/nix",
+        required_flags: &["ro", "nosuid", "nodev"],
+    },
+    ExpectedMount {
+        path: "/sbin",
+        required_flags: &["ro", "nosuid", "nodev"],
+    },
+    ExpectedMount {
+        path: "/proc",
+        required_flags: &["nosuid", "nodev", "noexec"],
+    },
+    ExpectedMount {
+        path: "/run/secrets",
+        required_flags: &["nosuid", "nodev", "noexec"],
+    },
+];
+
+/// Normalize an absolute container destination path and reject traversal.
+///
+/// Returns a normalized absolute path containing only `RootDir` and `Normal`
+/// components. `.` segments are ignored; `..` and relative paths are rejected.
+pub fn normalize_container_destination(dest: &Path) -> Result<PathBuf> {
+    if !dest.is_absolute() {
+        return Err(NucleusError::ConfigError(format!(
+            "Container destination must be absolute: {:?}",
+            dest
+        )));
+    }
+
+    let mut normalized = PathBuf::from("/");
+    let mut saw_component = false;
+
+    for component in dest.components() {
+        match component {
+            Component::RootDir => {}
+            Component::CurDir => {}
+            Component::Normal(part) => {
+                normalized.push(part);
+                saw_component = true;
+            }
+            Component::ParentDir => {
+                return Err(NucleusError::ConfigError(format!(
+                    "Container destination must not contain parent traversal: {:?}",
+                    dest
+                )));
+            }
+            Component::Prefix(_) => {
+                return Err(NucleusError::ConfigError(format!(
+                    "Unsupported container destination prefix: {:?}",
+                    dest
+                )));
+            }
+        }
+    }
+
+    if !saw_component {
+        return Err(NucleusError::ConfigError(format!(
+            "Container destination must not be the root directory: {:?}",
+            dest
+        )));
+    }
+
+    Ok(normalized)
+}
+
+/// Resolve a validated container destination under a host-side root directory.
+pub fn resolve_container_destination(root: &Path, dest: &Path) -> Result<PathBuf> {
+    let normalized = normalize_container_destination(dest)?;
+    let relative = normalized
+        .strip_prefix("/")
+        .expect("normalized container destination is always absolute");
+    Ok(root.join(relative))
+}
+
+/// Audit all mounts in the container's mount namespace.
+///
+/// Reads /proc/self/mounts and verifies that each known mount point carries
+/// its expected flags. In production mode, any missing flag is fatal.
+/// Returns Ok(()) if all checks pass, or a list of violations.
+pub fn audit_mounts(production_mode: bool) -> Result<()> {
+    let mounts_content = std::fs::read_to_string("/proc/self/mounts").map_err(|e| {
+        NucleusError::FilesystemError(format!("Failed to read /proc/self/mounts: {}", e))
+    })?;
+
+    let mut violations = Vec::new();
+
+    for expectation in PRODUCTION_MOUNT_EXPECTATIONS {
+        // Find the mount entry for this path
+        let mount_entry = mounts_content.lines().find(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            parts.len() >= 4 && parts[1] == expectation.path
+        });
+
+        if let Some(entry) = mount_entry {
+            let parts: Vec<&str> = entry.split_whitespace().collect();
+            if parts.len() >= 4 {
+                let options = parts[3];
+                for &flag in expectation.required_flags {
+                    if !options.split(',').any(|opt| opt == flag) {
+                        violations.push(format!(
+                            "Mount {} missing required flag '{}' (has: {})",
+                            expectation.path, flag, options
+                        ));
+                    }
+                }
+            }
+        }
+        // If mount doesn't exist, that's OK — not all subdirs are present in every rootfs
+    }
+
+    if violations.is_empty() {
+        info!("Mount audit passed: all expected flags verified");
+        Ok(())
+    } else if production_mode {
+        Err(NucleusError::FilesystemError(format!(
+            "Mount audit failed in production mode:\n  {}",
+            violations.join("\n  ")
+        )))
+    } else {
+        for v in &violations {
+            warn!("Mount audit: {}", v);
+        }
+        Ok(())
+    }
+}
 
 /// Create minimal filesystem structure in the new root
 pub fn create_minimal_fs(root: &Path) -> Result<()> {
@@ -259,16 +414,29 @@ pub fn bind_mount_host_paths(root: &Path, best_effort: bool) -> Result<()> {
 
 /// Mount procfs at the given path
 ///
-/// In rootless mode, procfs mounting should work due to user namespace capabilities
-pub fn mount_procfs(proc_path: &Path, best_effort: bool, read_only: bool) -> Result<()> {
-    info!("Mounting procfs at {:?}", proc_path);
+/// In rootless mode, procfs mounting should work due to user namespace capabilities.
+/// When `hide_pids` is true, mounts with hidepid=2 so processes cannot enumerate
+/// other PIDs (production hardening).
+pub fn mount_procfs(
+    proc_path: &Path,
+    best_effort: bool,
+    read_only: bool,
+    hide_pids: bool,
+) -> Result<()> {
+    info!(
+        "Mounting procfs at {:?} (hidepid={})",
+        proc_path,
+        if hide_pids { "2" } else { "0" }
+    );
+
+    let mount_data: Option<&str> = if hide_pids { Some("hidepid=2") } else { None };
 
     match mount(
         Some("proc"),
         proc_path,
         Some("proc"),
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
-        None::<&str>,
+        mount_data,
     ) {
         Ok(_) => {
             if read_only {
@@ -471,7 +639,7 @@ pub fn mount_secrets(root: &Path, secrets: &[crate::container::SecretMount]) -> 
         }
 
         // Destination inside container root
-        let dest = root.join(secret.dest.strip_prefix("/").unwrap_or(&secret.dest));
+        let dest = resolve_container_destination(root, &secret.dest)?;
 
         // Create parent directories
         if let Some(parent) = dest.parent() {
@@ -552,6 +720,166 @@ pub fn mount_secrets(root: &Path, secrets: &[crate::container::SecretMount]) -> 
         );
     }
 
+    Ok(())
+}
+
+/// Mount secrets onto a dedicated in-memory tmpfs instead of bind-mounting host paths.
+///
+/// Creates a per-container tmpfs at `<root>/run/secrets` with MS_NOEXEC | MS_NOSUID | MS_NODEV,
+/// copies secret file contents into it, then zeros the read buffer. This ensures secrets
+/// never reference host-side files after setup and are never persisted to disk.
+pub fn mount_secrets_inmemory(
+    root: &Path,
+    secrets: &[crate::container::SecretMount],
+) -> Result<()> {
+    if secrets.is_empty() {
+        return Ok(());
+    }
+
+    info!("Mounting {} secret(s) on in-memory tmpfs", secrets.len());
+
+    let secrets_dir = root.join("run/secrets");
+    std::fs::create_dir_all(&secrets_dir).map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to create secrets dir {:?}: {}",
+            secrets_dir, e
+        ))
+    })?;
+
+    // Mount a size-limited tmpfs for secrets (16 MiB max)
+    mount(
+        Some("tmpfs"),
+        &secrets_dir,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        Some("size=16m,mode=0700"),
+    )
+    .map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to mount secrets tmpfs at {:?}: {}",
+            secrets_dir, e
+        ))
+    })?;
+
+    for secret in secrets {
+        if !secret.source.exists() {
+            return Err(NucleusError::FilesystemError(format!(
+                "Secret source does not exist: {:?}",
+                secret.source
+            )));
+        }
+
+        // Read secret content from host
+        let mut content = std::fs::read(&secret.source).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to read secret {:?}: {}",
+                secret.source, e
+            ))
+        })?;
+
+        // Determine destination path inside the secrets tmpfs
+        // Strip leading / from dest to make it relative to secrets_dir
+        let dest = resolve_container_destination(&secrets_dir, &secret.dest)?;
+
+        // Create parent directories within the tmpfs
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to create secret parent dir {:?}: {}",
+                    parent, e
+                ))
+            })?;
+        }
+
+        // Write secret content to tmpfs
+        std::fs::write(&dest, &content).map_err(|e| {
+            NucleusError::FilesystemError(format!("Failed to write secret to {:?}: {}", dest, e))
+        })?;
+
+        // Set permissions
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(secret.mode);
+            std::fs::set_permissions(&dest, perms).map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to set permissions on secret {:?}: {}",
+                    dest, e
+                ))
+            })?;
+        }
+
+        // Zero the in-memory buffer to prevent secret leakage via memory reuse.
+        // zeroize handles both the current buffer and prevents the compiler from
+        // optimizing away the zeroing. Unlike manual write_volatile, zeroize also
+        // implements Drop so intermediate Vec reallocations are covered.
+        zeroize::Zeroize::zeroize(&mut content);
+        drop(content);
+
+        // Also bind-mount the secret to its expected container path for compatibility
+        let container_dest = resolve_container_destination(root, &secret.dest)?;
+        if container_dest != dest {
+            if let Some(parent) = container_dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to create secret mount parent {:?}: {}",
+                        parent, e
+                    ))
+                })?;
+            }
+
+            // Create mount point file
+            if secret.source.is_file() {
+                std::fs::write(&container_dest, "").map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to create secret mount point {:?}: {}",
+                        container_dest, e
+                    ))
+                })?;
+            }
+
+            // Bind mount from tmpfs location to expected container path
+            mount(
+                Some(dest.as_path()),
+                &container_dest,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to bind mount secret {:?} -> {:?}: {}",
+                    dest, container_dest, e
+                ))
+            })?;
+
+            // Remount read-only
+            mount(
+                None::<&str>,
+                &container_dest,
+                None::<&str>,
+                MsFlags::MS_REMOUNT
+                    | MsFlags::MS_BIND
+                    | MsFlags::MS_RDONLY
+                    | MsFlags::MS_NOSUID
+                    | MsFlags::MS_NODEV
+                    | MsFlags::MS_NOEXEC,
+                None::<&str>,
+            )
+            .map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to remount secret {:?} read-only: {}",
+                    container_dest, e
+                ))
+            })?;
+        }
+
+        debug!(
+            "Secret {:?} -> {:?} (in-memory tmpfs, mode {:04o})",
+            secret.source, secret.dest, secret.mode
+        );
+    }
+
+    info!("All secrets mounted on in-memory tmpfs");
     Ok(())
 }
 

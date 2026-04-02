@@ -3,15 +3,24 @@ use clap::Parser;
 use nucleus::checkpoint::CriuRuntime;
 use nucleus::container::{
     parse_signal, Container, ContainerConfig, ContainerLifecycle, ContainerState,
-    ContainerStateManager, HealthCheck, ReadinessProbe, SecretMount, ServiceMode, TrustLevel,
+    ContainerStateManager, HealthCheck, KernelLockdownMode, ReadinessProbe, SecretMount,
+    ServiceMode, TrustLevel,
 };
 use nucleus::filesystem::ContextMode;
 use nucleus::isolation::attach::ContainerAttach;
 use nucleus::isolation::NamespaceConfig;
 use nucleus::network::{BridgeConfig, EgressPolicy, NetworkMode, PortForward};
 use nucleus::resources::{IoDeviceLimit, ResourceLimits, ResourceStats};
+use nucleus::security::GVisorPlatform;
+use nucleus::topology::{
+    execute_reconcile, plan_reconcile, DependencyGraph, ReconcileAction, TopologyConfig,
+};
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::{Protocol, WithExportConfig};
+use opentelemetry_sdk::{trace::SdkTracerProvider, Resource};
 use std::path::PathBuf;
 use tracing::info;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
 #[command(name = "nucleus")]
@@ -65,6 +74,10 @@ enum Commands {
         /// Container runtime (default: gvisor, or native)
         #[arg(long, default_value = "gvisor")]
         runtime: String,
+
+        /// Internal: suppress printing the container ID before execution
+        #[arg(long, hide = true)]
+        quiet_id: bool,
 
         /// Run in rootless mode with user namespace
         #[arg(long)]
@@ -170,6 +183,70 @@ enum Commands {
         #[arg(long = "readiness-sd-notify")]
         readiness_sd_notify: bool,
 
+        /// Path to per-service seccomp profile (JSON, OCI subset format)
+        #[arg(long = "seccomp-profile")]
+        seccomp_profile: Option<String>,
+
+        /// Expected SHA-256 hash of the seccomp profile for integrity verification
+        #[arg(long = "seccomp-profile-sha256")]
+        seccomp_profile_sha256: Option<String>,
+
+        /// Seccomp mode: enforce (default) or trace (record syscalls for profile generation)
+        #[arg(long = "seccomp-mode", default_value = "enforce")]
+        seccomp_mode: String,
+
+        /// Path to write seccomp trace log (NDJSON) when --seccomp-mode=trace
+        #[arg(long = "seccomp-log")]
+        seccomp_log: Option<String>,
+
+        /// Request kernel logging for denied seccomp decisions when supported
+        #[arg(long = "seccomp-log-denied")]
+        seccomp_log_denied: bool,
+
+        /// Path to capability policy file (TOML)
+        #[arg(long = "caps-policy")]
+        caps_policy: Option<String>,
+
+        /// Expected SHA-256 hash of the capability policy file
+        #[arg(long = "caps-policy-sha256")]
+        caps_policy_sha256: Option<String>,
+
+        /// Path to Landlock policy file (TOML)
+        #[arg(long = "landlock-policy")]
+        landlock_policy: Option<String>,
+
+        /// Expected SHA-256 hash of the Landlock policy file
+        #[arg(long = "landlock-policy-sha256")]
+        landlock_policy_sha256: Option<String>,
+
+        /// Verify context contents before the workload runs
+        #[arg(long = "verify-context-integrity")]
+        verify_context_integrity: bool,
+
+        /// Verify rootfs attestation manifest before mounting it
+        #[arg(long = "verify-rootfs-attestation")]
+        verify_rootfs_attestation: bool,
+
+        /// Require host kernel lockdown mode: integrity or confidentiality
+        #[arg(long = "require-kernel-lockdown")]
+        require_kernel_lockdown: Option<String>,
+
+        /// gVisor platform backend: systrap, kvm, or ptrace
+        #[arg(long = "gvisor-platform", default_value = "systrap")]
+        gvisor_platform: String,
+
+        /// Enable time namespace isolation
+        #[arg(long = "time-namespace")]
+        time_namespace: bool,
+
+        /// Disable cgroup namespace isolation
+        #[arg(long = "disable-cgroup-namespace")]
+        disable_cgroup_namespace: bool,
+
+        /// Internal: topology config hash for reconciliation diffing
+        #[arg(long = "topology-config-hash", hide = true)]
+        topology_config_hash: Option<u64>,
+
         /// Command to run in container
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -248,15 +325,77 @@ enum Commands {
         #[arg(short, long)]
         input: String,
     },
+
+    /// Manage multi-container topologies (Compose equivalent)
+    #[command(subcommand)]
+    Compose(ComposeCommands),
+
+    /// Seccomp profile tools
+    #[command(subcommand)]
+    Seccomp(SeccompCommands),
+}
+
+#[derive(Parser, Debug)]
+enum SeccompCommands {
+    /// Generate a minimal seccomp profile from a trace log
+    Generate {
+        /// Path to NDJSON trace file from --seccomp-mode=trace
+        trace_file: String,
+
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+}
+
+#[derive(Parser, Debug)]
+enum ComposeCommands {
+    /// Bring up a topology in dependency order
+    Up {
+        /// Path to topology TOML file
+        #[arg(short, long)]
+        file: String,
+
+        /// Stop timeout in seconds (default: 10)
+        #[arg(long, default_value = "10")]
+        timeout: u64,
+    },
+
+    /// Graceful teardown in reverse dependency order
+    Down {
+        /// Path to topology TOML file
+        #[arg(short, long)]
+        file: String,
+
+        /// Stop timeout in seconds (default: 10)
+        #[arg(long, default_value = "10")]
+        timeout: u64,
+    },
+
+    /// Show topology status
+    Ps {
+        /// Path to topology TOML file
+        #[arg(short, long)]
+        file: String,
+    },
+
+    /// Show reconciliation plan without executing
+    Plan {
+        /// Path to topology TOML file
+        #[arg(short, long)]
+        file: String,
+    },
+
+    /// Validate a topology file
+    Validate {
+        /// Path to topology TOML file
+        #[arg(short, long)]
+        file: String,
+    },
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    init_tracing()?;
 
     let cli = Cli::parse();
 
@@ -488,6 +627,7 @@ fn main() -> Result<()> {
             swap,
             hostname,
             runtime,
+            quiet_id,
             rootless,
             oci,
             network,
@@ -514,6 +654,22 @@ fn main() -> Result<()> {
             readiness_exec,
             readiness_tcp,
             readiness_sd_notify,
+            seccomp_profile,
+            seccomp_profile_sha256,
+            seccomp_mode,
+            seccomp_log,
+            seccomp_log_denied,
+            caps_policy,
+            caps_policy_sha256,
+            landlock_policy,
+            landlock_policy_sha256,
+            verify_context_integrity,
+            verify_rootfs_attestation,
+            require_kernel_lockdown,
+            gvisor_platform,
+            time_namespace,
+            disable_cgroup_namespace,
+            topology_config_hash,
             command,
         } => {
             if command.is_empty() {
@@ -629,10 +785,44 @@ fn main() -> Result<()> {
                 }
             };
 
+            let required_lockdown = match require_kernel_lockdown.as_deref() {
+                None => None,
+                Some("integrity") => Some(KernelLockdownMode::Integrity),
+                Some("confidentiality") => Some(KernelLockdownMode::Confidentiality),
+                Some(other) => {
+                    eprintln!(
+                        "Unknown kernel lockdown mode: {}. Use integrity or confidentiality.",
+                        other
+                    );
+                    std::process::exit(1);
+                }
+            };
+
+            let gvisor_platform = match gvisor_platform.as_str() {
+                "systrap" => GVisorPlatform::Systrap,
+                "kvm" => GVisorPlatform::Kvm,
+                "ptrace" => GVisorPlatform::Ptrace,
+                other => {
+                    eprintln!(
+                        "Unknown gVisor platform: {}. Use systrap, kvm, or ptrace.",
+                        other
+                    );
+                    std::process::exit(1);
+                }
+            };
+
+            let mut namespaces = NamespaceConfig::all();
+            if time_namespace {
+                namespaces = namespaces.with_time_namespace(true);
+            }
+            if disable_cgroup_namespace {
+                namespaces = namespaces.with_cgroup_namespace(false);
+            }
+
             // Build configuration
             let mut config = ContainerConfig::new(name, command)
                 .with_limits(limits)
-                .with_namespaces(NamespaceConfig::all())
+                .with_namespaces(namespaces)
                 .with_network(net_mode)
                 .with_context_mode(ctx_mode)
                 .with_allow_host_network(allow_host_network)
@@ -641,7 +831,19 @@ fn main() -> Result<()> {
                 .with_trust_level(trust)
                 .with_proc_readonly(!proc_rw)
                 .with_service_mode(svc_mode)
-                .with_sd_notify(sd_notify);
+                .with_sd_notify(sd_notify)
+                .with_seccomp_log_denied(seccomp_log_denied)
+                .with_verify_context_integrity(verify_context_integrity)
+                .with_verify_rootfs_attestation(verify_rootfs_attestation)
+                .with_gvisor_platform(gvisor_platform);
+
+            if let Some(mode) = required_lockdown {
+                config = config.with_required_kernel_lockdown(mode);
+            }
+
+            if let Some(hash) = topology_config_hash {
+                config = config.with_config_hash(hash);
+            }
 
             if let Some(ctx) = context {
                 config = config.with_context(PathBuf::from(ctx));
@@ -652,36 +854,59 @@ fn main() -> Result<()> {
                 config = config.with_hostname(Some(host));
             }
 
-            match runtime.as_str() {
-                "native" => {} // default, nothing to do
-                "gvisor" => {
-                    config = config.with_gvisor(true);
-                    if !oci {
-                        info!("Security hardening: enabling OCI bundle mode for gVisor runtime");
-                        config = config.with_oci_bundle();
-                    }
-                }
-                other => {
-                    return Err(anyhow::anyhow!(
-                        "Unknown runtime '{}'; supported values are 'native' and 'gvisor'",
-                        other
-                    ));
-                }
-            }
+            config = apply_runtime_selection(config, &runtime, oci)?;
 
             if rootless {
                 info!("Enabling rootless mode");
                 config = config.with_rootless();
             }
 
-            if oci {
-                info!("Enabling OCI bundle mode");
-                config = config.with_oci_bundle();
-            }
-
             // Rootfs path
             if let Some(rootfs_dir) = rootfs {
                 config = config.with_rootfs_path(PathBuf::from(rootfs_dir));
+            }
+
+            // Seccomp profile and mode
+            if let Some(profile_path) = seccomp_profile {
+                config = config.with_seccomp_profile(PathBuf::from(profile_path));
+            }
+            if let Some(sha256) = seccomp_profile_sha256 {
+                config = config.with_seccomp_profile_sha256(sha256);
+            }
+            match seccomp_mode.as_str() {
+                "enforce" => {}
+                "trace" => {
+                    config = config.with_seccomp_mode(nucleus::container::SeccompMode::Trace);
+                    if let Some(log_path) = seccomp_log {
+                        config = config.with_seccomp_trace_log(PathBuf::from(log_path));
+                    } else {
+                        eprintln!("Error: --seccomp-log is required when --seccomp-mode=trace");
+                        std::process::exit(1);
+                    }
+                }
+                other => {
+                    eprintln!(
+                        "Error: Unknown seccomp mode '{}'; valid: enforce, trace",
+                        other
+                    );
+                    std::process::exit(1);
+                }
+            }
+
+            // Capability policy
+            if let Some(path) = caps_policy {
+                config = config.with_caps_policy(PathBuf::from(path));
+            }
+            if let Some(sha256) = caps_policy_sha256 {
+                config = config.with_caps_policy_sha256(sha256);
+            }
+
+            // Landlock policy
+            if let Some(path) = landlock_policy {
+                config = config.with_landlock_policy(PathBuf::from(path));
+            }
+            if let Some(sha256) = landlock_policy_sha256 {
+                config = config.with_landlock_policy_sha256(sha256);
             }
 
             // Egress policy: in production mode, always set a policy (deny-all if no
@@ -756,14 +981,224 @@ fn main() -> Result<()> {
                 }
             }
 
-            println!("{}", config.id);
+            if !quiet_id {
+                println!("{}", config.id);
+            }
 
             let container = Container::new(config);
             let exit_code = container.run()?;
 
             std::process::exit(exit_code);
         }
+
+        Commands::Compose(compose_cmd) => match compose_cmd {
+            ComposeCommands::Validate { file } => {
+                let config = TopologyConfig::from_file(&PathBuf::from(&file))?;
+                config.validate()?;
+                let graph = DependencyGraph::resolve(&config)?;
+                println!("Topology '{}' is valid", config.name);
+                println!(
+                    "Services ({}): {}",
+                    config.services.len(),
+                    config
+                        .services
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                println!("Startup order: {}", graph.startup_order.join(" -> "));
+                Ok(())
+            }
+
+            ComposeCommands::Plan { file } => {
+                let config = TopologyConfig::from_file(&PathBuf::from(&file))?;
+                config.validate()?;
+                let state_mgr = ContainerStateManager::new()?;
+                let plan = plan_reconcile(&config, &state_mgr)?;
+
+                println!("Reconciliation plan for topology '{}':", config.name);
+                for (name, action) in &plan.actions {
+                    let action_str = match action {
+                        ReconcileAction::NoChange => "no change",
+                        ReconcileAction::Start => "start",
+                        ReconcileAction::Restart => "restart",
+                        ReconcileAction::Stop => "stop",
+                    };
+                    println!("  {} -> {}", name, action_str);
+                }
+                Ok(())
+            }
+
+            ComposeCommands::Up { file, timeout } => {
+                let config = TopologyConfig::from_file(&PathBuf::from(&file))?;
+                config.validate()?;
+                let state_mgr = ContainerStateManager::new()?;
+                let plan = plan_reconcile(&config, &state_mgr)?;
+
+                println!("Bringing up topology '{}'...", config.name);
+                execute_reconcile(&config, &plan, &state_mgr, timeout)?;
+                println!("Topology '{}' is up", config.name);
+                Ok(())
+            }
+
+            ComposeCommands::Down { file, timeout } => {
+                let config = TopologyConfig::from_file(&PathBuf::from(&file))?;
+                config.validate()?;
+                let state_mgr = ContainerStateManager::new()?;
+                let graph = DependencyGraph::resolve(&config)?;
+
+                println!("Tearing down topology '{}'...", config.name);
+                for service_name in graph.shutdown_order() {
+                    let container_name = format!("{}-{}", config.name, service_name);
+                    match state_mgr.resolve_container(&container_name) {
+                        Ok(state) => {
+                            if state.is_running() {
+                                println!("Stopping {}...", container_name);
+                                ContainerLifecycle::stop(&state, timeout)?;
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+                println!("Topology '{}' is down", config.name);
+                Ok(())
+            }
+
+            ComposeCommands::Ps { file } => {
+                let config = TopologyConfig::from_file(&PathBuf::from(&file))?;
+                let state_mgr = ContainerStateManager::new()?;
+
+                println!(
+                    "{:<25} {:<10} {:<10} {:<30}",
+                    "SERVICE", "STATUS", "PID", "COMMAND"
+                );
+
+                for service_name in config.services.keys() {
+                    let container_name = format!("{}-{}", config.name, service_name);
+                    match state_mgr.resolve_container(&container_name) {
+                        Ok(state) => {
+                            let status = if state.is_running() {
+                                "Running"
+                            } else {
+                                "Stopped"
+                            };
+                            let cmd = state.command.join(" ");
+                            let cmd_display = if cmd.len() > 28 {
+                                format!("{}...", &cmd[..25])
+                            } else {
+                                cmd
+                            };
+                            println!(
+                                "{:<25} {:<10} {:<10} {:<30}",
+                                service_name, status, state.pid, cmd_display
+                            );
+                        }
+                        Err(_) => {
+                            println!(
+                                "{:<25} {:<10} {:<10} {:<30}",
+                                service_name, "Not found", "-", "-"
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
+        },
+
+        Commands::Seccomp(seccomp_cmd) => match seccomp_cmd {
+            SeccompCommands::Generate { trace_file, output } => {
+                let profile = nucleus::security::seccomp_generate::generate_from_trace(
+                    &PathBuf::from(&trace_file),
+                )?;
+                let json = serde_json::to_string_pretty(&profile)?;
+
+                if let Some(out_path) = output {
+                    std::fs::write(&out_path, &json)?;
+                    eprintln!("Wrote seccomp profile to {}", out_path);
+                } else {
+                    println!("{}", json);
+                }
+
+                eprintln!(
+                    "Profile contains {} syscalls",
+                    profile.syscalls.first().map(|g| g.names.len()).unwrap_or(0)
+                );
+                Ok(())
+            }
+        },
     }
+}
+
+fn init_tracing() -> Result<()> {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let fmt_layer = tracing_subscriber::fmt::layer();
+
+    let otlp_endpoint = std::env::var("NUCLEUS_OTLP_ENDPOINT")
+        .ok()
+        .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())
+        .filter(|value| !value.trim().is_empty());
+
+    if let Some(endpoint) = otlp_endpoint {
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_protocol(Protocol::HttpBinary)
+            .with_endpoint(endpoint.clone())
+            .build()
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to build OTLP exporter for {}: {}", endpoint, e)
+            })?;
+
+        let provider = SdkTracerProvider::builder()
+            .with_resource(
+                Resource::builder_empty()
+                    .with_service_name("nucleus")
+                    .build(),
+            )
+            .with_simple_exporter(exporter)
+            .build();
+        let tracer = provider.tracer("nucleus");
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .init();
+    }
+
+    Ok(())
+}
+
+fn apply_runtime_selection(mut config: ContainerConfig, runtime: &str, oci: bool) -> Result<ContainerConfig> {
+    match runtime {
+        "native" => {
+            if oci {
+                anyhow::bail!("--oci requires gVisor runtime; use --runtime gvisor");
+            }
+            config = config.with_gvisor(false);
+        }
+        "gvisor" => {
+            config = config.with_gvisor(true);
+            if !oci {
+                info!("Security hardening: enabling OCI bundle mode for gVisor runtime");
+            }
+            config = config.with_oci_bundle();
+        }
+        other => {
+            anyhow::bail!(
+                "Unknown runtime '{}'; supported values are 'native' and 'gvisor'",
+                other
+            );
+        }
+    }
+
+    Ok(config)
 }
 
 fn validate_container_name(name: &str) -> Result<()> {
@@ -803,4 +1238,29 @@ fn validate_hostname(hostname: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_native_runtime_disables_gvisor() {
+        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
+        let config = apply_runtime_selection(config, "native", false).unwrap();
+        assert!(
+            !config.use_gvisor,
+            "native runtime selection must disable gVisor"
+        );
+    }
+
+    #[test]
+    fn test_native_runtime_rejects_oci_flag() {
+        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
+        let err = apply_runtime_selection(config, "native", true).unwrap_err();
+        assert!(
+            err.to_string().contains("requires gVisor"),
+            "native runtime with --oci must be rejected explicitly"
+        );
+    }
 }

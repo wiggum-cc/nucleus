@@ -156,6 +156,24 @@ mod tests {
     }
 
     #[test]
+    fn test_oci_config_with_cgroup_and_time_namespaces() {
+        use nucleus::isolation::NamespaceConfig;
+
+        let namespaces = NamespaceConfig::minimal().with_time_namespace(true);
+        let config =
+            OciConfig::new(vec!["/bin/sh".to_string()], None).with_namespace_config(&namespaces);
+        let linux = config.linux.unwrap();
+        let namespaces = linux.namespaces.unwrap();
+        let ns_types: Vec<&str> = namespaces
+            .iter()
+            .map(|n| n.namespace_type.as_str())
+            .collect();
+
+        assert!(ns_types.contains(&"cgroup"));
+        assert!(ns_types.contains(&"time"));
+    }
+
+    #[test]
     fn test_oci_config_with_host_runtime_binds() {
         let config = OciConfig::new(vec!["/bin/sh".to_string()], None).with_host_runtime_binds();
         let mount_dests: Vec<&str> = config
@@ -178,7 +196,7 @@ mod tests {
         assert!(context_mount.is_some());
         let mount = context_mount.unwrap();
         assert_eq!(mount.mount_type, "bind");
-        assert!(mount.options.contains(&"rw".to_string()));
+        assert!(mount.options.contains(&"ro".to_string()));
     }
 
     #[test]
@@ -201,6 +219,27 @@ mod tests {
         assert_eq!(m.mount_type, "bind");
         assert!(m.options.contains(&"ro".to_string()));
         assert!(m.options.contains(&"noexec".to_string()));
+    }
+
+    #[test]
+    fn test_oci_config_with_inmemory_secret_mounts_adds_run_secrets_mount() {
+        use nucleus::container::SecretMount;
+
+        let stage_dir = TempDir::new().unwrap();
+        let staged = vec![SecretMount {
+            source: stage_dir.path().join("etc/tls/cert.pem"),
+            dest: std::path::PathBuf::from("/etc/tls/cert.pem"),
+            mode: 0o400,
+        }];
+
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None)
+            .with_inmemory_secret_mounts(stage_dir.path(), &staged)
+            .unwrap();
+
+        assert!(config.mounts.iter().any(|m| m.destination == "/run/secrets"));
+        assert!(config.mounts.iter().any(|m| {
+            m.destination == "/etc/tls/cert.pem" && m.source.ends_with("etc/tls/cert.pem")
+        }));
     }
 
     #[test]

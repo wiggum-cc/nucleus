@@ -1,6 +1,8 @@
 use crate::error::{NucleusError, Result};
+use crate::security::policy::sha256_hex;
 use seccompiler::{BpfProgram, SeccompAction, SeccompCondition, SeccompFilter, SeccompRule};
 use std::collections::BTreeMap;
+use std::path::Path;
 use tracing::{debug, info, warn};
 
 /// Seccomp filter manager
@@ -219,16 +221,12 @@ impl SeccompManager {
 
         // Allow all these syscalls unconditionally
         for syscall in allowed_syscalls {
-            let rule = SeccompRule::new(vec![])
-                .map_err(|e| NucleusError::SeccompError(format!("Failed to create rule: {}", e)))?;
-            rules.insert(syscall, vec![rule]);
+            rules.insert(syscall, Vec::new());
         }
 
         // Add network-mode-specific syscalls
         for syscall in Self::network_mode_syscalls(allow_network) {
-            let rule = SeccompRule::new(vec![])
-                .map_err(|e| NucleusError::SeccompError(format!("Failed to create rule: {}", e)))?;
-            rules.insert(syscall, vec![rule]);
+            rules.insert(syscall, Vec::new());
         }
 
         // Restrict socket() domains by network mode.
@@ -315,16 +313,14 @@ impl SeccompManager {
         }
         rules.insert(libc::SYS_prctl, prctl_rules);
 
-        // clone3: allow unconditionally — clone3 passes flags inside a struct pointer
-        // (arg0) that seccomp BPF cannot dereference, so arg-level namespace-flag
-        // filtering is not possible. Namespace creation is still blocked because all
-        // capabilities are dropped (CLONE_NEWUSER requires CAP_SYS_ADMIN on the host
-        // user namespace; other CLONE_NEW* require CAP_SYS_ADMIN). Blocking clone3
-        // entirely would break programs linked against modern glibc (≥2.34).
-        let clone3_rule = SeccompRule::new(vec![]).map_err(|e| {
-            NucleusError::SeccompError(format!("Failed to create clone3 rule: {}", e))
-        })?;
-        rules.insert(libc::SYS_clone3, vec![clone3_rule]);
+        // clone3: DENIED. clone3 passes flags inside a struct pointer that seccomp
+        // BPF cannot dereference, so namespace-flag filtering is impossible. Rather
+        // than relying on capability ordering as the sole defense, we block clone3
+        // entirely. glibc/musl fall back to the classic clone() syscall, which *is*
+        // filtered above. This is defense-in-depth: even if capabilities are
+        // mis-ordered, namespace creation via clone3 is blocked at the BPF level.
+        //
+        // clone3 is NOT added to the rules map, so it hits the default EPERM action.
 
         // clone: allow but deny namespace-creating flags to prevent nested namespace creation
         let clone_condition = SeccompCondition::new(
@@ -377,15 +373,19 @@ impl SeccompManager {
     /// Once applied, the filter cannot be removed (irreversible property)
     /// In rootless mode or if seccomp setup fails, this will warn and continue
     pub fn apply_minimal_filter(&mut self) -> Result<bool> {
-        self.apply_minimal_filter_with_mode(false)
+        self.apply_minimal_filter_with_mode(false, false)
     }
 
     /// Apply seccomp filter with configurable failure behavior
     ///
     /// When `best_effort` is true, failures are logged and execution continues.
     /// When false, seccomp setup is fail-closed.
-    pub fn apply_minimal_filter_with_mode(&mut self, best_effort: bool) -> Result<bool> {
-        self.apply_filter_for_network_mode(true, best_effort)
+    pub fn apply_minimal_filter_with_mode(
+        &mut self,
+        best_effort: bool,
+        log_denied: bool,
+    ) -> Result<bool> {
+        self.apply_filter_for_network_mode(true, best_effort, log_denied)
     }
 
     /// Apply seccomp filter with network-mode-aware socket restrictions
@@ -400,6 +400,7 @@ impl SeccompManager {
         &mut self,
         allow_network: bool,
         best_effort: bool,
+        log_denied: bool,
     ) -> Result<bool> {
         if self.applied {
             debug!("Seccomp filter already applied, skipping");
@@ -464,7 +465,7 @@ impl SeccompManager {
         };
 
         // Apply the filter
-        match seccompiler::apply_filter(&bpf_prog) {
+        match Self::apply_bpf_program(&bpf_prog, log_denied) {
             Ok(_) => {
                 self.applied = true;
                 info!("Successfully applied seccomp filter");
@@ -487,9 +488,411 @@ impl SeccompManager {
         }
     }
 
+    /// Apply a seccomp profile loaded from a JSON file.
+    ///
+    /// The profile format is a JSON object with:
+    /// ```json
+    /// {
+    ///   "defaultAction": "SCMP_ACT_ERRNO",
+    ///   "syscalls": [
+    ///     { "names": ["read", "write", "open", ...], "action": "SCMP_ACT_ALLOW" }
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// This is a subset of the OCI seccomp profile format. Only the syscall name
+    /// allowlist is used; argument-level filtering from the built-in profile is
+    /// not applied when using a custom profile.
+    ///
+    /// If `expected_sha256` is provided, the file's SHA-256 hash is verified
+    /// against it before loading. This prevents silent profile tampering.
+    pub fn apply_profile_from_file(
+        &mut self,
+        profile_path: &Path,
+        expected_sha256: Option<&str>,
+        audit_mode: bool,
+    ) -> Result<bool> {
+        if self.applied {
+            debug!("Seccomp filter already applied, skipping");
+            return Ok(true);
+        }
+
+        info!("Loading seccomp profile from {:?}", profile_path);
+
+        // Read profile file
+        let content = std::fs::read(profile_path).map_err(|e| {
+            NucleusError::SeccompError(format!(
+                "Failed to read seccomp profile {:?}: {}",
+                profile_path, e
+            ))
+        })?;
+
+        // Verify SHA-256 hash if expected
+        if let Some(expected) = expected_sha256 {
+            let actual = sha256_hex(&content);
+            if actual != expected {
+                return Err(NucleusError::SeccompError(format!(
+                    "Seccomp profile hash mismatch: expected {}, got {}",
+                    expected, actual
+                )));
+            }
+            info!("Seccomp profile hash verified: {}", actual);
+        }
+
+        // Parse profile
+        let profile: SeccompProfile = serde_json::from_slice(&content).map_err(|e| {
+            NucleusError::SeccompError(format!("Failed to parse seccomp profile: {}", e))
+        })?;
+
+        // Warn when custom profile allows security-critical syscalls without
+        // argument-level filtering. The built-in filter restricts clone, ioctl,
+        // prctl, and socket at the argument level; a custom profile that allows
+        // them by name only silently removes all of that hardening.
+        Self::warn_missing_arg_filters(&profile);
+
+        // Build filter from profile
+        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+
+        for syscall_group in &profile.syscalls {
+            if syscall_group.action == "SCMP_ACT_ALLOW" {
+                for name in &syscall_group.names {
+                    if let Some(nr) = syscall_name_to_number(name) {
+                        rules.insert(nr, Vec::new());
+                    } else {
+                        warn!("Unknown syscall in profile: {} (skipping)", name);
+                    }
+                }
+            }
+        }
+
+        let filter = SeccompFilter::new(
+            rules,
+            SeccompAction::Errno(libc::EPERM as u32),
+            SeccompAction::Allow,
+            std::env::consts::ARCH.try_into().map_err(|e| {
+                NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
+            })?,
+        )
+        .map_err(|e| {
+            NucleusError::SeccompError(format!(
+                "Failed to create seccomp filter from profile: {}",
+                e
+            ))
+        })?;
+
+        let bpf_prog: BpfProgram = filter.try_into().map_err(|e| {
+            NucleusError::SeccompError(format!("Failed to compile BPF program from profile: {}", e))
+        })?;
+
+        match Self::apply_bpf_program(&bpf_prog, audit_mode) {
+            Ok(_) => {
+                self.applied = true;
+                info!(
+                    "Seccomp profile applied from {:?} (log_denied={})",
+                    profile_path, audit_mode
+                );
+                Ok(true)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Install an allow-all seccomp filter with SECCOMP_FILTER_FLAG_LOG.
+    ///
+    /// Used in trace mode: all syscalls are allowed but logged to the kernel
+    /// audit subsystem. A separate reader collects the logged syscalls.
+    pub fn apply_trace_filter(&mut self) -> Result<bool> {
+        if self.applied {
+            debug!("Seccomp filter already applied, skipping trace filter");
+            return Ok(true);
+        }
+
+        info!("Applying seccomp trace filter (allow-all + LOG)");
+
+        // Create an empty rule set — with SeccompAction::Allow as default,
+        // every syscall is permitted. The LOG flag causes the kernel to
+        // audit each syscall decision.
+        let filter = SeccompFilter::new(
+            BTreeMap::new(),
+            SeccompAction::Allow, // default: allow everything
+            SeccompAction::Allow, // match action (unused — no rules)
+            std::env::consts::ARCH.try_into().map_err(|e| {
+                NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
+            })?,
+        )
+        .map_err(|e| NucleusError::SeccompError(format!("Failed to create trace filter: {}", e)))?;
+
+        let bpf_prog: BpfProgram = filter.try_into().map_err(|e| {
+            NucleusError::SeccompError(format!("Failed to compile trace BPF: {}", e))
+        })?;
+
+        // Apply with LOG flag so kernel audits every syscall
+        Self::apply_bpf_program(&bpf_prog, true)?;
+        self.applied = true;
+        info!("Seccomp trace filter applied (all syscalls allowed + logged)");
+        Ok(true)
+    }
+
+    /// Syscalls that the built-in filter restricts at the argument level.
+    /// Custom profiles allowing these without argument filters weaken security.
+    const ARG_FILTERED_SYSCALLS: &'static [&'static str] =
+        &["clone", "clone3", "ioctl", "prctl", "socket"];
+
+    /// Warn when a custom seccomp profile allows security-critical syscalls
+    /// without argument-level filtering.
+    fn warn_missing_arg_filters(profile: &SeccompProfile) {
+        for group in &profile.syscalls {
+            if group.action != "SCMP_ACT_ALLOW" {
+                continue;
+            }
+            for name in &group.names {
+                if Self::ARG_FILTERED_SYSCALLS.contains(&name.as_str()) && group.args.is_empty() {
+                    warn!(
+                        "Custom seccomp profile allows '{}' without argument filters. \
+                         The built-in filter restricts this syscall at the argument level. \
+                         This profile weakens security compared to the default.",
+                        name
+                    );
+                }
+            }
+        }
+    }
+
     /// Check if seccomp filter has been applied
     pub fn is_applied(&self) -> bool {
         self.applied
+    }
+
+    fn apply_bpf_program(bpf_prog: &BpfProgram, log_denied: bool) -> Result<()> {
+        let mut flags: libc::c_ulong = 0;
+        if log_denied {
+            flags |= libc::SECCOMP_FILTER_FLAG_LOG as libc::c_ulong;
+        }
+
+        match Self::apply_bpf_program_with_flags(bpf_prog, flags) {
+            Ok(()) => Ok(()),
+            Err(err)
+                if log_denied
+                    && err.raw_os_error() == Some(libc::EINVAL)
+                    && libc::SECCOMP_FILTER_FLAG_LOG != 0 =>
+            {
+                warn!(
+                    "Kernel rejected SECCOMP_FILTER_FLAG_LOG; continuing with seccomp \
+                     enforcement without deny logging"
+                );
+                Self::apply_bpf_program_with_flags(bpf_prog, 0)?;
+                Ok(())
+            }
+            Err(err) => Err(NucleusError::SeccompError(format!(
+                "Failed to apply seccomp filter: {}",
+                err
+            ))),
+        }
+    }
+
+    fn apply_bpf_program_with_flags(
+        bpf_prog: &BpfProgram,
+        flags: libc::c_ulong,
+    ) -> std::io::Result<()> {
+        let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let prog = libc::sock_fprog {
+            len: bpf_prog.len() as u16,
+            filter: bpf_prog.as_ptr() as *mut libc::sock_filter,
+        };
+
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_SET_MODE_FILTER,
+                flags,
+                &prog as *const libc::sock_fprog,
+            )
+        };
+
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+}
+
+// SeccompProfile and SeccompSyscallGroup are defined in seccomp_generate.rs
+use crate::security::seccomp_generate::SeccompProfile;
+
+/// Map a syscall name (e.g. "read", "write") to its Linux syscall number.
+///
+/// Covers the most common syscalls. Unknown names return None.
+fn syscall_name_to_number(name: &str) -> Option<i64> {
+    match name {
+        // File I/O
+        "read" => Some(libc::SYS_read),
+        "write" => Some(libc::SYS_write),
+        "open" => Some(libc::SYS_open),
+        "openat" => Some(libc::SYS_openat),
+        "close" => Some(libc::SYS_close),
+        "stat" => Some(libc::SYS_stat),
+        "fstat" => Some(libc::SYS_fstat),
+        "lstat" => Some(libc::SYS_lstat),
+        "lseek" => Some(libc::SYS_lseek),
+        "access" => Some(libc::SYS_access),
+        "fcntl" => Some(libc::SYS_fcntl),
+        "readv" => Some(libc::SYS_readv),
+        "writev" => Some(libc::SYS_writev),
+        "pread64" => Some(libc::SYS_pread64),
+        "pwrite64" => Some(libc::SYS_pwrite64),
+        "readlink" => Some(libc::SYS_readlink),
+        "readlinkat" => Some(libc::SYS_readlinkat),
+        "newfstatat" => Some(libc::SYS_newfstatat),
+        "statx" => Some(libc::SYS_statx),
+        "faccessat" => Some(libc::SYS_faccessat),
+        "faccessat2" => Some(libc::SYS_faccessat2),
+        "dup" => Some(libc::SYS_dup),
+        "dup2" => Some(libc::SYS_dup2),
+        "dup3" => Some(libc::SYS_dup3),
+        "pipe" => Some(libc::SYS_pipe),
+        "pipe2" => Some(libc::SYS_pipe2),
+        "unlink" => Some(libc::SYS_unlink),
+        "unlinkat" => Some(libc::SYS_unlinkat),
+        "rename" => Some(libc::SYS_rename),
+        "renameat" => Some(libc::SYS_renameat),
+        "renameat2" => Some(libc::SYS_renameat2),
+        "link" => Some(libc::SYS_link),
+        "linkat" => Some(libc::SYS_linkat),
+        "symlink" => Some(libc::SYS_symlink),
+        "symlinkat" => Some(libc::SYS_symlinkat),
+        "chmod" => Some(libc::SYS_chmod),
+        "fchmod" => Some(libc::SYS_fchmod),
+        "fchmodat" => Some(libc::SYS_fchmodat),
+        "truncate" => Some(libc::SYS_truncate),
+        "ftruncate" => Some(libc::SYS_ftruncate),
+        "fallocate" => Some(libc::SYS_fallocate),
+        "fadvise64" => Some(libc::SYS_fadvise64),
+        "fsync" => Some(libc::SYS_fsync),
+        "fdatasync" => Some(libc::SYS_fdatasync),
+        "flock" => Some(libc::SYS_flock),
+        "sendfile" => Some(libc::SYS_sendfile),
+        "copy_file_range" => Some(libc::SYS_copy_file_range),
+        "splice" => Some(libc::SYS_splice),
+        "tee" => Some(libc::SYS_tee),
+        // Memory
+        "mmap" => Some(libc::SYS_mmap),
+        "munmap" => Some(libc::SYS_munmap),
+        "mprotect" => Some(libc::SYS_mprotect),
+        "brk" => Some(libc::SYS_brk),
+        "mremap" => Some(libc::SYS_mremap),
+        "madvise" => Some(libc::SYS_madvise),
+        "msync" => Some(libc::SYS_msync),
+        "mlock" => Some(libc::SYS_mlock),
+        "munlock" => Some(libc::SYS_munlock),
+        // Process
+        "fork" => Some(libc::SYS_fork),
+        "clone" => Some(libc::SYS_clone),
+        "clone3" => Some(libc::SYS_clone3),
+        "execve" => Some(libc::SYS_execve),
+        "execveat" => Some(libc::SYS_execveat),
+        "wait4" => Some(libc::SYS_wait4),
+        "waitid" => Some(libc::SYS_waitid),
+        "exit" => Some(libc::SYS_exit),
+        "exit_group" => Some(libc::SYS_exit_group),
+        "getpid" => Some(libc::SYS_getpid),
+        "gettid" => Some(libc::SYS_gettid),
+        "getuid" => Some(libc::SYS_getuid),
+        "getgid" => Some(libc::SYS_getgid),
+        "geteuid" => Some(libc::SYS_geteuid),
+        "getegid" => Some(libc::SYS_getegid),
+        "getppid" => Some(libc::SYS_getppid),
+        "getpgrp" => Some(libc::SYS_getpgrp),
+        "setsid" => Some(libc::SYS_setsid),
+        "getgroups" => Some(libc::SYS_getgroups),
+        // Signals
+        "rt_sigaction" => Some(libc::SYS_rt_sigaction),
+        "rt_sigprocmask" => Some(libc::SYS_rt_sigprocmask),
+        "rt_sigreturn" => Some(libc::SYS_rt_sigreturn),
+        "rt_sigsuspend" => Some(libc::SYS_rt_sigsuspend),
+        "sigaltstack" => Some(libc::SYS_sigaltstack),
+        "kill" => Some(libc::SYS_kill),
+        "tgkill" => Some(libc::SYS_tgkill),
+        // Time
+        "clock_gettime" => Some(libc::SYS_clock_gettime),
+        "clock_getres" => Some(libc::SYS_clock_getres),
+        "clock_nanosleep" => Some(libc::SYS_clock_nanosleep),
+        "gettimeofday" => Some(libc::SYS_gettimeofday),
+        "nanosleep" => Some(libc::SYS_nanosleep),
+        // Directories
+        "getcwd" => Some(libc::SYS_getcwd),
+        "chdir" => Some(libc::SYS_chdir),
+        "fchdir" => Some(libc::SYS_fchdir),
+        "mkdir" => Some(libc::SYS_mkdir),
+        "mkdirat" => Some(libc::SYS_mkdirat),
+        "rmdir" => Some(libc::SYS_rmdir),
+        "getdents" => Some(libc::SYS_getdents),
+        "getdents64" => Some(libc::SYS_getdents64),
+        // Network
+        "socket" => Some(libc::SYS_socket),
+        "connect" => Some(libc::SYS_connect),
+        "sendto" => Some(libc::SYS_sendto),
+        "recvfrom" => Some(libc::SYS_recvfrom),
+        "sendmsg" => Some(libc::SYS_sendmsg),
+        "recvmsg" => Some(libc::SYS_recvmsg),
+        "shutdown" => Some(libc::SYS_shutdown),
+        "bind" => Some(libc::SYS_bind),
+        "listen" => Some(libc::SYS_listen),
+        "accept" => Some(libc::SYS_accept),
+        "accept4" => Some(libc::SYS_accept4),
+        "setsockopt" => Some(libc::SYS_setsockopt),
+        "getsockopt" => Some(libc::SYS_getsockopt),
+        "getsockname" => Some(libc::SYS_getsockname),
+        "getpeername" => Some(libc::SYS_getpeername),
+        "socketpair" => Some(libc::SYS_socketpair),
+        // Poll/Select
+        "poll" => Some(libc::SYS_poll),
+        "ppoll" => Some(libc::SYS_ppoll),
+        "select" => Some(libc::SYS_select),
+        "pselect6" => Some(libc::SYS_pselect6),
+        "epoll_create" => Some(libc::SYS_epoll_create),
+        "epoll_create1" => Some(libc::SYS_epoll_create1),
+        "epoll_ctl" => Some(libc::SYS_epoll_ctl),
+        "epoll_wait" => Some(libc::SYS_epoll_wait),
+        "epoll_pwait" => Some(libc::SYS_epoll_pwait),
+        "eventfd" => Some(libc::SYS_eventfd),
+        "eventfd2" => Some(libc::SYS_eventfd2),
+        "signalfd" => Some(libc::SYS_signalfd),
+        "signalfd4" => Some(libc::SYS_signalfd4),
+        "timerfd_create" => Some(libc::SYS_timerfd_create),
+        "timerfd_settime" => Some(libc::SYS_timerfd_settime),
+        "timerfd_gettime" => Some(libc::SYS_timerfd_gettime),
+        // Misc
+        "uname" => Some(libc::SYS_uname),
+        "getrandom" => Some(libc::SYS_getrandom),
+        "futex" => Some(libc::SYS_futex),
+        "set_tid_address" => Some(libc::SYS_set_tid_address),
+        "set_robust_list" => Some(libc::SYS_set_robust_list),
+        "get_robust_list" => Some(libc::SYS_get_robust_list),
+        "arch_prctl" => Some(libc::SYS_arch_prctl),
+        "sysinfo" => Some(libc::SYS_sysinfo),
+        "umask" => Some(libc::SYS_umask),
+        "getrlimit" => Some(libc::SYS_getrlimit),
+        "prlimit64" => Some(libc::SYS_prlimit64),
+        "getrusage" => Some(libc::SYS_getrusage),
+        "times" => Some(libc::SYS_times),
+        "sched_yield" => Some(libc::SYS_sched_yield),
+        "sched_getaffinity" => Some(libc::SYS_sched_getaffinity),
+        "getcpu" => Some(libc::SYS_getcpu),
+        "rseq" => Some(libc::SYS_rseq),
+        "close_range" => Some(libc::SYS_close_range),
+        "memfd_create" => Some(libc::SYS_memfd_create),
+        "ioctl" => Some(libc::SYS_ioctl),
+        "prctl" => Some(libc::SYS_prctl),
+        // Landlock
+        "landlock_create_ruleset" => Some(libc::SYS_landlock_create_ruleset),
+        "landlock_add_rule" => Some(libc::SYS_landlock_add_rule),
+        "landlock_restrict_self" => Some(libc::SYS_landlock_restrict_self),
+        _ => None,
     }
 }
 
@@ -596,11 +999,47 @@ mod tests {
         let net = SeccompManager::network_mode_syscalls(true);
 
         // Snapshot counts to catch unintended policy drift.
-        // +5 accounts for conditional rules inserted in minimal_filter(): socket/ioctl/prctl/clone/clone3.
+        // +4 accounts for conditional rules inserted in minimal_filter(): socket/ioctl/prctl/clone.
+        // clone3 is blocked (not in rules map), so it does not count.
         assert_eq!(base.len(), 135);
         assert_eq!(net.len(), 11);
-        assert_eq!(base.len() + 5, 140);
-        assert_eq!(base.len() + net.len() + 5, 151);
+        assert_eq!(base.len() + 4, 139);
+        assert_eq!(base.len() + net.len() + 4, 150);
+    }
+
+    #[test]
+    fn test_arg_filtered_syscalls_list_includes_critical_syscalls() {
+        // These syscalls must be in the arg-filtered list so custom profiles
+        // get warnings when they allow them without filters.
+        for name in &["clone", "clone3", "ioctl", "prctl", "socket"] {
+            assert!(
+                SeccompManager::ARG_FILTERED_SYSCALLS.contains(name),
+                "'{}' must be in ARG_FILTERED_SYSCALLS",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_clone3_blocked_in_minimal_filter() {
+        // clone3 must NOT appear in the BPF rules map — it should hit the
+        // default deny action (EPERM). This is defense-in-depth: clone3 cannot
+        // be arg-filtered by BPF, so we block it entirely.
+        let rules = SeccompManager::minimal_filter(true).unwrap();
+        assert!(
+            !rules.contains_key(&libc::SYS_clone3),
+            "clone3 must not be in the seccomp allowlist"
+        );
+    }
+
+    #[test]
+    fn test_clone_is_allowed_with_arg_filter() {
+        // clone (not clone3) should still be in the rules with arg filtering
+        let rules = SeccompManager::minimal_filter(true).unwrap();
+        assert!(
+            rules.contains_key(&libc::SYS_clone),
+            "clone must be in the seccomp allowlist with arg filters"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 /// Container state tracking information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerState {
-    /// Container ID (unique 12 hex chars)
+    /// Container ID (unique 32 hex chars, 128-bit)
     pub id: String,
 
     /// Container name (user-supplied or same as ID)
@@ -40,6 +40,10 @@ pub struct ContainerState {
 
     /// cgroup path
     pub cgroup_path: Option<String>,
+
+    /// Desired topology config hash associated with this container, if any.
+    #[serde(default)]
+    pub config_hash: Option<u64>,
 
     /// UID of the user who created this container
     #[serde(default)]
@@ -83,6 +87,7 @@ impl ContainerState {
             using_gvisor,
             rootless,
             cgroup_path,
+            config_hash: None,
             creator_uid: nix::unistd::Uid::effective().as_raw(),
             start_ticks,
         }
@@ -147,7 +152,29 @@ impl ContainerStateManager {
     ///
     /// Creates the state directory if it doesn't exist
     pub fn new() -> Result<Self> {
-        let state_dir = Self::default_state_dir();
+        let mut last_error = None;
+        for candidate in Self::default_state_dir_candidates() {
+            match Self::with_state_dir(candidate.clone()) {
+                Ok(manager) => return Ok(manager),
+                Err(err) => {
+                    debug!(
+                        path = ?candidate,
+                        error = %err,
+                        "State directory candidate unavailable, trying next fallback"
+                    );
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            NucleusError::ConfigError("No usable state directory candidates found".to_string())
+        }))
+    }
+
+    /// Create a state manager rooted at an explicit directory.
+    pub fn with_state_dir(state_dir: PathBuf) -> Result<Self> {
+        Self::reject_symlink_path(&state_dir)?;
 
         // Create state directory if it doesn't exist
         if !state_dir.exists() {
@@ -158,31 +185,134 @@ impl ContainerStateManager {
                 ))
             })?;
         }
-        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).map_err(|e| {
-            NucleusError::ConfigError(format!(
-                "Failed to secure state directory permissions {:?}: {}",
-                state_dir, e
-            ))
-        })?;
+        Self::reject_symlink_path(&state_dir)?;
+        Self::ensure_secure_state_dir_permissions(&state_dir)?;
+        Self::ensure_state_dir_writable(&state_dir)?;
 
         Ok(Self { state_dir })
     }
 
-    /// Get default state directory
-    fn default_state_dir() -> PathBuf {
+    fn reject_symlink_path(state_dir: &PathBuf) -> Result<()> {
+        match fs::symlink_metadata(state_dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err(NucleusError::ConfigError(format!(
+                    "Refusing symlink state directory path {:?}; use a real directory",
+                    state_dir
+                )))
+            }
+            Ok(_) | Err(_) => Ok(()),
+        }
+    }
+
+    fn ensure_secure_state_dir_permissions(state_dir: &PathBuf) -> Result<()> {
+        match fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700)) {
+            Ok(()) => Ok(()),
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::EROFS) | Some(libc::EPERM) | Some(libc::EACCES)
+                ) =>
+            {
+                let metadata = fs::metadata(state_dir).map_err(|meta_err| {
+                    NucleusError::ConfigError(format!(
+                        "Failed to secure state directory permissions {:?}: {} (and could not \
+                         inspect existing permissions: {})",
+                        state_dir, e, meta_err
+                    ))
+                })?;
+
+                let mode = metadata.permissions().mode() & 0o777;
+                let owner = metadata.uid();
+                let current_uid = nix::unistd::Uid::effective().as_raw();
+                let is_owner_ok = owner == current_uid || nix::unistd::Uid::effective().is_root();
+                let is_mode_ok = mode & 0o077 == 0;
+
+                if is_owner_ok && is_mode_ok {
+                    debug!(
+                        path = ?state_dir,
+                        mode = format!("{:o}", mode),
+                        owner,
+                        "State directory already has secure permissions; skipping chmod failure"
+                    );
+                    Ok(())
+                } else {
+                    Err(NucleusError::ConfigError(format!(
+                        "Failed to secure state directory permissions {:?}: {} (existing mode \
+                         {:o}, owner uid {})",
+                        state_dir, e, mode, owner
+                    )))
+                }
+            }
+            Err(e) => Err(NucleusError::ConfigError(format!(
+                "Failed to secure state directory permissions {:?}: {}",
+                state_dir, e
+            ))),
+        }
+    }
+
+    fn ensure_state_dir_writable(state_dir: &PathBuf) -> Result<()> {
+        let probe_name = format!(
+            ".nucleus-write-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let probe_path = state_dir.join(probe_name);
+
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&probe_path)
+            .map_err(|e| {
+                NucleusError::ConfigError(format!(
+                    "State directory {:?} is not writable: {}",
+                    state_dir, e
+                ))
+            })?;
+        drop(file);
+
+        fs::remove_file(&probe_path).map_err(|e| {
+            NucleusError::ConfigError(format!(
+                "Failed to cleanup state directory probe {:?}: {}",
+                probe_path, e
+            ))
+        })?;
+
+        Ok(())
+    }
+
+    /// Get ordered default state directory candidates.
+    fn default_state_dir_candidates() -> Vec<PathBuf> {
+        if let Some(path) = std::env::var_os("NUCLEUS_STATE_DIR").filter(|p| !p.is_empty()) {
+            return vec![PathBuf::from(path)];
+        }
+
         if nix::unistd::Uid::effective().is_root() {
-            PathBuf::from("/var/run/nucleus")
+            return vec![PathBuf::from("/var/run/nucleus")];
         } else {
-            // Prefer XDG_RUNTIME_DIR (per-user, tmpfs, mode 0700) over /tmp
-            dirs::runtime_dir()
-                .map(|d| d.join("nucleus"))
-                .or_else(|| dirs::data_local_dir().map(|d| d.join("nucleus")))
-                .unwrap_or_else(|| {
-                    // Last resort: ~/.nucleus (never /tmp — symlink attack vector)
-                    dirs::home_dir()
-                        .map(|h| h.join(".nucleus"))
-                        .unwrap_or_else(|| PathBuf::from("/var/run/nucleus"))
-                })
+            let mut candidates = Vec::new();
+
+            if let Some(dir) = dirs::runtime_dir() {
+                candidates.push(dir.join("nucleus"));
+            }
+            if let Some(dir) = dirs::data_local_dir() {
+                candidates.push(dir.join("nucleus"));
+            }
+            if let Some(dir) = dirs::home_dir() {
+                candidates.push(dir.join(".nucleus"));
+            }
+
+            // Final fallback for restricted sandboxes where standard runtime/home
+            // paths are mounted read-only. Keep it private to the effective UID.
+            candidates.push(PathBuf::from(format!(
+                "/tmp/nucleus-{}",
+                nix::unistd::Uid::effective().as_raw()
+            )));
+
+            candidates
         }
     }
 
@@ -260,11 +390,15 @@ impl ContainerStateManager {
             NucleusError::ConfigError(format!("Failed to serialize container state: {}", e))
         })?;
 
+        // O_NOFOLLOW prevents TOCTOU symlink attacks: if an attacker replaces
+        // the temp path with a symlink between check and open, the open fails
+        // instead of following the symlink to an attacker-controlled location.
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp_path)
             .map_err(|e| {
                 NucleusError::ConfigError(format!(
@@ -292,12 +426,33 @@ impl ContainerStateManager {
     }
 
     /// Load container state
+    ///
+    /// Opens with O_NOFOLLOW to prevent symlink-based TOCTOU attacks.
     pub fn load_state(&self, container_id: &str) -> Result<ContainerState> {
         let path = self.state_file_path(container_id)?;
 
-        let json = fs::read_to_string(&path).map_err(|e| {
-            NucleusError::ConfigError(format!("Failed to read state file {:?}: {}", path, e))
-        })?;
+        // Use O_NOFOLLOW to atomically reject symlinks at open time
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| {
+                NucleusError::ConfigError(format!("Failed to read state file {:?}: {}", path, e))
+            })?;
+
+        let json: String = {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::BufReader::new(file)
+                .read_to_string(&mut buf)
+                .map_err(|e| {
+                    NucleusError::ConfigError(format!(
+                        "Failed to read state file {:?}: {}",
+                        path, e
+                    ))
+                })?;
+            buf
+        };
 
         let state = serde_json::from_str(&json).map_err(|e| {
             NucleusError::ConfigError(format!("Failed to parse container state: {}", e))
@@ -526,5 +681,61 @@ mod tests {
 
         // Not found
         assert!(mgr.resolve_container("nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_load_state_rejects_symlink() {
+        // H-3: O_NOFOLLOW must prevent loading state through a symlink
+        let (mgr, temp_dir) = temp_state_manager();
+
+        // Create a real state file
+        let state = ContainerState::new(
+            "real".to_string(),
+            "real".to_string(),
+            1234,
+            vec!["/bin/sh".to_string()],
+            None,
+            None,
+            false,
+            false,
+            None,
+        );
+        mgr.save_state(&state).unwrap();
+
+        // Create a symlink pointing to the real state file
+        let symlink_path = temp_dir.path().join("symlinked.json");
+        let real_path = temp_dir.path().join("real.json");
+        std::os::unix::fs::symlink(&real_path, &symlink_path).unwrap();
+
+        // Loading through the symlink ID must fail (O_NOFOLLOW)
+        let result = mgr.load_state("symlinked");
+        assert!(result.is_err(), "load_state must reject symlinks");
+    }
+
+    #[test]
+    fn test_save_state_rejects_symlink_tmp() {
+        // H-3: O_NOFOLLOW on save must prevent writing through a symlink
+        let (mgr, temp_dir) = temp_state_manager();
+
+        let state = ContainerState::new(
+            "target".to_string(),
+            "target".to_string(),
+            1234,
+            vec!["/bin/sh".to_string()],
+            None,
+            None,
+            false,
+            false,
+            None,
+        );
+
+        // Pre-create a symlink at the temp path to simulate an attack
+        let tmp_path = temp_dir.path().join("target.json.tmp");
+        let evil_path = temp_dir.path().join("evil");
+        std::os::unix::fs::symlink(&evil_path, &tmp_path).unwrap();
+
+        // save_state should fail because O_NOFOLLOW rejects the symlink
+        let result = mgr.save_state(&state);
+        assert!(result.is_err(), "save_state must reject symlinks at tmp path");
     }
 }

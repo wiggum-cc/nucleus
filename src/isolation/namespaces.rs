@@ -20,8 +20,12 @@ pub struct NamespaceConfig {
     pub uts: bool,
     /// IPC namespace - inter-process communication isolation
     pub ipc: bool,
+    /// Cgroup namespace - isolate cgroup hierarchy visibility
+    pub cgroup: bool,
     /// User namespace - user/group ID isolation
     pub user: bool,
+    /// Time namespace - isolate time offsets from the host
+    pub time: bool,
 }
 
 impl NamespaceConfig {
@@ -33,7 +37,9 @@ impl NamespaceConfig {
             net: true,
             uts: true,
             ipc: true,
+            cgroup: true,
             user: false, // User namespace requires special setup
+            time: false, // Opt-in until time namespace support is broadly validated
         }
     }
 
@@ -45,8 +51,22 @@ impl NamespaceConfig {
             net: true,
             uts: false,
             ipc: false,
+            cgroup: true,
             user: false,
+            time: false,
         }
+    }
+
+    /// Enable or disable cgroup namespace isolation.
+    pub fn with_cgroup_namespace(mut self, enabled: bool) -> Self {
+        self.cgroup = enabled;
+        self
+    }
+
+    /// Enable or disable time namespace isolation.
+    pub fn with_time_namespace(mut self, enabled: bool) -> Self {
+        self.time = enabled;
+        self
     }
 
     /// Convert to CloneFlags for unshare(2)
@@ -68,8 +88,14 @@ impl NamespaceConfig {
         if self.ipc {
             flags |= CloneFlags::CLONE_NEWIPC;
         }
+        if self.cgroup {
+            flags |= CloneFlags::CLONE_NEWCGROUP;
+        }
         if self.user {
             flags |= CloneFlags::CLONE_NEWUSER;
+        }
+        if self.time {
+            flags |= CloneFlags::from_bits_retain(libc::CLONE_NEWTIME);
         }
 
         flags
@@ -201,7 +227,9 @@ mod tests {
         assert!(config.net);
         assert!(config.uts);
         assert!(config.ipc);
+        assert!(config.cgroup);
         assert!(!config.user); // User namespace disabled by default
+        assert!(!config.time);
     }
 
     #[test]
@@ -212,7 +240,9 @@ mod tests {
         assert!(config.net);
         assert!(!config.uts);
         assert!(!config.ipc);
+        assert!(config.cgroup);
         assert!(!config.user);
+        assert!(!config.time);
     }
 
     #[test]

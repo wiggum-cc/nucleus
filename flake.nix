@@ -30,11 +30,31 @@
       #   nucleus.lib.mkRootfs { pkgs = import nixpkgs { system = "x86_64-linux"; };
       #     packages = [ pkgs.coreutils pkgs.curl pkgs.cacert ]; }
       lib.mkRootfs = { pkgs, packages ? [ ], name ? "nucleus-rootfs" }:
-        pkgs.buildEnv {
-          inherit name;
-          paths = [ pkgs.coreutils pkgs.bashInteractive ] ++ packages;
-          pathsToLink = [ "/bin" "/sbin" "/lib" "/lib64" "/usr" "/etc" "/nix" ];
-        };
+        let
+          baseRootfs = pkgs.buildEnv {
+            inherit name;
+            paths = [ pkgs.coreutils pkgs.bashInteractive ] ++ packages;
+            pathsToLink = [ "/bin" "/sbin" "/lib" "/lib64" "/usr" "/etc" "/nix" ];
+          };
+        in
+        pkgs.runCommand name {
+          nativeBuildInputs = [ pkgs.coreutils pkgs.findutils ];
+        } ''
+          mkdir -p "$out"
+          for path in bin sbin lib lib64 usr etc nix; do
+            if [ -e "${baseRootfs}/$path" ]; then
+              ln -s "${baseRootfs}/$path" "$out/$path"
+            fi
+          done
+
+          manifest="$out/.nucleus-rootfs-sha256"
+          find -L "$out" -type f ! -name ".nucleus-rootfs-sha256" -printf '%P\0' \
+            | sort -z \
+            | while IFS= read -r -d "" rel; do
+                digest="$(sha256sum "$out/$rel" | cut -d' ' -f1)"
+                printf '%s\t%s\n' "$digest" "$rel"
+              done > "$manifest"
+        '';
     } //
     flake-utils.lib.eachDefaultSystem (system:
       let

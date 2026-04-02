@@ -93,11 +93,12 @@ mod tests {
     fn test_namespace_config_variations() {
         // Test different namespace configurations
         let all = NamespaceConfig::all();
-        assert!(all.pid && all.mnt && all.net && all.uts && all.ipc);
+        assert!(all.pid && all.mnt && all.net && all.uts && all.ipc && all.cgroup);
+        assert!(!all.time);
 
         let minimal = NamespaceConfig::minimal();
-        assert!(minimal.pid && minimal.mnt && minimal.net);
-        assert!(!minimal.uts && !minimal.ipc);
+        assert!(minimal.pid && minimal.mnt && minimal.net && minimal.cgroup);
+        assert!(!minimal.uts && !minimal.ipc && !minimal.time);
     }
 
     #[test]

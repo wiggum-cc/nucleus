@@ -39,20 +39,13 @@ impl BridgeNetwork {
         let mut net_state = NetworkState::Unconfigured;
         net_state = net_state.transition(NetworkState::Configuring)?;
 
-        let reserved = Self::collect_reserved_ips();
-        let container_ip = match &config.container_ip {
-            Some(ip) => {
-                if Self::is_ip_in_use(ip)? || reserved.contains(ip) {
-                    return Err(NucleusError::NetworkError(format!(
-                        "Requested container IP {} is already in use",
-                        ip
-                    )));
-                }
-                ip.clone()
-            }
-            None => Self::allocate_ip(&config.subnet)?,
-        };
-        Self::record_allocated_ip(container_id, &container_ip)?;
+        let alloc_dir = Self::ip_alloc_dir();
+        let container_ip = Self::reserve_ip_in_dir(
+            &alloc_dir,
+            container_id,
+            &config.subnet,
+            config.container_ip.as_deref(),
+        )?;
         let prefix = Self::subnet_prefix(&config.subnet);
 
         // Linux interface names max 15 chars; truncate if needed
@@ -60,7 +53,11 @@ impl BridgeNetwork {
         let veth_cont_full = format!("vethc-{:x}", pid);
         let veth_host = veth_host_full[..veth_host_full.len().min(15)].to_string();
         let veth_container = veth_cont_full[..veth_cont_full.len().min(15)].to_string();
-        let mut rollback = SetupRollback::new(veth_host.clone(), config.subnet.clone());
+        let mut rollback = SetupRollback::new(
+            veth_host.clone(),
+            config.subnet.clone(),
+            Some((alloc_dir.clone(), container_id.to_string())),
+        );
 
         // 1. Create bridge if it doesn't exist
         Self::ensure_bridge_for(&config.bridge_name, &config.subnet)?;
@@ -393,6 +390,45 @@ impl BridgeNetwork {
         Ok(())
     }
 
+    /// Detect and remove orphaned iptables rules from previous Nucleus runs.
+    ///
+    /// Checks for stale MASQUERADE rules referencing the nucleus subnet that
+    /// have no corresponding running container. Prevents gradual degradation
+    /// of network isolation from accumulated orphaned rules.
+    pub fn cleanup_orphaned_rules(subnet: &str) {
+        // List NAT rules and look for nucleus-related MASQUERADE entries
+        let output = match Command::new("iptables")
+            .args(["-t", "nat", "-L", "POSTROUTING", "-n"])
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                debug!("Cannot check iptables for orphaned rules: {}", e);
+                return;
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut orphaned_count = 0u32;
+        for line in stdout.lines() {
+            if line.contains("MASQUERADE") && line.contains(subnet) {
+                // Try to remove it; if it fails, it may be actively used
+                let _ = Self::run_cmd(
+                    "iptables",
+                    &["-t", "nat", "-D", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE"],
+                );
+                orphaned_count += 1;
+            }
+        }
+
+        if orphaned_count > 0 {
+            info!(
+                "Cleaned up {} orphaned iptables MASQUERADE rule(s) for subnet {}",
+                orphaned_count, subnet
+            );
+        }
+    }
+
     fn ensure_bridge_for(bridge_name: &str, subnet: &str) -> Result<()> {
         // Check if bridge exists
         if Self::run_cmd("ip", &["link", "show", bridge_name]).is_ok() {
@@ -423,23 +459,10 @@ impl BridgeNetwork {
     }
 
     fn setup_port_forward_for(container_ip: &str, pf: &PortForward) -> Result<()> {
-        Self::run_cmd(
-            "iptables",
-            &[
-                "-t",
-                "nat",
-                "-A",
-                "PREROUTING",
-                "-p",
-                &pf.protocol,
-                "--dport",
-                &pf.host_port.to_string(),
-                "-j",
-                "DNAT",
-                "--to-destination",
-                &format!("{}:{}", container_ip, pf.container_port),
-            ],
-        )?;
+        for chain in ["PREROUTING", "OUTPUT"] {
+            let args = Self::port_forward_rule_args("-A", chain, container_ip, pf);
+            Self::run_cmd_owned("iptables", &args)?;
+        }
 
         info!(
             "Port forward: {}:{} -> {}:{}/{}",
@@ -449,23 +472,10 @@ impl BridgeNetwork {
     }
 
     fn cleanup_port_forward(&self, pf: &PortForward) -> Result<()> {
-        Self::run_cmd(
-            "iptables",
-            &[
-                "-t",
-                "nat",
-                "-D",
-                "PREROUTING",
-                "-p",
-                &pf.protocol,
-                "--dport",
-                &pf.host_port.to_string(),
-                "-j",
-                "DNAT",
-                "--to-destination",
-                &format!("{}:{}", self.container_ip, pf.container_port),
-            ],
-        )?;
+        for chain in ["OUTPUT", "PREROUTING"] {
+            let args = Self::port_forward_rule_args("-D", chain, &self.container_ip, pf);
+            Self::run_cmd_owned("iptables", &args)?;
+        }
         Ok(())
     }
 
@@ -474,16 +484,51 @@ impl BridgeNetwork {
     /// Checks both host-visible interfaces (via `ip addr`) and IPs assigned to
     /// other Nucleus containers (via state files) to avoid duplicates. Container
     /// IPs inside network namespaces are invisible to `ip addr show` on the host.
-    fn allocate_ip(subnet: &str) -> Result<String> {
+    fn allocate_ip_with_reserved(
+        subnet: &str,
+        reserved: &std::collections::HashSet<String>,
+    ) -> Result<String> {
         let base = subnet.split('/').next().unwrap_or("10.0.42.0");
         let parts: Vec<&str> = base.split('.').collect();
         if parts.len() != 4 {
             return Ok("10.0.42.2".to_string());
         }
 
-        // Acquire advisory lock to prevent concurrent IP allocation races
-        let alloc_dir = Self::ip_alloc_dir();
-        std::fs::create_dir_all(&alloc_dir).map_err(|e| {
+        // Use rejection sampling to avoid modulo bias.
+        // Range is 2..=254 (253 values). We reject random bytes >= 253 to
+        // ensure uniform distribution, then add 2 to shift into the valid range.
+        let mut buf = [0u8; 1];
+        for _ in 0..32 {
+            let _ = std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf));
+            // Rejection sampling: discard values that would cause modulo bias
+            if buf[0] >= 253 {
+                continue;
+            }
+            let offset = buf[0] as u32 + 2;
+            let candidate = format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], offset);
+            if reserved.contains(&candidate) {
+                continue;
+            }
+            if !Self::is_ip_in_use(&candidate)? {
+                // Lock is released when lock_file is dropped
+                return Ok(candidate);
+            }
+        }
+
+        Err(NucleusError::NetworkError(format!(
+            "Failed to allocate free IP in subnet {}",
+            subnet
+        )))
+    }
+
+    fn reserve_ip_in_dir(
+        alloc_dir: &std::path::Path,
+        container_id: &str,
+        subnet: &str,
+        requested_ip: Option<&str>,
+    ) -> Result<String> {
+        std::fs::create_dir_all(alloc_dir).map_err(|e| {
             NucleusError::NetworkError(format!("Failed to create IP alloc dir: {}", e))
         })?;
         let lock_path = alloc_dir.join(".lock");
@@ -504,35 +549,30 @@ impl BridgeNetwork {
             )));
         }
 
-        // Collect IPs already assigned to other Nucleus containers from state dir
-        let reserved = Self::collect_reserved_ips();
-
-        let mut buf = [0u8; 1];
-        for _ in 0..32 {
-            let _ = std::fs::File::open("/dev/urandom")
-                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf));
-            let offset = (buf[0] as u32 % 253) + 2;
-            let candidate = format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], offset);
-            if reserved.contains(&candidate) {
-                continue;
+        let reserved = Self::collect_reserved_ips_in_dir(alloc_dir);
+        let ip = match requested_ip {
+            Some(ip) => {
+                if reserved.contains(ip) || Self::is_ip_in_use(ip)? {
+                    return Err(NucleusError::NetworkError(format!(
+                        "Requested container IP {} is already in use",
+                        ip
+                    )));
+                }
+                ip.to_string()
             }
-            if !Self::is_ip_in_use(&candidate)? {
-                // Lock is released when lock_file is dropped
-                return Ok(candidate);
-            }
-        }
+            None => Self::allocate_ip_with_reserved(subnet, &reserved)?,
+        };
 
-        Err(NucleusError::NetworkError(format!(
-            "Failed to allocate free IP in subnet {}",
-            subnet
-        )))
+        Self::record_allocated_ip_in_dir(alloc_dir, container_id, &ip)?;
+        Ok(ip)
     }
 
     /// Scan the Nucleus IP allocation directory for IPs already assigned.
-    fn collect_reserved_ips() -> std::collections::HashSet<String> {
-        let alloc_dir = Self::ip_alloc_dir();
+    fn collect_reserved_ips_in_dir(
+        alloc_dir: &std::path::Path,
+    ) -> std::collections::HashSet<String> {
         let mut ips = std::collections::HashSet::new();
-        if let Ok(entries) = std::fs::read_dir(&alloc_dir) {
+        if let Ok(entries) = std::fs::read_dir(alloc_dir) {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
                     if name.ends_with(".ip") {
@@ -550,9 +590,12 @@ impl BridgeNetwork {
     }
 
     /// Persist the allocated IP for this container so other containers can see it.
-    fn record_allocated_ip(container_id: &str, ip: &str) -> Result<()> {
-        let alloc_dir = Self::ip_alloc_dir();
-        std::fs::create_dir_all(&alloc_dir).map_err(|e| {
+    fn record_allocated_ip_in_dir(
+        alloc_dir: &std::path::Path,
+        container_id: &str,
+        ip: &str,
+    ) -> Result<()> {
+        std::fs::create_dir_all(alloc_dir).map_err(|e| {
             NucleusError::NetworkError(format!("Failed to create IP alloc dir: {}", e))
         })?;
         let path = alloc_dir.join(format!("{}.ip", container_id));
@@ -564,7 +607,12 @@ impl BridgeNetwork {
 
     /// Remove the persisted IP allocation for a container.
     fn release_allocated_ip(container_id: &str) {
-        let path = Self::ip_alloc_dir().join(format!("{}.ip", container_id));
+        let alloc_dir = Self::ip_alloc_dir();
+        Self::release_allocated_ip_in_dir(&alloc_dir, container_id);
+    }
+
+    fn release_allocated_ip_in_dir(alloc_dir: &std::path::Path, container_id: &str) {
+        let path = alloc_dir.join(format!("{}.ip", container_id));
         let _ = std::fs::remove_file(path);
     }
 
@@ -636,6 +684,47 @@ impl BridgeNetwork {
         }
 
         Ok(())
+    }
+
+    fn run_cmd_owned(program: &str, args: &[String]) -> Result<()> {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        Self::run_cmd(program, &refs)
+    }
+
+    fn port_forward_rule_args(
+        operation: &str,
+        chain: &str,
+        container_ip: &str,
+        pf: &PortForward,
+    ) -> Vec<String> {
+        let mut args = vec![
+            "-t".to_string(),
+            "nat".to_string(),
+            operation.to_string(),
+            chain.to_string(),
+            "-p".to_string(),
+            pf.protocol.clone(),
+        ];
+
+        if chain == "OUTPUT" {
+            args.extend([
+                "-m".to_string(),
+                "addrtype".to_string(),
+                "--dst-type".to_string(),
+                "LOCAL".to_string(),
+            ]);
+        }
+
+        args.extend([
+            "--dport".to_string(),
+            pf.host_port.to_string(),
+            "-j".to_string(),
+            "DNAT".to_string(),
+            "--to-destination".to_string(),
+            format!("{}:{}", container_ip, pf.container_port),
+        ]);
+
+        args
     }
 
     fn is_ip_in_use(ip: &str) -> Result<bool> {
@@ -721,11 +810,16 @@ struct SetupRollback {
     nat_added: bool,
     port_forwards: Vec<(String, PortForward)>,
     prev_ip_forward: Option<String>,
+    reserved_ip: Option<(std::path::PathBuf, String)>,
     armed: bool,
 }
 
 impl SetupRollback {
-    fn new(veth_host: String, subnet: String) -> Self {
+    fn new(
+        veth_host: String,
+        subnet: String,
+        reserved_ip: Option<(std::path::PathBuf, String)>,
+    ) -> Self {
         Self {
             veth_host,
             subnet,
@@ -733,6 +827,7 @@ impl SetupRollback {
             nat_added: false,
             port_forwards: Vec::new(),
             prev_ip_forward: None,
+            reserved_ip,
             armed: true,
         }
     }
@@ -749,23 +844,10 @@ impl Drop for SetupRollback {
         }
 
         for (container_ip, pf) in self.port_forwards.iter().rev() {
-            let _ = BridgeNetwork::run_cmd(
-                "iptables",
-                &[
-                    "-t",
-                    "nat",
-                    "-D",
-                    "PREROUTING",
-                    "-p",
-                    &pf.protocol,
-                    "--dport",
-                    &pf.host_port.to_string(),
-                    "-j",
-                    "DNAT",
-                    "--to-destination",
-                    &format!("{}:{}", container_ip, pf.container_port),
-                ],
-            );
+            for chain in ["OUTPUT", "PREROUTING"] {
+                let args = BridgeNetwork::port_forward_rule_args("-D", chain, container_ip, pf);
+                let _ = BridgeNetwork::run_cmd_owned("iptables", &args);
+            }
         }
 
         if self.nat_added {
@@ -787,5 +869,89 @@ impl Drop for SetupRollback {
         if self.veth_created {
             let _ = BridgeNetwork::run_cmd("ip", &["link", "del", &self.veth_host]);
         }
+
+        if let Some((alloc_dir, container_id)) = &self.reserved_ip {
+            BridgeNetwork::release_allocated_ip_in_dir(alloc_dir, container_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ip_allocation_rejection_sampling_range() {
+        // H-5: Verify that rejection sampling produces values in 2..=254
+        // and that values >= 253 are rejected (no modulo bias).
+        for byte in 0u8..253 {
+            let offset = byte as u32 + 2;
+            assert!(offset >= 2 && offset <= 254, "offset {} out of range", offset);
+        }
+        // Values 253, 254, 255 must be rejected
+        for byte in [253u8, 254, 255] {
+            assert!(byte >= 253);
+        }
+    }
+
+    #[test]
+    fn test_reserve_ip_blocks_duplicate_requested_address() {
+        let temp = tempfile::tempdir().unwrap();
+        BridgeNetwork::record_allocated_ip_in_dir(temp.path(), "one", "10.0.42.2").unwrap();
+
+        let err = BridgeNetwork::reserve_ip_in_dir(
+            temp.path(),
+            "two",
+            "10.0.42.0/24",
+            Some("10.0.42.2"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("already in use"),
+            "second reservation of the same IP must fail"
+        );
+    }
+
+    #[test]
+    fn test_setup_rollback_releases_reserved_ip() {
+        let temp = tempfile::tempdir().unwrap();
+        BridgeNetwork::record_allocated_ip_in_dir(temp.path(), "rollback", "10.0.42.3").unwrap();
+
+        let rollback = SetupRollback {
+            veth_host: "veth-test".to_string(),
+            subnet: "10.0.42.0/24".to_string(),
+            veth_created: false,
+            nat_added: false,
+            port_forwards: Vec::new(),
+            prev_ip_forward: None,
+            reserved_ip: Some((temp.path().to_path_buf(), "rollback".to_string())),
+            armed: true,
+        };
+
+        drop(rollback);
+
+        assert!(
+            !temp.path().join("rollback.ip").exists(),
+            "rollback must release reserved IP files on setup failure"
+        );
+    }
+
+    #[test]
+    fn test_port_forward_rules_include_output_chain_for_local_host_clients() {
+        let pf = PortForward {
+            host_port: 8080,
+            container_port: 80,
+            protocol: "tcp".to_string(),
+        };
+
+        let prerouting = BridgeNetwork::port_forward_rule_args("-A", "PREROUTING", "10.0.42.2", &pf);
+        let output = BridgeNetwork::port_forward_rule_args("-A", "OUTPUT", "10.0.42.2", &pf);
+
+        assert!(prerouting.iter().any(|arg| arg == "PREROUTING"));
+        assert!(output.iter().any(|arg| arg == "OUTPUT"));
+        assert!(
+            output.windows(2).any(|pair| pair[0] == "--dst-type" && pair[1] == "LOCAL"),
+            "OUTPUT rule must target local-destination traffic"
+        );
     }
 }

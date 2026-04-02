@@ -14,19 +14,27 @@ Nucleus is a minimalist container runtime for Linux. It provides isolated execut
 - **gVisor integration** – Optional application kernel for enhanced security, including networked service mode
 - **Production service support** – Declarative NixOS module, egress policies, health checks, secrets mounting, sd_notify, and journald integration
 - **Minimal rootfs** – Replace host bind mounts with a purpose-built Nix store closure for production services
+- **External security policies** – Per-service seccomp profiles (JSON), capability policies (TOML), and Landlock rules (TOML) with SHA-256 pinning
+- **Seccomp profile generation** – Trace mode records syscalls, then `nucleus seccomp generate` creates a minimal allowlist profile
+- **Multi-container topologies** – Compose-equivalent TOML format with dependency DAG, reconciliation, and NixOS systemd integration
+- **Integrity & audit controls** – Structured audit log, context hashing, rootfs attestation, seccomp deny logging, mount flag verification, and kernel lockdown assertions
+- **Structured telemetry** – Optional OpenTelemetry export for container lifecycle tracing
 - **Linux-native** – Runs on standard Linux and NixOS
 
 ## Architecture
 
 Nucleus leverages Linux kernel isolation primitives:
 
-- **Namespaces** – PID, mount, network, UTS, IPC, user isolation
+- **Namespaces** – PID, mount, network, UTS, IPC, user, cgroup, and optional time isolation
 - **cgroups v2** – Resource limits (CPU, memory, PIDs, I/O)
 - **pivot_root** – Filesystem isolation (chroot fallback available in agent mode only)
-- **Capabilities** – All capabilities dropped (irreversible)
-- **seccomp** – Syscall whitelist filtering (irreversible)
-- **Landlock** – Path-based filesystem access control (Linux 5.13+)
+- **Capabilities** – All capabilities dropped by default, or configured via TOML policy file (irreversible)
+- **seccomp** – Syscall whitelist filtering with per-service JSON profiles and trace-based generation (irreversible)
+- **Landlock** – Path-based filesystem access control via hardcoded defaults or TOML policy file (Linux 5.13+)
 - **gVisor** – Optional application kernel (runsc) with None/Sandbox/Host network modes
+- **PID 1 init** – Mini-init supervisor in production mode for zombie reaping and signal forwarding
+- **In-memory secrets** – Dedicated tmpfs at `/run/secrets` with volatile zeroing of source buffers
+- **Mount audit** – Post-setup verification of mount flags in production mode
 
 Container filesystem is backed by tmpfs and either populated with context files (agent mode) or mounted from a pre-built Nix rootfs closure (production mode).
 
@@ -75,6 +83,9 @@ nucleus run --network bridge -p 8080:80 -- ./server
 # Context streaming (bind mount for instant access)
 nucleus run --context ./large-dir/ --context-mode bind -- ./agent
 
+# Integrity and audit hardening
+nucleus run --context ./ctx/ --verify-context-integrity --seccomp-log-denied -- ./agent
+
 # Environment variables
 nucleus run -e API_KEY=secret -e DEBUG=1 -- ./agent
 ```
@@ -95,6 +106,8 @@ nucleus run \
   --trust-level trusted \
   --memory 1G --cpus 2 --pids 256 \
   --rootfs /nix/store/...-my-service-rootfs \
+  --verify-rootfs-attestation \
+  --require-kernel-lockdown integrity \
   --network bridge --dns 10.0.0.1 \
   --egress-allow 10.0.0.0/8 --egress-tcp-port 443 --egress-tcp-port 8443 \
   --health-cmd "curl -sf http://localhost:8080/health" \
@@ -109,10 +122,148 @@ nucleus run \
 nucleus run \
   --service-mode production \
   --runtime gvisor \
+  --gvisor-platform kvm \
   --memory 512M \
   --network bridge --dns 10.0.0.1 \
   --rootfs /nix/store/...-proxy-rootfs \
   -- /bin/proxy
+```
+
+### Security Policy Files
+
+Nix defines the service (what runs). Separate files define security policy (what the process is allowed to do at the kernel level). This separation keeps security config auditable, tool-compatible, and on its own change cadence.
+
+```bash
+# Run with external security policies
+nucleus run \
+  --service-mode production \
+  --rootfs /nix/store/...-my-service-rootfs \
+  --memory 512M --cpus 1 \
+  --seccomp-profile ./config/my-service.seccomp.json \
+  --seccomp-profile-sha256 abc123... \
+  --caps-policy ./config/my-service.caps.toml \
+  --landlock-policy ./config/my-service.landlock.toml \
+  -- /bin/my-service
+```
+
+**Seccomp profile** (JSON — OCI-native format, tooling emits it directly):
+```json
+{
+  "defaultAction": "SCMP_ACT_KILL_PROCESS",
+  "architectures": ["SCMP_ARCH_X86_64"],
+  "syscalls": [
+    {
+      "names": ["read", "write", "close", "openat", "fstat",
+                "mmap", "munmap", "brk", "futex", "clock_gettime"],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}
+```
+
+**Capability policy** (TOML):
+```toml
+# config/my-service.caps.toml
+[bounding]
+keep = []          # empty = drop all
+
+[ambient]
+keep = []
+```
+
+**Landlock policy** (TOML):
+```toml
+# config/my-service.landlock.toml
+min_abi = 3
+
+[[rules]]
+path = "/bin"
+access = ["read", "execute"]
+
+[[rules]]
+path = "/etc/myservice"
+access = ["read"]
+
+[[rules]]
+path = "/run/secrets"
+access = ["read"]
+
+[[rules]]
+path = "/tmp"
+access = ["read", "write", "create", "remove"]
+```
+
+### Seccomp Profile Generation
+
+Profiles shouldn't be hand-written from scratch. Use trace mode to record actual syscall usage, then generate a minimal profile:
+
+```bash
+# 1. Run in trace mode — all syscalls allowed but logged
+nucleus run \
+  --seccomp-mode trace \
+  --seccomp-log ./trace.ndjson \
+  --rootfs /nix/store/...-my-service-rootfs \
+  --memory 512M \
+  -- /bin/my-service
+
+# 2. Generate minimal profile from trace
+nucleus seccomp generate ./trace.ndjson -o config/my-service.seccomp.json
+
+# 3. Review and tighten (remove anything surprising)
+# 4. Commit — Nix pins the SHA-256 hash
+# 5. Run in enforce mode
+nucleus run \
+  --seccomp-profile ./config/my-service.seccomp.json \
+  --seccomp-profile-sha256 "$(sha256sum config/my-service.seccomp.json | cut -d' ' -f1)" \
+  -- /bin/my-service
+```
+
+Trace mode requires root or `CAP_SYSLOG` (reads `/dev/kmsg`). It is rejected in production mode — it is a development tool only.
+
+### Multi-Container Topologies
+
+Nucleus includes a Compose-equivalent for managing multi-container stacks using TOML configuration with dependency ordering.
+
+```toml
+# topology.toml
+name = "myapp"
+
+[networks.internal]
+subnet = "10.42.0.0/24"
+
+[services.postgres]
+rootfs = "/nix/store/...-postgres"
+command = ["postgres", "-D", "/var/lib/postgresql/data"]
+memory = "2G"
+cpus = 2.0
+networks = ["internal"]
+health_check = "pg_isready -U myapp"
+
+[services.web]
+rootfs = "/nix/store/...-web"
+command = ["/bin/web-server"]
+memory = "512M"
+networks = ["internal"]
+port_forwards = ["8443:8443"]
+egress_allow = ["10.42.0.0/24"]
+
+[[services.web.depends_on]]
+service = "postgres"
+condition = "healthy"
+```
+
+```bash
+# Validate topology and show dependency order
+nucleus compose validate -f topology.toml
+
+# Bring up all services in dependency order
+nucleus compose up -f topology.toml
+
+# Show service status
+nucleus compose ps -f topology.toml
+
+# Tear down in reverse dependency order
+nucleus compose down -f topology.toml
 ```
 
 ### Container Management
@@ -200,6 +351,19 @@ in
       cpus = 2.0;
       pids = 256;
 
+      # Security policy files (separate from Nix, auditable by security engineers)
+      seccompProfile = {
+        path = ./config/sigid-proxy.seccomp.json;
+        sha256 = "abc123...";  # Nix verifies at build time
+      };
+      capsPolicy = ./config/sigid-proxy.caps.toml;
+      landlockPolicy = ./config/sigid-proxy.landlock.toml;
+
+      # Optional hardening toggles
+      verifyRootfsAttestation = true;
+      seccompLogDenied = true;
+      requireKernelLockdown = "integrity";
+
       # Networking
       network = "bridge";
       dns = [ "10.0.0.1" ];  # internal resolver — no public DNS default
@@ -233,6 +397,26 @@ in
 }
 ```
 
+### Topology Services
+
+Topologies can also be managed as systemd services:
+
+```nix
+{
+  services.nucleus = {
+    enable = true;
+    package = nucleus.packages.x86_64-linux.default;
+
+    topologies.myapp = {
+      enable = true;
+      configFile = ./topology.toml;
+    };
+  };
+}
+```
+
+This creates a `nucleus-topology-myapp.service` (Type=oneshot, RemainAfterExit) that runs `nucleus compose up` on start and `nucleus compose down` on stop.
+
 ### What the Module Generates
 
 For each enabled container, the module creates a systemd service:
@@ -263,6 +447,8 @@ nucleus.lib.mkRootfs {
 
 This produces a Nix store path containing `/bin`, `/lib`, `/etc`, etc. from the specified packages. It is mounted read-only inside the container, replacing the host bind mounts used in agent mode.
 
+`mkRootfs` also emits a `.nucleus-rootfs-sha256` manifest at the root of the closure. Use `--verify-rootfs-attestation` or `verifyRootfsAttestation = true;` to require that manifest to match the mounted rootfs at startup.
+
 ## Production Mode vs Agent Mode
 
 | Feature | Agent Mode | Production Mode |
@@ -274,11 +460,17 @@ This produces a Nix store path containing `/bin`, `/lib`, `/etc`, etc. from the 
 | Cgroup limits | Best-effort | Required (fatal on failure) |
 | Bridge DNS | Defaults to 8.8.8.8/8.8.4.4 | Must be configured explicitly |
 | Rootfs | Host bind mounts (/bin, /usr, /lib, /nix) | Pre-built Nix closure (`--rootfs`) |
-| Egress policy | Optional | Optional (fatal on apply failure) |
+| Egress policy | Optional | Deny-all default (fatal on apply failure) |
 | Memory limit | Optional | Required |
+| PID 1 init | Direct exec | Mini-init with zombie reaping + signal forwarding |
+| Secrets | Bind mount | In-memory tmpfs with volatile zeroing |
+| /proc | Mounted normally | `hidepid=2` (hides other processes) |
+| Mount audit | Skipped | Post-setup flag verification (fatal) |
+| Seccomp trace mode | Allowed | Forbidden |
+| Landlock ABI | Best-effort | V3 minimum required |
 | Health checks | Optional | Optional |
 | sd_notify | Optional | Optional |
-| Secrets mounting | Optional | Optional |
+| Security policies | Optional | Optional (recommended) |
 
 ## Egress Policy
 
@@ -315,6 +507,26 @@ When using gVisor (`--runtime gvisor`), the network mode is automatically select
 
 The `sandbox` mode gives gVisor-isolated services full network access through gVisor's user-space TCP/IP stack, without exposing the host kernel's network code.
 
+## Additional Hardening Flags
+
+- `--seccomp-profile <path>` loads a custom per-service seccomp profile (OCI JSON format).
+- `--seccomp-profile-sha256 <hex>` verifies the profile's SHA-256 hash before loading.
+- `--seccomp-mode trace|enforce` switches between trace (record all syscalls) and enforce (default).
+- `--seccomp-log <path>` writes NDJSON syscall trace when in trace mode.
+- `--caps-policy <path>` loads a TOML capability policy (replaces default drop-all).
+- `--caps-policy-sha256 <hex>` verifies the capability policy hash.
+- `--landlock-policy <path>` loads a TOML Landlock filesystem policy (replaces default rules).
+- `--landlock-policy-sha256 <hex>` verifies the Landlock policy hash.
+- `--verify-context-integrity` hashes the source context tree before launch and verifies the populated `/context` tree matches.
+- `--verify-rootfs-attestation` requires a `.nucleus-rootfs-sha256` manifest and verifies the mounted rootfs against it.
+- `--seccomp-log-denied` requests kernel logging for denied seccomp decisions when the host supports `SECCOMP_FILTER_FLAG_LOG`.
+- `--require-kernel-lockdown integrity|confidentiality` refuses startup unless `/sys/kernel/security/lockdown` satisfies the requested mode.
+- `--gvisor-platform systrap|kvm|ptrace` selects the runsc backend explicitly.
+- `--time-namespace` enables Linux time namespaces for native containers.
+- `--disable-cgroup-namespace` turns off cgroup namespace isolation when a workload needs the host cgroup view.
+
+If `NUCLEUS_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` is set, Nucleus exports lifecycle spans over OTLP in addition to normal local logging.
+
 ## Development
 
 This project uses Nix flakes for reproducible builds:
@@ -347,13 +559,28 @@ nucleus/
 │   ├── container/      # Container orchestration, lifecycle, state, config
 │   ├── isolation/      # Namespace management, user mapping, attach
 │   ├── resources/      # cgroup v2 resource control, stats
-│   ├── filesystem/     # tmpfs, rootfs mounting, context population, secrets
-│   ├── security/       # Capabilities, seccomp, Landlock, gVisor, OCI
+│   ├── filesystem/     # tmpfs, rootfs mounting, context population, secrets, attestation
+│   ├── security/       # Capabilities, seccomp, Landlock, gVisor, OCI, policy files
+│   │   ├── caps_policy.rs       # TOML capability policy loader
+│   │   ├── landlock_policy.rs   # TOML Landlock policy loader
+│   │   ├── seccomp_trace.rs     # Seccomp trace mode (syscall recording)
+│   │   ├── seccomp_generate.rs  # Profile generator from traces
+│   │   └── policy.rs            # Shared policy infrastructure (SHA-256, TOML/JSON loaders)
 │   ├── network/        # Networking (none/host/bridge), egress policy
+│   ├── topology/       # Multi-container topology (Compose equivalent)
+│   │   ├── config.rs   # TOML topology config (services, networks, volumes)
+│   │   ├── dag.rs      # Dependency DAG with topological sort
+│   │   ├── reconcile.rs # Diff running vs desired state, apply changes
+│   │   └── dns.rs      # Per-topology /etc/hosts DNS
 │   ├── checkpoint/     # CRIU checkpoint/restore
+│   ├── audit.rs        # Structured audit log (JSON events)
 │   └── error.rs        # Error types
 ├── nix/
-│   └── module.nix      # NixOS module for declarative service management
+│   └── module.nix      # NixOS module (containers + topologies)
+├── config/             # Security policy files (per-service)
+│   ├── *.seccomp.json  # Seccomp syscall allowlists (OCI format)
+│   ├── *.caps.toml     # Capability bounding set policies
+│   └── *.landlock.toml # Landlock filesystem access rules
 ├── tests/
 │   ├── model_based_*   # Property-based tests from TLA+ specs
 │   └── tla_*           # tla-connect driver tests

@@ -47,9 +47,9 @@ impl ContainerAttach {
 
         // Open namespace file descriptors (include user namespace when present)
         let ns_types = if state.rootless {
-            &["user", "pid", "mnt", "net", "uts", "ipc"][..]
+            &["user", "pid", "mnt", "net", "uts", "ipc", "cgroup"][..]
         } else {
-            &["pid", "mnt", "net", "uts", "ipc"][..]
+            &["pid", "mnt", "net", "uts", "ipc", "cgroup"][..]
         };
         let mut ns_fds: Vec<(String, File)> = Vec::new();
 

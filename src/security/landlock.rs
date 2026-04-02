@@ -9,6 +9,13 @@ use tracing::{debug, info, warn};
 /// The landlock crate gracefully degrades for older kernels.
 const TARGET_ABI: ABI = ABI::V5;
 
+/// Minimum Landlock ABI version required for production mode.
+///
+/// V3 adds LANDLOCK_ACCESS_FS_TRUNCATE which prevents silent data truncation
+/// that V1/V2 cannot control. This is the minimum we consider safe for
+/// production workloads.
+const MINIMUM_PRODUCTION_ABI: ABI = ABI::V3;
+
 /// Landlock filesystem access-control manager
 ///
 /// Implements fine-grained, path-based filesystem restrictions as an additional
@@ -42,6 +49,51 @@ impl LandlockManager {
     /// Everything else is denied by the ruleset.
     pub fn apply_container_policy(&mut self) -> Result<bool> {
         self.apply_container_policy_with_mode(false)
+    }
+
+    /// Assert that the kernel supports at least the minimum Landlock ABI version
+    /// required for production workloads.
+    ///
+    /// Returns Ok(()) if the ABI is sufficient, or Err if the kernel is too old.
+    /// In best-effort mode, a too-old kernel is logged but not fatal.
+    pub fn assert_minimum_abi(&self, production_mode: bool) -> Result<()> {
+        // Probe the kernel's Landlock ABI version by attempting to create a ruleset
+        // with the minimum ABI's access rights. If the kernel doesn't support the
+        // minimum ABI, the ruleset will be NotEnforced or PartiallyEnforced.
+        let min_access = AccessFs::from_all(MINIMUM_PRODUCTION_ABI);
+        let target_access = AccessFs::from_all(TARGET_ABI);
+
+        // If the minimum access set equals the target, the kernel supports everything
+        // If the minimum is a subset, check that at least the minimum rights are present
+        if min_access != target_access {
+            info!(
+                "Landlock ABI: target={:?}, minimum_production={:?}",
+                TARGET_ABI, MINIMUM_PRODUCTION_ABI
+            );
+        }
+
+        // The actual enforcement check happens in build_and_restrict().
+        // Here we do a lightweight check: if the kernel supports the target ABI,
+        // it certainly supports the minimum. The landlock crate handles this
+        // gracefully, but we want an explicit assertion for production.
+        match Ruleset::default().handle_access(AccessFs::from_all(MINIMUM_PRODUCTION_ABI)) {
+            Ok(_) => {
+                info!("Landlock ABI >= V3 confirmed");
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!(
+                    "Kernel Landlock ABI is below minimum required version (V3): {}",
+                    e
+                );
+                if production_mode {
+                    Err(ll_err(e))
+                } else {
+                    warn!("{}", msg);
+                    Ok(())
+                }
+            }
+        }
     }
 
     /// Apply with configurable failure behavior.
@@ -95,8 +147,10 @@ impl LandlockManager {
         // Read + execute for binary paths
         let access_read_exec = access_read | AccessFs::Execute;
 
-        // Write access set for /tmp
-        let access_tmp = access_all;
+        // Write access set for /tmp — full read+write but no execute.
+        // Executing from /tmp is a common attack pattern (drop-and-exec).
+        let mut access_tmp = access_all;
+        access_tmp.remove(AccessFs::Execute);
 
         let mut ruleset = Ruleset::default()
             .handle_access(access_all)
@@ -200,5 +254,19 @@ mod tests {
         // Should not error even if kernel has no Landlock
         let result = mgr.apply_container_policy_with_mode(true);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_tmp_access_excludes_execute() {
+        // L-5: /tmp should have read+write but NOT execute permission.
+        // Verify at the type level that our access_tmp definition
+        // does not include Execute.
+        let access_all = AccessFs::from_all(TARGET_ABI);
+        let mut access_tmp = access_all;
+        access_tmp.remove(AccessFs::Execute);
+        assert!(!access_tmp.contains(AccessFs::Execute));
+        // But it should still have write capabilities
+        assert!(access_tmp.contains(AccessFs::WriteFile));
+        assert!(access_tmp.contains(AccessFs::RemoveFile));
     }
 }

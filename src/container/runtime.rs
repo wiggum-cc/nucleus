@@ -1,17 +1,21 @@
+use crate::audit::{audit, audit_error, AuditEventType};
 use crate::container::{
-    ContainerConfig, ContainerState, ContainerStateManager, ServiceMode, TrustLevel,
+    ContainerConfig, ContainerState, ContainerStateManager, KernelLockdownMode, ServiceMode,
+    TrustLevel,
 };
 use crate::error::{NucleusError, Result};
 use crate::filesystem::{
-    bind_mount_host_paths, bind_mount_rootfs, create_dev_nodes, create_minimal_fs, mask_proc_paths,
-    mount_procfs, mount_secrets, switch_root, FilesystemState, LazyContextPopulator, TmpfsMount,
+    audit_mounts, bind_mount_host_paths, bind_mount_rootfs, create_dev_nodes, create_minimal_fs,
+    mask_proc_paths, mount_procfs, mount_secrets, mount_secrets_inmemory, snapshot_context_dir,
+    switch_root, verify_context_manifest, verify_rootfs_attestation, ContextPopulator,
+    FilesystemState, LazyContextPopulator, TmpfsMount, resolve_container_destination,
 };
 use crate::isolation::NamespaceManager;
 use crate::network::{BridgeNetwork, NetworkMode};
 use crate::resources::Cgroup;
 use crate::security::{
-    CapabilityManager, GVisorNetworkMode, GVisorRuntime, LandlockManager, OciBundle, OciConfig,
-    OciMount, SeccompManager, SecurityState,
+    seccomp_trace::SeccompTraceReader, CapabilityManager, GVisorNetworkMode, GVisorRuntime,
+    LandlockManager, OciBundle, OciConfig, OciMount, SeccompManager, SecurityState,
 };
 use nix::sys::signal::{kill, Signal};
 use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
@@ -20,7 +24,7 @@ use nix::unistd::{fork, pipe, read, write, ForkResult, Pid};
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd};
 use tempfile::Builder;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, warn};
 
 /// Container runtime that orchestrates all isolation mechanisms
 ///
@@ -49,9 +53,32 @@ impl Container {
     ///
     /// This orchestrates all components according to the formal specifications
     pub fn run(&self) -> Result<i32> {
+        let lifecycle_span = info_span!(
+            "container.lifecycle",
+            container.id = %self.config.id,
+            container.name = %self.config.name,
+            runtime = if self.config.use_gvisor { "gvisor" } else { "native" }
+        );
+        let _enter = lifecycle_span.enter();
+
         info!(
             "Starting container: {} (ID: {})",
             self.config.name, self.config.id
+        );
+        audit(
+            &self.config.id,
+            &self.config.name,
+            AuditEventType::ContainerStart,
+            format!(
+                "command={:?} mode={:?} runtime={}",
+                self.config.command,
+                self.config.service_mode,
+                if self.config.use_gvisor {
+                    "gvisor"
+                } else {
+                    "native"
+                }
+            ),
         );
 
         // Auto-detect if we need rootless mode
@@ -66,9 +93,11 @@ impl Container {
 
         // Validate production mode invariants before anything else.
         config.validate_production_mode()?;
+        Self::assert_kernel_lockdown(&config)?;
 
         Self::apply_network_mode_guards(&mut config, is_root)?;
         Self::apply_trust_level_guards(&mut config)?;
+        config.validate_runtime_support()?;
 
         // Bridge networking requires root
         if matches!(config.network, NetworkMode::Bridge(_)) && !is_root {
@@ -186,7 +215,7 @@ impl Container {
                     .limits
                     .cpu_quota_us
                     .map(|quota| (quota * 1000) / config.limits.cpu_period_us);
-                let state = ContainerState::new(
+                let mut state = ContainerState::new(
                     config.id.clone(),
                     config.name.clone(),
                     target_pid,
@@ -197,9 +226,11 @@ impl Container {
                     config.user_ns_config.is_some(),
                     cgroup_path,
                 );
+                state.config_hash = config.config_hash;
 
                 let mut bridge_net: Option<BridgeNetwork> = None;
                 let mut child_waited = false;
+                let mut trace_reader = Self::maybe_start_seccomp_trace_reader(&config, target_pid)?;
                 let run_result: Result<i32> = (|| {
                     state_mgr.save_state(&state)?;
 
@@ -278,9 +309,22 @@ impl Container {
                     let _ = waitpid(child, None);
                 }
 
+                if let Some(reader) = trace_reader.take() {
+                    reader.stop_and_flush();
+                }
+
                 if let Some(cgroup) = cgroup_opt {
                     if let Err(e) = cgroup.cleanup() {
                         warn!("Failed to cleanup cgroup: {}", e);
+                    }
+                }
+
+                if config.use_gvisor {
+                    if let Err(e) = Self::cleanup_gvisor_artifacts(&config.id) {
+                        warn!(
+                            "Failed to cleanup gVisor artifacts for {}: {}",
+                            config.id, e
+                        );
                     }
                 }
 
@@ -290,13 +334,27 @@ impl Container {
 
                 match run_result {
                     Ok(exit_code) => {
+                        audit(
+                            &config.id,
+                            &config.name,
+                            AuditEventType::ContainerStop,
+                            format!("exit_code={}", exit_code),
+                        );
                         info!(
                             "Container {} ({}) exited with code {}",
                             config.name, config.id, exit_code
                         );
                         Ok(exit_code)
                     }
-                    Err(e) => Err(e),
+                    Err(e) => {
+                        audit_error(
+                            &config.id,
+                            &config.name,
+                            AuditEventType::ContainerStop,
+                            format!("error={}", e),
+                        );
+                        Err(e)
+                    }
                 }
             }
             ForkResult::Child => {
@@ -323,6 +381,15 @@ impl Container {
     fn setup_and_exec(&self, ready_pipe: Option<OwnedFd>) -> Result<()> {
         let is_rootless = self.config.user_ns_config.is_some();
         let allow_degraded_security = Self::allow_degraded_security(&self.config);
+        let context_manifest = if self.config.verify_context_integrity {
+            self.config
+                .context_dir
+                .as_ref()
+                .map(|dir| snapshot_context_dir(dir))
+                .transpose()?
+        } else {
+            None
+        };
 
         // Initialize state machines
         let mut fs_state = FilesystemState::Unmounted;
@@ -393,11 +460,17 @@ impl Container {
         if let Some(context_dir) = &self.config.context_dir {
             let context_dest = container_root.join("context");
             LazyContextPopulator::populate(&self.config.context_mode, context_dir, &context_dest)?;
+            if let Some(expected) = &context_manifest {
+                verify_context_manifest(expected, &context_dest)?;
+            }
         }
         fs_state = fs_state.transition(FilesystemState::Populated)?;
 
         // 7. Mount runtime paths: either a pre-built rootfs or host bind mounts
         if let Some(ref rootfs_path) = self.config.rootfs_path {
+            if self.config.verify_rootfs_attestation {
+                verify_rootfs_attestation(rootfs_path)?;
+            }
             bind_mount_rootfs(&container_root, rootfs_path)?;
         } else {
             bind_mount_host_paths(&container_root, is_rootless)?;
@@ -414,12 +487,22 @@ impl Container {
             }
         }
 
-        // 7c. Mount secrets
-        mount_secrets(&container_root, &self.config.secrets)?;
+        // 7c. Mount secrets (in-memory tmpfs for production, bind-mount for agent mode)
+        if self.config.service_mode == ServiceMode::Production {
+            mount_secrets_inmemory(&container_root, &self.config.secrets)?;
+        } else {
+            mount_secrets(&container_root, &self.config.secrets)?;
+        }
 
-        // 8. Mount procfs
+        // 8. Mount procfs (hidepid=2 in production mode to prevent PID enumeration)
         let proc_path = container_root.join("proc");
-        mount_procfs(&proc_path, is_rootless, self.config.proc_readonly)?;
+        let hide_pids = self.config.service_mode == ServiceMode::Production;
+        mount_procfs(
+            &proc_path,
+            is_rootless,
+            self.config.proc_readonly,
+            hide_pids,
+        )?;
 
         // 8b. Mask sensitive /proc paths to reduce kernel info leakage
         mask_proc_paths(&proc_path)?;
@@ -430,13 +513,48 @@ impl Container {
         fs_state = fs_state.transition(FilesystemState::Pivoted)?;
         debug!("Filesystem state: {:?}", fs_state);
 
+        // 10b. Audit mount flags to verify filesystem hardening invariants
+        audit_mounts(self.config.service_mode == ServiceMode::Production)?;
+        audit(
+            &self.config.id,
+            &self.config.name,
+            AuditEventType::MountAuditPassed,
+            "all mount flags verified",
+        );
+
         // 11. Ensure no_new_privs before applying additional hardening.
         self.enforce_no_new_privs()?;
+        audit(
+            &self.config.id,
+            &self.config.name,
+            AuditEventType::NoNewPrivsSet,
+            "prctl(PR_SET_NO_NEW_PRIVS, 1) applied",
+        );
 
-        // 12. Drop capabilities
+        // 12. Drop capabilities (from policy file or default drop-all)
         // Security: Privileged -> CapabilitiesDropped
         let mut cap_mgr = CapabilityManager::new();
-        cap_mgr.drop_all()?;
+        if let Some(ref policy_path) = self.config.caps_policy {
+            let policy: crate::security::CapsPolicy = crate::security::load_toml_policy(
+                policy_path,
+                self.config.caps_policy_sha256.as_deref(),
+            )?;
+            policy.apply(&mut cap_mgr)?;
+            audit(
+                &self.config.id,
+                &self.config.name,
+                AuditEventType::CapabilitiesDropped,
+                format!("capability policy applied from {:?}", policy_path),
+            );
+        } else {
+            cap_mgr.drop_all()?;
+            audit(
+                &self.config.id,
+                &self.config.name,
+                AuditEventType::CapabilitiesDropped,
+                "all capabilities dropped including bounding set",
+            );
+        }
         sec_state = sec_state.transition(SecurityState::CapabilitiesDropped)?;
 
         // 12b. RLIMIT backstop: defense-in-depth against fork bombs and fd exhaustion.
@@ -467,14 +585,51 @@ impl Container {
             }
         }
 
-        // 13. Apply seccomp filter
+        // 13. Apply seccomp filter (trace, profile-from-file, or built-in allowlist)
         // Security: CapabilitiesDropped -> SeccompApplied
+        use crate::container::config::SeccompMode;
         let mut seccomp_mgr = SeccompManager::new();
         let allow_network = !matches!(self.config.network, NetworkMode::None);
-        let seccomp_applied =
-            seccomp_mgr.apply_filter_for_network_mode(allow_network, allow_degraded_security)?;
+        let seccomp_applied = match self.config.seccomp_mode {
+            SeccompMode::Trace => {
+                audit(
+                    &self.config.id,
+                    &self.config.name,
+                    AuditEventType::SeccompApplied,
+                    "seccomp trace mode: allow-all + LOG",
+                );
+                seccomp_mgr.apply_trace_filter()?
+            }
+            SeccompMode::Enforce => {
+                if let Some(ref profile_path) = self.config.seccomp_profile {
+                    audit(
+                        &self.config.id,
+                        &self.config.name,
+                        AuditEventType::SeccompProfileLoaded,
+                        format!("path={:?}", profile_path),
+                    );
+                    seccomp_mgr.apply_profile_from_file(
+                        profile_path,
+                        self.config.seccomp_profile_sha256.as_deref(),
+                        self.config.seccomp_log_denied,
+                    )?
+                } else {
+                    seccomp_mgr.apply_filter_for_network_mode(
+                        allow_network,
+                        allow_degraded_security,
+                        self.config.seccomp_log_denied,
+                    )?
+                }
+            }
+        };
         if seccomp_applied {
             sec_state = sec_state.transition(SecurityState::SeccompApplied)?;
+            audit(
+                &self.config.id,
+                &self.config.name,
+                AuditEventType::SeccompApplied,
+                format!("network={}", allow_network),
+            );
         } else if !allow_degraded_security {
             return Err(NucleusError::SeccompError(
                 "Seccomp filter is required but was not enforced".to_string(),
@@ -483,13 +638,35 @@ impl Container {
             warn!("Seccomp not enforced; container is running with degraded hardening");
         }
 
-        // 14. Apply Landlock filesystem policy
-        let mut landlock_mgr = LandlockManager::new();
-        let landlock_applied =
-            landlock_mgr.apply_container_policy_with_mode(allow_degraded_security)?;
+        // 14. Apply Landlock policy (from policy file or default hardcoded rules)
+        let landlock_applied = if let Some(ref policy_path) = self.config.landlock_policy {
+            let policy: crate::security::LandlockPolicy = crate::security::load_toml_policy(
+                policy_path,
+                self.config.landlock_policy_sha256.as_deref(),
+            )?;
+            policy.apply(allow_degraded_security)?
+        } else {
+            let mut landlock_mgr = LandlockManager::new();
+            landlock_mgr.assert_minimum_abi(self.config.service_mode == ServiceMode::Production)?;
+            landlock_mgr.apply_container_policy_with_mode(allow_degraded_security)?
+        };
         if seccomp_applied && landlock_applied {
             sec_state = sec_state.transition(SecurityState::LandlockApplied)?;
-            sec_state = sec_state.transition(SecurityState::Locked)?;
+            if self.config.seccomp_mode == SeccompMode::Trace {
+                warn!("Security state NOT locked: seccomp in trace mode (allow-all)");
+            } else {
+                sec_state = sec_state.transition(SecurityState::Locked)?;
+            }
+            audit(
+                &self.config.id,
+                &self.config.name,
+                AuditEventType::LandlockApplied,
+                if self.config.seccomp_mode == SeccompMode::Trace {
+                    "landlock applied, but seccomp in trace mode — not locked".to_string()
+                } else {
+                    "security state locked: all hardening layers active".to_string()
+                },
+            );
         } else if !allow_degraded_security {
             return Err(NucleusError::LandlockError(
                 "Landlock policy is required but was not enforced".to_string(),
@@ -499,7 +676,13 @@ impl Container {
         }
         debug!("Security state: {:?}", sec_state);
 
-        // 15. Exec target process
+        // 15. In production mode with PID namespace, run as a mini-init (PID 1)
+        // that reaps zombies and forwards signals, rather than exec-ing directly.
+        if self.config.service_mode == ServiceMode::Production && self.config.namespaces.pid {
+            return self.run_as_init();
+        }
+
+        // 15b. Agent mode: exec target process directly
         self.exec_command()?;
 
         // Should never reach here
@@ -527,8 +710,18 @@ impl Container {
 
         let mut oci_config =
             OciConfig::new(self.config.command.clone(), self.config.hostname.clone());
+        let context_manifest = if self.config.verify_context_integrity {
+            self.config
+                .context_dir
+                .as_ref()
+                .map(|dir| snapshot_context_dir(dir))
+                .transpose()?
+        } else {
+            None
+        };
 
         oci_config = oci_config.with_resources(&self.config.limits);
+        oci_config = oci_config.with_namespace_config(&self.config.namespaces);
 
         // Inject user-configured environment variables
         if !self.config.environment.is_empty() {
@@ -542,17 +735,32 @@ impl Container {
 
         // Mount pre-built rootfs if provided
         if let Some(ref rootfs_path) = self.config.rootfs_path {
+            if self.config.verify_rootfs_attestation {
+                verify_rootfs_attestation(rootfs_path)?;
+            }
             oci_config = oci_config.with_rootfs_binds(rootfs_path);
         } else {
             oci_config = oci_config.with_host_runtime_binds();
         }
 
         if let Some(context_dir) = &self.config.context_dir {
-            oci_config = oci_config.with_context_bind(context_dir);
+            if matches!(
+                self.config.context_mode,
+                crate::filesystem::ContextMode::BindMount
+            ) {
+                ContextPopulator::new(context_dir, "/context").validate_source_tree()?;
+                oci_config = oci_config.with_context_bind(context_dir);
+            }
         }
 
-        // Mount secrets into OCI bundle
-        if !self.config.secrets.is_empty() {
+        if !self.config.secrets.is_empty() && self.config.service_mode == ServiceMode::Production {
+            let secret_stage_dir = Self::gvisor_secret_stage_dir(&self.config.id);
+            Self::mount_gvisor_secret_stage_tmpfs(&secret_stage_dir)?;
+            let staged_secrets =
+                Self::stage_gvisor_secret_files(&secret_stage_dir, &self.config.secrets)?;
+            oci_config =
+                oci_config.with_inmemory_secret_mounts(&secret_stage_dir, &staged_secrets)?;
+        } else if !self.config.secrets.is_empty() {
             oci_config = oci_config.with_secret_mounts(&self.config.secrets);
         }
 
@@ -560,13 +768,14 @@ impl Container {
             oci_config = oci_config.with_rootless_user_namespace(user_ns_config);
         }
 
-        let bundle_dir = Builder::new()
-            .prefix("nucleus-oci-")
-            .tempdir_in("/tmp")
-            .map_err(|e| {
-                NucleusError::FilesystemError(format!("Failed to create OCI bundle dir: {}", e))
-            })?;
-        let bundle_path = bundle_dir.path().to_path_buf();
+        let artifact_dir = Self::gvisor_artifact_dir(&self.config.id);
+        std::fs::create_dir_all(&artifact_dir).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to create gVisor artifact dir {:?}: {}",
+                artifact_dir, e
+            ))
+        })?;
+        let bundle_path = Self::gvisor_bundle_path(&self.config.id);
         let oci_mounts = oci_config.mounts.clone();
         let bundle = OciBundle::new(bundle_path, oci_config);
         bundle.create()?;
@@ -574,6 +783,18 @@ impl Container {
         let rootfs = bundle.rootfs_path();
         create_minimal_fs(&rootfs)?;
         Self::prepare_oci_mountpoints(&rootfs, &oci_mounts)?;
+        if let Some(context_dir) = &self.config.context_dir {
+            if matches!(
+                self.config.context_mode,
+                crate::filesystem::ContextMode::Copy
+            ) {
+                let context_dest = rootfs.join("context");
+                ContextPopulator::new(context_dir, &context_dest).populate()?;
+                if let Some(expected) = &context_manifest {
+                    verify_context_manifest(expected, &context_dest)?;
+                }
+            }
+        }
 
         let dev_path = rootfs.join("dev");
         create_dev_nodes(&dev_path, false)?;
@@ -591,18 +812,31 @@ impl Container {
         };
 
         let rootless_oci = self.config.user_ns_config.is_some();
-        gvisor.exec_with_oci_bundle_network(&self.config.id, &bundle, gvisor_net, rootless_oci)?;
+        gvisor.exec_with_oci_bundle_network(
+            &self.config.id,
+            &bundle,
+            gvisor_net,
+            rootless_oci,
+            self.config.gvisor_platform,
+        )?;
 
         Ok(())
     }
 
     fn prepare_oci_mountpoints(rootfs: &std::path::Path, mounts: &[OciMount]) -> Result<()> {
         for mount in mounts {
-            let relative = mount.destination.trim_start_matches('/');
-            if relative.is_empty() {
-                continue;
-            }
-
+            let normalized = crate::filesystem::normalize_container_destination(
+                std::path::Path::new(&mount.destination),
+            )
+            .map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Invalid OCI mount destination {:?}: {}",
+                    mount.destination, e
+                ))
+            })?;
+            let relative = normalized
+                .strip_prefix("/")
+                .expect("normalized OCI mount destination is always absolute");
             let target = rootfs.join(relative);
             if mount.mount_type == "bind" && std::path::Path::new(&mount.source).is_file() {
                 if let Some(parent) = target.parent() {
@@ -629,6 +863,141 @@ impl Container {
                     ))
                 })?;
             }
+        }
+
+        Ok(())
+    }
+
+    fn gvisor_artifact_dir(container_id: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join("nucleus-gvisor")
+            .join(container_id)
+    }
+
+    fn gvisor_bundle_path(container_id: &str) -> std::path::PathBuf {
+        Self::gvisor_artifact_dir(container_id).join("bundle")
+    }
+
+    fn gvisor_secret_stage_dir(container_id: &str) -> std::path::PathBuf {
+        Self::gvisor_artifact_dir(container_id).join("secrets-stage")
+    }
+
+    fn mount_gvisor_secret_stage_tmpfs(stage_dir: &std::path::Path) -> Result<()> {
+        std::fs::create_dir_all(stage_dir).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to create gVisor secret stage dir {:?}: {}",
+                stage_dir, e
+            ))
+        })?;
+
+        nix::mount::mount(
+            Some("tmpfs"),
+            stage_dir,
+            Some("tmpfs"),
+            nix::mount::MsFlags::MS_NOSUID
+                | nix::mount::MsFlags::MS_NODEV
+                | nix::mount::MsFlags::MS_NOEXEC,
+            Some("size=16m,mode=0700"),
+        )
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to mount gVisor secret stage tmpfs at {:?}: {}",
+                stage_dir, e
+            ))
+        })
+    }
+
+    fn stage_gvisor_secret_files(
+        stage_dir: &std::path::Path,
+        secrets: &[crate::container::SecretMount],
+    ) -> Result<Vec<crate::container::SecretMount>> {
+        let mut staged = Vec::with_capacity(secrets.len());
+
+        for secret in secrets {
+            if !secret.source.exists() {
+                return Err(NucleusError::FilesystemError(format!(
+                    "Secret source does not exist: {:?}",
+                    secret.source
+                )));
+            }
+
+            let staged_source = resolve_container_destination(stage_dir, &secret.dest)?;
+            if let Some(parent) = staged_source.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to create gVisor secret parent {:?}: {}",
+                        parent, e
+                    ))
+                })?;
+            }
+
+            let mut content = std::fs::read(&secret.source).map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to read secret {:?}: {}",
+                    secret.source, e
+                ))
+            })?;
+            std::fs::write(&staged_source, &content).map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to write staged secret {:?}: {}",
+                    staged_source, e
+                ))
+            })?;
+
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    &staged_source,
+                    std::fs::Permissions::from_mode(secret.mode),
+                )
+                .map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to set permissions on staged secret {:?}: {}",
+                        staged_source, e
+                    ))
+                })?;
+            }
+
+            for byte in content.iter_mut() {
+                unsafe {
+                    std::ptr::write_volatile(byte, 0);
+                }
+            }
+
+            staged.push(crate::container::SecretMount {
+                source: staged_source,
+                dest: secret.dest.clone(),
+                mode: secret.mode,
+            });
+        }
+
+        Ok(staged)
+    }
+
+    fn cleanup_gvisor_artifacts(container_id: &str) -> Result<()> {
+        let artifact_dir = Self::gvisor_artifact_dir(container_id);
+        let secret_stage_dir = Self::gvisor_secret_stage_dir(container_id);
+
+        if secret_stage_dir.exists() {
+            match nix::mount::umount2(&secret_stage_dir, nix::mount::MntFlags::MNT_DETACH) {
+                Ok(()) => {}
+                Err(nix::errno::Errno::EINVAL) | Err(nix::errno::Errno::ENOENT) => {}
+                Err(e) => {
+                    return Err(NucleusError::FilesystemError(format!(
+                        "Failed to unmount gVisor secret stage {:?}: {}",
+                        secret_stage_dir, e
+                    )));
+                }
+            }
+        }
+
+        if artifact_dir.exists() {
+            std::fs::remove_dir_all(&artifact_dir).map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to remove gVisor artifact dir {:?}: {}",
+                    artifact_dir, e
+                ))
+            })?;
         }
 
         Ok(())
@@ -691,6 +1060,100 @@ impl Container {
         Ok(())
     }
 
+    /// Run as a minimal PID 1 init process inside the container.
+    ///
+    /// Forks a child that execs the workload. PID 1 (this process) stays alive to:
+    /// - Reap zombie processes (orphaned children)
+    /// - Forward SIGTERM/SIGINT/SIGHUP to the workload child
+    /// - Exit with the workload's exit code
+    ///
+    /// This prevents zombie accumulation in long-running production containers
+    /// and ensures clean shutdown ordering.
+    fn run_as_init(&self) -> Result<()> {
+        info!("Starting as PID 1 init supervisor (production mode)");
+        audit(
+            &self.config.id,
+            &self.config.name,
+            AuditEventType::InitSupervisorStarted,
+            "PID 1 init supervisor for zombie reaping and signal forwarding",
+        );
+
+        match unsafe { fork() }? {
+            ForkResult::Parent { child } => {
+                // PID 1: mini-init — reap zombies and forward signals
+
+                // Set up signal forwarding to the workload child
+                let mut sigset = SigSet::empty();
+                for sig in [
+                    Signal::SIGTERM,
+                    Signal::SIGINT,
+                    Signal::SIGHUP,
+                    Signal::SIGQUIT,
+                    Signal::SIGUSR1,
+                    Signal::SIGUSR2,
+                ] {
+                    sigset.add(sig);
+                }
+
+                // Block forwarded signals so we can use sigtimedwait
+                pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&sigset), None).map_err(|e| {
+                    NucleusError::ExecError(format!("Init: failed to block signals: {}", e))
+                })?;
+
+                // Spawn a thread to forward signals to the child
+                let child_pid = child;
+                std::thread::spawn(move || {
+                    while let Ok(signal) = sigset.wait() {
+                        let _ = kill(child_pid, signal);
+                    }
+                });
+
+                // Main loop: reap all children, exit when workload child exits
+                let workload_exit = loop {
+                    match waitpid(Pid::from_raw(-1), None) {
+                        Ok(WaitStatus::Exited(pid, code)) => {
+                            if pid == child {
+                                debug!("Init: workload child exited with code {}", code);
+                                break code;
+                            }
+                            debug!("Init: reaped zombie PID {} (exit code {})", pid, code);
+                        }
+                        Ok(WaitStatus::Signaled(pid, signal, _)) => {
+                            if pid == child {
+                                let code = 128 + signal as i32;
+                                debug!(
+                                    "Init: workload child killed by signal {:?} (exit code {})",
+                                    signal, code
+                                );
+                                break code;
+                            }
+                            debug!("Init: reaped zombie PID {} (killed by {:?})", pid, signal);
+                        }
+                        Err(nix::errno::Errno::ECHILD) => {
+                            // No more children — workload must have exited
+                            debug!("Init: no more children, exiting");
+                            break 1;
+                        }
+                        Err(nix::errno::Errno::EINTR) => continue,
+                        Err(e) => {
+                            error!("Init: waitpid error: {}", e);
+                            break 1;
+                        }
+                        _ => continue,
+                    }
+                };
+
+                std::process::exit(workload_exit);
+            }
+            ForkResult::Child => {
+                // Workload child: exec the target command
+                self.exec_command()?;
+                // Should never reach here
+                Ok(())
+            }
+        }
+    }
+
     fn enforce_no_new_privs(&self) -> Result<()> {
         let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
         if ret != 0 {
@@ -700,6 +1163,52 @@ impl Container {
             )));
         }
         Ok(())
+    }
+
+    fn assert_kernel_lockdown(config: &ContainerConfig) -> Result<()> {
+        let Some(required) = config.required_kernel_lockdown else {
+            return Ok(());
+        };
+
+        let path = "/sys/kernel/security/lockdown";
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            NucleusError::ConfigError(format!(
+                "Kernel lockdown assertion requested, but {} could not be read: {}",
+                path, e
+            ))
+        })?;
+
+        let active = Self::parse_active_lockdown_mode(&content).ok_or_else(|| {
+            NucleusError::ConfigError(format!(
+                "Kernel lockdown assertion requested, but active mode could not be parsed from {}",
+                path
+            ))
+        })?;
+
+        if required.accepts(active) {
+            info!(
+                required = required.as_str(),
+                active = active.as_str(),
+                "Kernel lockdown requirement satisfied"
+            );
+            Ok(())
+        } else {
+            Err(NucleusError::ConfigError(format!(
+                "Kernel lockdown mode '{}' does not satisfy required mode '{}'",
+                active.as_str(),
+                required.as_str()
+            )))
+        }
+    }
+
+    fn parse_active_lockdown_mode(content: &str) -> Option<KernelLockdownMode> {
+        let start = content.find('[')?;
+        let end = content[start + 1..].find(']')?;
+        match &content[start + 1..start + 1 + end] {
+            "integrity" => Some(KernelLockdownMode::Integrity),
+            "confidentiality" => Some(KernelLockdownMode::Confidentiality),
+            _ => None,
+        }
     }
 
     /// Forward selected signals to child process using sigwait (no async signal handlers).
@@ -1087,6 +1596,25 @@ impl Container {
         }
         Ok(())
     }
+
+    fn maybe_start_seccomp_trace_reader(
+        config: &ContainerConfig,
+        target_pid: u32,
+    ) -> Result<Option<SeccompTraceReader>> {
+        if config.seccomp_mode != crate::container::config::SeccompMode::Trace {
+            return Ok(None);
+        }
+
+        let log_path = config.seccomp_trace_log.as_ref().ok_or_else(|| {
+            NucleusError::ConfigError(
+                "Seccomp trace mode requires --seccomp-log / seccomp_trace_log".to_string(),
+            )
+        })?;
+
+        let mut reader = SeccompTraceReader::new(target_pid, log_path);
+        reader.start_recording()?;
+        Ok(Some(reader))
+    }
 }
 
 #[cfg(test)]
@@ -1164,5 +1692,55 @@ mod tests {
         assert!(config.namespaces.net);
         Container::apply_network_mode_guards(&mut config, true).unwrap();
         assert!(config.namespaces.net);
+    }
+
+    #[test]
+    fn test_parse_kernel_lockdown_mode() {
+        assert_eq!(
+            Container::parse_active_lockdown_mode("none [integrity] confidentiality"),
+            Some(KernelLockdownMode::Integrity)
+        );
+        assert_eq!(
+            Container::parse_active_lockdown_mode("none integrity [confidentiality]"),
+            Some(KernelLockdownMode::Confidentiality)
+        );
+        assert_eq!(
+            Container::parse_active_lockdown_mode("[none] integrity"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_stage_gvisor_secret_files_rewrites_sources_under_stage_dir() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source-secret");
+        std::fs::write(&source, "supersecret").unwrap();
+
+        let staged = Container::stage_gvisor_secret_files(
+            &temp.path().join("stage"),
+            &[crate::container::SecretMount {
+                source: source.clone(),
+                dest: std::path::PathBuf::from("/etc/app/secret.txt"),
+                mode: 0o400,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(staged.len(), 1);
+        assert!(staged[0].source.starts_with(temp.path().join("stage")));
+        assert_eq!(
+            std::fs::read_to_string(&staged[0].source).unwrap(),
+            "supersecret"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_gvisor_artifacts_removes_artifact_dir() {
+        let artifact_dir = Container::gvisor_artifact_dir("cleanup-test");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        std::fs::write(artifact_dir.join("config.json"), "{}").unwrap();
+
+        Container::cleanup_gvisor_artifacts("cleanup-test").unwrap();
+        assert!(!artifact_dir.exists());
     }
 }

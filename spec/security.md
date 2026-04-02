@@ -44,7 +44,19 @@ Nucleus employs multiple layers of security:
 
 ### 2. Capabilities (Privilege Reduction)
 
-Default: **Drop all capabilities**
+Default: **Drop all capabilities** (bounding, effective, inheritable, permitted, ambient)
+
+Can be configured via external TOML policy file (`--caps-policy`):
+
+```toml
+# Drop everything (default)
+[bounding]
+keep = []
+
+# Or keep specific capabilities:
+# [bounding]
+# keep = ["NET_BIND_SERVICE"]
+```
 
 Minimal set if needed:
 - `CAP_NET_BIND_SERVICE` - Bind to ports < 1024 (if networking enabled)
@@ -59,9 +71,23 @@ Minimal set if needed:
 
 ### 3. Seccomp (Syscall Filtering)
 
-**Whitelist approach:**
+**Three modes of operation:**
 
-Allowed syscalls:
+1. **Built-in allowlist** (default) — ~100 syscalls, network-aware, argument-level filtering on `socket()`, `ioctl()`, `prctl()`, `clone()`
+2. **Custom JSON profile** (`--seccomp-profile`) — OCI-format syscall allowlist loaded from file with optional SHA-256 verification
+3. **Trace mode** (`--seccomp-mode trace`) — allow-all with `SECCOMP_FILTER_FLAG_LOG` for profile generation; development only, rejected in production
+
+**Profile generation workflow:**
+```bash
+# Record syscalls in trace mode
+nucleus run --seccomp-mode trace --seccomp-log trace.ndjson -- ./my-service
+# Generate minimal profile
+nucleus seccomp generate trace.ndjson -o my-service.seccomp.json
+# Enforce in production
+nucleus run --seccomp-profile my-service.seccomp.json --seccomp-profile-sha256 abc... -- ./my-service
+```
+
+**Built-in allowlist includes:**
 ```
 read, write, open, openat, close, stat, fstat, lstat
 mmap, munmap, mprotect, brk
@@ -72,7 +98,7 @@ landlock_create_ruleset, landlock_add_rule, landlock_restrict_self
 ...
 ```
 
-Blocked syscalls:
+**Blocked syscalls:**
 ```
 ptrace          # Process tracing
 kexec_load      # Load new kernel
@@ -88,12 +114,15 @@ io_uring        # Async I/O (potential escape vector)
 Notes:
 - x32 legacy syscall numbers (512-547) are not allowlisted and are denied by default.
 - Landlock syscalls are allowlisted only to enable post-seccomp Landlock bootstrap in runtime setup.
+- `--seccomp-log-denied` enables kernel-level logging of denied syscalls via `SECCOMP_FILTER_FLAG_LOG`.
 
 ### 4. Landlock (Filesystem Access Control)
 
 **Path-based access restrictions using Linux LSM (kernel 5.13+):**
 
-Applied after pivot_root, Landlock restricts what the container process can do with files it can see:
+Applied after pivot_root, Landlock restricts what the container process can do with files it can see.
+
+**Default policy** (when no `--landlock-policy` file is provided):
 
 | Path | Access |
 |------|--------|
@@ -105,11 +134,32 @@ Applied after pivot_root, Landlock restricts what the container process can do w
 | `/` | Directory traversal only (ReadDir) |
 | Everything else | **Denied** |
 
+**Custom policy** (via `--landlock-policy <path>.toml`):
+```toml
+min_abi = 3
+
+[[rules]]
+path = "/bin"
+access = ["read", "execute"]
+
+[[rules]]
+path = "/run/secrets"
+access = ["read"]
+
+[[rules]]
+path = "/tmp"
+access = ["read", "write", "create", "remove"]
+```
+
+Access flags: `read`, `write`, `execute`, `create`, `remove`, `readdir`, `all`.
+
 **Properties:**
 - Irreversible once applied (kernel-enforced)
 - Stackable with seccomp and capabilities (independent enforcement)
 - Unprivileged (works in rootless mode)
 - Graceful degradation on kernels without Landlock support
+- Production mode requires Landlock ABI V3+ (adds `LANDLOCK_ACCESS_FS_TRUNCATE`)
+- Policy file integrity verified via optional `--landlock-policy-sha256`
 
 **Why this matters:**
 Even if an attacker escapes the mount namespace (e.g., via a kernel bug), Landlock's LSM-level enforcement remains as an independent barrier. Namespaces control what you *see*; Landlock controls what you can *do* with what you see.
@@ -174,6 +224,44 @@ When `--runtime gvisor`:
 - Port forwarding limited to explicitly published ports
 - Requires root (degrades to None in rootless with warning)
 - Container IP in private subnet (10.0.42.0/24)
+
+### 10. Structured Audit Log
+
+All security-critical actions emit structured JSON events via `tracing::info!(target: "nucleus::audit", ...)`:
+
+- `ContainerStart` / `ContainerStop` — lifecycle events
+- `CapabilitiesDropped` — all caps cleared or policy applied
+- `SeccompApplied` / `SeccompProfileLoaded` — filter enforcement
+- `LandlockApplied` — filesystem policy locked
+- `MountAuditPassed` — post-setup mount flag verification
+- `NoNewPrivsSet` — `PR_SET_NO_NEW_PRIVS` applied
+- `InitSupervisorStarted` — PID 1 mini-init active
+
+Events include container ID, name, timestamp, and detail string.
+
+### 11. Production Mode Hardening
+
+Production mode (`--service-mode production`) enforces additional invariants:
+
+- **PID 1 init**: Fork-based mini-init with zombie reaping (`waitpid(-1, WNOHANG)`) and signal forwarding (SIGTERM/SIGINT/SIGHUP to child)
+- **In-memory secrets**: 16MB tmpfs at `/run/secrets`, source buffers zeroed with `write_volatile`
+- **Mount audit**: Verifies mount flags (MS_RDONLY, MS_NOSUID, MS_NODEV) on security-sensitive paths post-setup; fatal on mismatch
+- **hidepid=2**: `/proc` mounted with `hidepid=2` to hide other processes
+- **Landlock ABI**: Requires V3 minimum (adds truncate protection)
+- **Deny-all egress**: Default egress policy when no `--egress-allow` specified
+- **Seccomp trace forbidden**: `--seccomp-mode trace` rejected at config validation
+
+### 12. Security Policy File Architecture
+
+Security policy is separated from structural configuration (Nix) for auditability and independent change cadence:
+
+| Concern | Format | Why separate |
+|---------|--------|-------------|
+| Seccomp syscall allowlist | JSON (OCI format) | 100-300 lines, generated by tooling, audited by security team |
+| Capability bounding set | TOML | Changes with CVEs, not deployments |
+| Landlock filesystem rules | TOML | Per-service access needs, distinct from topology |
+
+All policy files support SHA-256 pinning for supply-chain integrity. Nix pins the hash at build time; Nucleus verifies at load time.
 
 ## Attack Scenarios
 
@@ -271,21 +359,28 @@ When `--runtime gvisor`:
 
 | Security Feature | Docker/runc | Nucleus |
 |------------------|-------------|---------|
-| Namespaces | All 6 | All 6 |
-| Capabilities | Drop most | Drop all (default) |
-| Seccomp | Whitelist (~300) | Whitelist (~100) |
-| Landlock | No | Yes (path-based ACLs) |
+| Namespaces | All 6 | All 8 (including cgroup, time) |
+| Capabilities | Drop most | Drop all (default), configurable via TOML |
+| Seccomp | Whitelist (~300) | Whitelist (~100), per-service JSON profiles, trace-based generation |
+| Landlock | No | Yes (path-based ACLs), configurable via TOML |
 | cgroups | v1/v2 | v2 only |
 | Rootless | Yes | Yes |
 | gVisor | Optional | Optional |
 | AppArmor/SELinux | Yes | Landlock (kernel-native) |
-| Networking | Full CNI | None/Host/Bridge |
+| Networking | Full CNI | None/Host/Bridge + deny-all egress |
+| Multi-container | Docker Compose | Nucleus Compose (TOML, DAG, reconciliation) |
+| Secrets | Docker secrets, tmpfs | In-memory tmpfs with volatile zeroing |
+| Audit log | Docker events | Structured JSON audit events |
+| Profile generation | N/A | Trace mode + `seccomp generate` |
+| Policy integrity | N/A | SHA-256 pinning on all policy files |
+| PID 1 init | tini/dumb-init | Built-in mini-init (production mode) |
 | Checkpoint | Optional (CRIU) | Optional (CRIU) |
 | Ownership | Root/socket | creator_uid |
 
 Nucleus aims for a **smaller attack surface** by:
 - No daemon (smaller code)
-- Stricter seccomp defaults
+- Stricter seccomp defaults with per-service profiling
 - Ephemeral-only (no persistence concerns)
 - Simpler design (fewer features = fewer bugs)
 - No networking by default
+- SHA-256 integrity verification on all security policy files

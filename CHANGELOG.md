@@ -77,8 +77,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Read-only bind mount for security (Landlock already enforces)
   - Bind mount happens before pivot_root (source on host filesystem)
 
+- Production hardening
+  - PID 1 mini-init with zombie reaping and signal forwarding (production mode + PID namespace)
+  - In-memory secrets on dedicated 16MB tmpfs at `/run/secrets` with `write_volatile` zeroing
+  - Post-setup mount flag audit (fatal in production mode)
+  - `hidepid=2` on `/proc` in production mode (hides other processes)
+  - Landlock ABI V3 minimum assertion in production mode
+  - `no_new_privs` enforcement before seccomp/Landlock
+  - RLIMIT_NPROC and RLIMIT_NOFILE backstops before seccomp
+
+- External security policy files
+  - Per-service seccomp profiles (JSON, OCI format) with SHA-256 integrity verification
+  - TOML capability policy files (`--caps-policy`) replacing default drop-all
+  - TOML Landlock policy files (`--landlock-policy`) replacing default hardcoded rules
+  - SHA-256 pinning for all policy files (supply-chain integrity)
+
+- Seccomp profile generation workflow
+  - `--seccomp-mode trace` installs allow-all filter with `SECCOMP_FILTER_FLAG_LOG`
+  - `--seccomp-log <path>` writes NDJSON trace of observed syscalls
+  - `nucleus seccomp generate <trace>` produces minimal OCI-format JSON profile
+  - Inverse syscall number-to-name mapping (~150 syscalls)
+
+- Structured audit logging
+  - JSON audit events for all security-critical actions
+  - Event types: ContainerStart, ContainerStop, CapabilitiesDropped, SeccompApplied, SeccompProfileLoaded, LandlockApplied, MountAuditPassed, NoNewPrivsSet, InitSupervisorStarted
+  - Emitted via `tracing::info!(target: "nucleus::audit", ...)`
+
+- Multi-container topology (Compose equivalent)
+  - TOML topology configuration (services, networks, volumes, dependencies)
+  - Dependency DAG resolution with Kahn's algorithm (topological sort)
+  - Circular dependency detection
+  - Reconciliation engine: diff running vs desired state, plan and execute changes
+  - Per-topology /etc/hosts DNS injection
+  - `nucleus compose` subcommand: `up`, `down`, `ps`, `plan`, `validate`
+  - NixOS module `topologies` option with systemd oneshot services
+
+- NixOS module updates
+  - `seccompProfile` / `seccompProfileSha256` options
+  - `capsPolicy` / `capsPolicySha256` options
+  - `landlockPolicy` / `landlockPolicySha256` options
+  - `topologies.<name>` with `configFile` for declarative multi-container stacks
+
 ### Dependencies
-- Core: nix, libc, caps, seccompiler, landlock, clap, anyhow, thiserror, tracing
+- Core: nix, libc, caps, seccompiler, landlock, clap, anyhow, thiserror, tracing, toml, sha2, hex
 - Dev: tla-connect, itf, tempfile, proptest
 
 ## [0.1.0] - TBD

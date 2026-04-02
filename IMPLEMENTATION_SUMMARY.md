@@ -55,10 +55,21 @@ nucleus/
 │   │   ├── criu.rs               # CRIU runtime (dump/restore)
 │   │   ├── metadata.rs           # Checkpoint metadata
 │   │   └── state.rs              # Checkpoint state machine
+│   ├── topology/                 # Multi-container topology
+│   │   ├── config.rs             # TOML config (services, networks, deps)
+│   │   ├── dag.rs                # Dependency DAG, topological sort
+│   │   ├── reconcile.rs          # Diff and reconcile running vs desired
+│   │   └── dns.rs                # Per-topology /etc/hosts DNS
+│   ├── audit.rs                  # Structured JSON audit log
 │   └── security/                 # Security enforcement
 │       ├── capabilities.rs       # Capability dropping
+│       ├── caps_policy.rs        # TOML capability policy loader
 │       ├── seccomp.rs            # Seccomp filtering
-│       ├── landlock.rs           # Landlock filesystem policy
+│       ├── seccomp_trace.rs      # Seccomp trace mode recorder
+│       ├── seccomp_generate.rs   # Profile generator from traces
+│       ├── landlock.rs           # Landlock filesystem policy (default)
+│       ├── landlock_policy.rs    # TOML Landlock policy loader
+│       ├── policy.rs             # Shared policy infrastructure (SHA-256, loaders)
 │       ├── gvisor.rs             # gVisor integration
 │       ├── oci.rs                # OCI bundle format
 │       └── state.rs              # State machine

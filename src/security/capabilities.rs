@@ -1,10 +1,19 @@
 use crate::error::{NucleusError, Result};
-use caps::{CapSet, Capability};
+use caps::{CapSet, Capability, CapsHashSet};
 use tracing::{debug, info};
 
 /// Security context that tracks capability state
 pub struct CapabilityManager {
     dropped: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilitySets {
+    pub bounding: Vec<Capability>,
+    pub permitted: Vec<Capability>,
+    pub effective: Vec<Capability>,
+    pub inheritable: Vec<Capability>,
+    pub ambient: Vec<Capability>,
 }
 
 impl CapabilityManager {
@@ -87,6 +96,13 @@ impl CapabilityManager {
                 caps::drop(None, CapSet::Inheritable, cap).map_err(|e| {
                     NucleusError::CapabilityError(format!("Failed to drop {cap:?}: {e}"))
                 })?;
+
+                if let Err(e) = caps::drop(None, CapSet::Bounding, cap) {
+                    debug!(
+                        "Failed to drop bounding cap {:?}: {} (may not be present)",
+                        cap, e
+                    );
+                }
             }
         }
 
@@ -101,6 +117,52 @@ impl CapabilityManager {
         Ok(())
     }
 
+    /// Apply explicit capability sets.
+    ///
+    /// Bounding is handled as a drop-only upper bound; the remaining sets are
+    /// set exactly to the provided values.
+    pub fn apply_sets(&mut self, sets: &CapabilitySets) -> Result<()> {
+        if self.dropped {
+            debug!("Capabilities already dropped, skipping");
+            return Ok(());
+        }
+
+        info!("Applying explicit capability sets");
+
+        for cap in caps::all() {
+            if !sets.bounding.contains(&cap) {
+                if let Err(e) = caps::drop(None, CapSet::Bounding, cap) {
+                    debug!(
+                        "Failed to drop bounding cap {:?}: {} (may not be present)",
+                        cap, e
+                    );
+                }
+            }
+        }
+
+        caps::set(None, CapSet::Permitted, &to_caps_hash_set(&sets.permitted)).map_err(|e| {
+            NucleusError::CapabilityError(format!("Failed to set permitted caps: {}", e))
+        })?;
+        caps::set(
+            None,
+            CapSet::Inheritable,
+            &to_caps_hash_set(&sets.inheritable),
+        )
+        .map_err(|e| {
+            NucleusError::CapabilityError(format!("Failed to set inheritable caps: {}", e))
+        })?;
+        caps::set(None, CapSet::Ambient, &to_caps_hash_set(&sets.ambient)).map_err(|e| {
+            NucleusError::CapabilityError(format!("Failed to set ambient caps: {}", e))
+        })?;
+        caps::set(None, CapSet::Effective, &to_caps_hash_set(&sets.effective)).map_err(|e| {
+            NucleusError::CapabilityError(format!("Failed to set effective caps: {}", e))
+        })?;
+
+        self.dropped = true;
+        info!("Successfully applied capability sets");
+        Ok(())
+    }
+
     /// Check if capabilities have been dropped
     pub fn is_dropped(&self) -> bool {
         self.dropped
@@ -111,6 +173,10 @@ impl Default for CapabilityManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn to_caps_hash_set(caps_list: &[Capability]) -> CapsHashSet {
+    caps_list.iter().copied().collect()
 }
 
 #[cfg(test)]

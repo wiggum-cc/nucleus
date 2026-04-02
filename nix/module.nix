@@ -93,6 +93,48 @@ let
         description = "Container runtime.";
       };
 
+      gvisorPlatform = mkOption {
+        type = types.enum [ "systrap" "kvm" "ptrace" ];
+        default = "systrap";
+        description = "gVisor platform backend when runtime = gvisor.";
+      };
+
+      requireKernelLockdown = mkOption {
+        type = types.nullOr (types.enum [ "integrity" "confidentiality" ]);
+        default = null;
+        description = "Require the host kernel to be in at least this lockdown mode.";
+      };
+
+      verifyRootfsAttestation = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Verify the rootfs attestation manifest before container start.";
+      };
+
+      verifyContextIntegrity = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Verify context contents before the workload runs.";
+      };
+
+      seccompLogDenied = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Request kernel logging for denied seccomp decisions when supported.";
+      };
+
+      timeNamespace = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Enable Linux time namespace isolation.";
+      };
+
+      cgroupNamespace = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Enable Linux cgroup namespace isolation.";
+      };
+
       healthCheck = mkOption {
         type = types.nullOr types.str;
         default = null;
@@ -187,6 +229,42 @@ let
         description = "Context directory to pre-populate in the container.";
       };
 
+      seccompProfile = mkOption {
+        type = types.nullOr types.path;
+        default = null;
+        description = "Path to a custom seccomp BPF profile (JSON). If set, nucleus loads this instead of its built-in filter.";
+      };
+
+      seccompProfileSha256 = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Expected SHA-256 hex digest of the seccomp profile. Nucleus refuses to start if the profile hash doesn't match.";
+      };
+
+      capsPolicy = mkOption {
+        type = types.nullOr types.path;
+        default = null;
+        description = "Path to capability policy file (TOML). Defines which capabilities to keep/drop.";
+      };
+
+      capsPolicySha256 = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Expected SHA-256 hash of the capability policy file.";
+      };
+
+      landlockPolicy = mkOption {
+        type = types.nullOr types.path;
+        default = null;
+        description = "Path to Landlock filesystem policy file (TOML). Defines per-path access rules.";
+      };
+
+      landlockPolicySha256 = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Expected SHA-256 hash of the Landlock policy file.";
+      };
+
       extraArgs = mkOption {
         type = types.listOf types.str;
         default = [ ];
@@ -210,7 +288,17 @@ let
         ]
         ++ lib.optionals (containerCfg.cpus != null) [ "--cpus" (e (toString containerCfg.cpus)) ]
         ++ optional (containerCfg.runtime == "gvisor") "--runtime gvisor"
+        ++ optional (containerCfg.runtime == "gvisor") "--gvisor-platform"
+        ++ optional (containerCfg.runtime == "gvisor") (e containerCfg.gvisorPlatform)
         ++ optional containerCfg.sdNotify "--sd-notify"
+        ++ optional containerCfg.seccompLogDenied "--seccomp-log-denied"
+        ++ optional containerCfg.verifyRootfsAttestation "--verify-rootfs-attestation"
+        ++ optional containerCfg.verifyContextIntegrity "--verify-context-integrity"
+        ++ optional containerCfg.timeNamespace "--time-namespace"
+        ++ optional (!containerCfg.cgroupNamespace) "--disable-cgroup-namespace"
+        ++ lib.optionals (containerCfg.requireKernelLockdown != null) [
+          "--require-kernel-lockdown" (e containerCfg.requireKernelLockdown)
+        ]
         ++ (lib.concatMap (d: [ "--dns" (e d) ]) containerCfg.dns)
         ++ (lib.concatMap (c: [ "--egress-allow" (e c) ]) containerCfg.egressAllow)
         ++ (lib.concatMap (p: [ "--egress-tcp-port" (e (toString p)) ]) containerCfg.egressTcpPorts)
@@ -228,6 +316,24 @@ let
           "--health-start-period" (e (toString containerCfg.healthStartPeriod))
         ]
         ++ lib.optionals (containerCfg.context != null) [ "--context" (e (toString containerCfg.context)) ]
+        ++ lib.optionals (containerCfg.seccompProfile != null) [
+          "--seccomp-profile" (e (toString containerCfg.seccompProfile))
+        ]
+        ++ lib.optionals (containerCfg.seccompProfileSha256 != null) [
+          "--seccomp-profile-sha256" (e containerCfg.seccompProfileSha256)
+        ]
+        ++ lib.optionals (containerCfg.capsPolicy != null) [
+          "--caps-policy" (e (toString containerCfg.capsPolicy))
+        ]
+        ++ lib.optionals (containerCfg.capsPolicySha256 != null) [
+          "--caps-policy-sha256" (e containerCfg.capsPolicySha256)
+        ]
+        ++ lib.optionals (containerCfg.landlockPolicy != null) [
+          "--landlock-policy" (e (toString containerCfg.landlockPolicy))
+        ]
+        ++ lib.optionals (containerCfg.landlockPolicySha256 != null) [
+          "--landlock-policy-sha256" (e containerCfg.landlockPolicySha256)
+        ]
         ++ containerCfg.extraArgs
       );
       commandStr = lib.concatStringsSep " " (map lib.escapeShellArg containerCfg.command);
@@ -264,6 +370,25 @@ let
       };
     };
 
+  mkTopologyService = name: topoCfg:
+    nameValuePair "nucleus-topology-${name}" {
+      description = "Nucleus topology: ${name}";
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+      wantedBy = [ "multi-user.target" ];
+
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${cfg.package}/bin/nucleus compose up ${lib.escapeShellArg (toString topoCfg.configFile)}";
+        ExecStop = "${cfg.package}/bin/nucleus compose down ${lib.escapeShellArg (toString topoCfg.configFile)}";
+        StandardOutput = "journal";
+        StandardError = "journal";
+        SyslogIdentifier = "nucleus-topology-${name}";
+        Delegate = true;
+      };
+    };
+
 in
 {
   options.services.nucleus = {
@@ -279,10 +404,30 @@ in
       default = { };
       description = "Declarative Nucleus containers to run as systemd services.";
     };
+
+    topologies = mkOption {
+      type = types.attrsOf (types.submodule {
+        options = {
+          enable = mkEnableOption "this Nucleus topology";
+
+          configFile = mkOption {
+            type = types.path;
+            description = "Path to the topology TOML file (nucleus compose format).";
+          };
+        };
+      });
+      default = { };
+      description = ''
+        Declarative Nucleus topologies (multi-container stacks).
+        Each topology is managed by `nucleus compose up/down`.
+      '';
+    };
   };
 
   config = mkIf cfg.enable {
     systemd.services = lib.mapAttrs' mkContainerService
-      (lib.filterAttrs (_: c: c.enable) cfg.containers);
+      (lib.filterAttrs (_: c: c.enable) cfg.containers)
+    // lib.mapAttrs' mkTopologyService
+      (lib.filterAttrs (_: t: t.enable) cfg.topologies);
   };
 }

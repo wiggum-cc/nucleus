@@ -20,9 +20,9 @@ mod tests {
     // --- Container ID generation ---
 
     #[test]
-    fn test_container_id_is_12_hex_chars() {
+    fn test_container_id_is_32_hex_chars() {
         let id = generate_container_id();
-        assert_eq!(id.len(), 12);
+        assert_eq!(id.len(), 32);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
@@ -402,15 +402,16 @@ mod tests {
     #[test]
     fn test_namespace_all() {
         let ns = NamespaceConfig::all();
-        assert!(ns.pid && ns.mnt && ns.net && ns.uts && ns.ipc);
+        assert!(ns.pid && ns.mnt && ns.net && ns.uts && ns.ipc && ns.cgroup);
         assert!(!ns.user); // user not included in all()
+        assert!(!ns.time);
     }
 
     #[test]
     fn test_namespace_minimal() {
         let ns = NamespaceConfig::minimal();
-        assert!(ns.pid && ns.mnt && ns.net);
-        assert!(!ns.uts && !ns.ipc && !ns.user);
+        assert!(ns.pid && ns.mnt && ns.net && ns.cgroup);
+        assert!(!ns.uts && !ns.ipc && !ns.user && !ns.time);
     }
 
     // --- Network state machine ---

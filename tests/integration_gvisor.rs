@@ -15,6 +15,11 @@ mod tests {
     use nucleus::resources::ResourceLimits;
     use nucleus::security::GVisorRuntime;
     use std::fs;
+    use std::os::unix::net::UnixListener;
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::OnceLock;
     use tempfile::TempDir;
 
     // -----------------------------------------------------------------------
@@ -23,11 +28,80 @@ mod tests {
 
     macro_rules! require_gvisor {
         () => {
-            if !GVisorRuntime::is_available() {
-                eprintln!("SKIP: runsc not available");
+            if let Some(reason) = gvisor_skip_reason() {
+                eprintln!("SKIP: {}", reason);
                 return;
             }
         };
+    }
+
+    fn gvisor_skip_reason() -> Option<String> {
+        static REASON: OnceLock<Option<String>> = OnceLock::new();
+        REASON
+            .get_or_init(detect_gvisor_skip_reason)
+            .as_ref()
+            .cloned()
+    }
+
+    fn detect_gvisor_skip_reason() -> Option<String> {
+        if !GVisorRuntime::is_available() {
+            return Some("runsc not available".to_string());
+        }
+
+        let probe_dir = match TempDir::new() {
+            Ok(dir) => dir,
+            Err(err) => {
+                return Some(format!("failed to create gVisor probe dir: {}", err));
+            }
+        };
+        let socket_path = probe_dir.path().join("socket-probe.sock");
+        match UnixListener::bind(&socket_path) {
+            Ok(listener) => {
+                drop(listener);
+                let _ = fs::remove_file(&socket_path);
+            }
+            Err(err) => {
+                return Some(format!(
+                    "host sandbox forbids AF_UNIX socket bind required by gVisor: {}",
+                    err
+                ));
+            }
+        }
+
+        let root_dir = probe_dir.path().join("root");
+        let output = match Command::new("runsc")
+            .env("XDG_RUNTIME_DIR", probe_dir.path())
+            .env("TMPDIR", probe_dir.path())
+            .args([
+                "--root",
+                root_dir.to_string_lossy().as_ref(),
+                "--rootless",
+                "--network",
+                "none",
+                "do",
+                "/bin/true",
+            ])
+            .output()
+        {
+            Ok(output) => output,
+            Err(err) => {
+                return Some(format!("failed to spawn runsc smoke test: {}", err));
+            }
+        };
+
+        if output.status.success() {
+            None
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let summary = stderr
+                .lines()
+                .last()
+                .unwrap_or("unknown gVisor launch failure");
+            Some(format!(
+                "rootless runsc smoke test failed: {}",
+                summary.trim()
+            ))
+        }
     }
 
     /// Run a container through the production code path and return exit code.
@@ -36,28 +110,57 @@ mod tests {
         Container::new(config).run()
     }
 
-    /// Run a container that writes its output to a context directory,
-    /// then read and return that output.
-    /// The command should write to /context/output.
     fn run_gvisor_with_output(name: &str, shell_cmd: &str) -> (i32, String) {
-        let context_dir = TempDir::new().unwrap();
-        let output_file = context_dir.path().join("output");
-        // Pre-create so the container can write to it
-        fs::write(&output_file, "").unwrap();
+        run_gvisor_with_output_opts(name, shell_cmd, None, &[])
+    }
 
-        let config = ContainerConfig::new(
-            Some(name.to_string()),
-            vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                format!("{{ {}; }} > /context/output 2>&1", shell_cmd),
-            ],
-        )
-        .with_context(context_dir.path().to_path_buf());
+    fn run_gvisor_with_output_opts(
+        name: &str,
+        shell_cmd: &str,
+        context_dir: Option<&Path>,
+        extra_args: &[&str],
+    ) -> (i32, String) {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nucleus"));
+        cmd.arg("run")
+            .arg("--name")
+            .arg(name)
+            .arg("--runtime")
+            .arg("gvisor");
 
-        let exit_code = Container::new(config).run().unwrap_or(-1);
-        let output = fs::read_to_string(&output_file).unwrap_or_default();
-        (exit_code, output)
+        if let Some(dir) = context_dir {
+            cmd.arg("--context").arg(dir);
+        }
+
+        for arg in extra_args {
+            cmd.arg(arg);
+        }
+
+        let output = cmd
+            .arg("--")
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(shell_cmd)
+            .output()
+            .unwrap();
+
+        let exit_code = output
+            .status
+            .code()
+            .unwrap_or_else(|| 128 + output.status.signal().unwrap_or(1));
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut lines = stdout.lines();
+        let _container_id = lines.next();
+        let mut combined = lines.collect::<Vec<_>>().join("\n");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(stderr.trim_end());
+        }
+
+        (exit_code, combined)
     }
 
     fn unique_name(prefix: &str) -> String {
@@ -343,24 +446,13 @@ mod tests {
     #[test]
     fn test_gvisor_hostname_set() {
         require_gvisor!();
-        let context_dir = TempDir::new().unwrap();
-        let output_file = context_dir.path().join("output");
-        fs::write(&output_file, "").unwrap();
-
-        let config = ContainerConfig::new(
-            Some(unique_name("gv-hostname")),
-            vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "hostname > /context/output".to_string(),
-            ],
-        )
-        .with_hostname(Some("nucleus-test-host".to_string()))
-        .with_context(context_dir.path().to_path_buf());
-
-        let exit_code = Container::new(config).run().unwrap();
+        let (exit_code, output) = run_gvisor_with_output_opts(
+            &unique_name("gv-hostname"),
+            "hostname",
+            None,
+            &["--hostname", "nucleus-test-host"],
+        );
         assert_eq!(exit_code, 0);
-        let output = fs::read_to_string(&output_file).unwrap();
         assert_eq!(
             output.trim(),
             "nucleus-test-host",
@@ -447,27 +539,13 @@ mod tests {
     #[test]
     fn test_gvisor_environment_variables() {
         require_gvisor!();
-        let context_dir = TempDir::new().unwrap();
-        let output_file = context_dir.path().join("output");
-        fs::write(&output_file, "").unwrap();
-
-        let mut config = ContainerConfig::new(
-            Some(unique_name("gv-env")),
-            vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "echo PATH=$PATH && echo NUCLEUS_TEST=$NUCLEUS_TEST > /context/output".to_string(),
-            ],
-        )
-        .with_context(context_dir.path().to_path_buf());
-
-        config
-            .environment
-            .push(("NUCLEUS_TEST".to_string(), "gvisor-works".to_string()));
-
-        let exit_code = Container::new(config).run().unwrap();
+        let (exit_code, output) = run_gvisor_with_output_opts(
+            &unique_name("gv-env"),
+            "echo PATH=$PATH && echo NUCLEUS_TEST=$NUCLEUS_TEST",
+            None,
+            &["-e", "NUCLEUS_TEST=gvisor-works"],
+        );
         assert_eq!(exit_code, 0);
-        let output = fs::read_to_string(&output_file).unwrap();
         assert!(
             output.contains("NUCLEUS_TEST=gvisor-works"),
             "Custom env var should be set, got: {}",
@@ -655,22 +733,13 @@ mod tests {
         require_gvisor!();
         let context_dir = TempDir::new().unwrap();
         fs::write(context_dir.path().join("input.txt"), "hello from host").unwrap();
-        let output_file = context_dir.path().join("output");
-        fs::write(&output_file, "").unwrap();
-
-        let config = ContainerConfig::new(
-            Some(unique_name("gv-context")),
-            vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "cat /context/input.txt > /context/output".to_string(),
-            ],
-        )
-        .with_context(context_dir.path().to_path_buf());
-
-        let exit_code = Container::new(config).run().unwrap();
+        let (exit_code, output) = run_gvisor_with_output_opts(
+            &unique_name("gv-context"),
+            "cat /context/input.txt",
+            Some(context_dir.path()),
+            &[],
+        );
         assert_eq!(exit_code, 0);
-        let output = fs::read_to_string(&output_file).unwrap();
         assert!(
             output.contains("hello from host"),
             "Context dir content should be readable, got: {}",
