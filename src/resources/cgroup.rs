@@ -145,20 +145,22 @@ impl Cgroup {
 
     /// Clean up the cgroup
     ///
-    /// State transition: * -> Removed
+    /// State transition: * -> Removed (only on success)
     pub fn cleanup(mut self) -> Result<()> {
-        // Mark as terminal first so Drop doesn't retry if remove fails
-        self.state = CgroupState::Removed;
         info!("Cleaning up cgroup {:?}", self.path);
 
         // Try to remove the cgroup directory
         // This will fail if there are still processes in the cgroup
         if self.path.exists() {
             fs::remove_dir(&self.path).map_err(|e| {
+                // BUG-06: Do NOT set state to Removed on failure — Drop should
+                // still attempt cleanup when the Cgroup is dropped.
                 NucleusError::CgroupError(format!("Failed to remove cgroup: {}", e))
             })?;
         }
 
+        // Only mark as terminal after successful removal
+        self.state = CgroupState::Removed;
         info!("Successfully cleaned up cgroup");
 
         Ok(())
@@ -191,4 +193,20 @@ mod tests {
 
     // Note: Testing actual cgroup operations requires root privileges
     // and cgroup v2 filesystem. These are tested in integration tests.
+
+    #[test]
+    fn test_cleanup_sets_removed_only_after_success() {
+        // BUG-06: cleanup must not mark state as Removed before the directory
+        // is actually removed. Verify structurally.
+        let source = include_str!("cgroup.rs");
+        let cleanup_start = source.find("pub fn cleanup").unwrap();
+        let cleanup_end = source[cleanup_start..].find("\n    }").unwrap();
+        let cleanup_body = &source[cleanup_start..cleanup_start + cleanup_end];
+        let removed_pos = cleanup_body.find("Removed").expect("must reference Removed state");
+        let remove_dir_pos = cleanup_body.find("remove_dir").expect("must call remove_dir");
+        assert!(
+            removed_pos > remove_dir_pos,
+            "CgroupState::Removed must be set AFTER remove_dir succeeds, not before"
+        );
+    }
 }

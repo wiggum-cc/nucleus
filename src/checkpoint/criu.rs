@@ -115,25 +115,7 @@ impl CriuRuntime {
             )));
         }
 
-        // Create output directory with secure permissions
-        fs::create_dir_all(output_dir).map_err(|e| {
-            NucleusError::CheckpointError(format!(
-                "Failed to create checkpoint directory {:?}: {}",
-                output_dir, e
-            ))
-        })?;
-        fs::set_permissions(output_dir, fs::Permissions::from_mode(0o700)).map_err(|e| {
-            NucleusError::CheckpointError(format!(
-                "Failed to set checkpoint directory permissions: {}",
-                e
-            ))
-        })?;
-
-        // Create images subdirectory
-        let images_dir = output_dir.join("images");
-        fs::create_dir_all(&images_dir).map_err(|e| {
-            NucleusError::CheckpointError(format!("Failed to create images directory: {}", e))
-        })?;
+        let images_dir = Self::prepare_checkpoint_dir(output_dir)?;
 
         // Run criu dump
         let mut cmd = Command::new(&self.binary_path);
@@ -229,7 +211,7 @@ impl CriuRuntime {
 
         // Parse restored PID from pidfile, with output fallback for compatibility.
         let pid_text = fs::read_to_string(&pidfile_path).unwrap_or_default();
-        if let Some(pid) = Self::parse_pid_text(&pid_text) {
+        if let Some(pid) = Self::parse_pidfile(&pid_text) {
             info!("Restore complete, new PID: {}", pid);
             return Ok(pid);
         }
@@ -259,11 +241,71 @@ impl CriuRuntime {
             .filter(|tok| !tok.is_empty())
             .find_map(|tok| tok.parse::<u32>().ok())
     }
+
+    fn parse_pidfile(text: &str) -> Option<u32> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        trimmed.parse::<u32>().ok()
+    }
+
+    fn prepare_checkpoint_dir(output_dir: &Path) -> Result<PathBuf> {
+        Self::ensure_secure_dir(output_dir, "checkpoint directory")?;
+        let images_dir = output_dir.join("images");
+        Self::ensure_secure_dir(&images_dir, "checkpoint images directory")?;
+        Ok(images_dir)
+    }
+
+    fn ensure_secure_dir(path: &Path, label: &str) -> Result<()> {
+        Self::reject_symlink_path(path, label)?;
+
+        if path.exists() {
+            if !path.is_dir() {
+                return Err(NucleusError::CheckpointError(format!(
+                    "{} {:?} is not a directory",
+                    label, path
+                )));
+            }
+        } else {
+            fs::create_dir_all(path).map_err(|e| {
+                NucleusError::CheckpointError(format!(
+                    "Failed to create {} {:?}: {}",
+                    label, path, e
+                ))
+            })?;
+        }
+
+        Self::reject_symlink_path(path, label)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            NucleusError::CheckpointError(format!(
+                "Failed to set {} permissions {:?}: {}",
+                label, path, e
+            ))
+        })?;
+
+        Ok(())
+    }
+
+    fn reject_symlink_path(path: &Path, label: &str) -> Result<()> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(
+                NucleusError::CheckpointError(format!(
+                    "Refusing symlink {} {:?}",
+                    label, path
+                )),
+            ),
+            Ok(_) | Err(_) => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::CriuRuntime;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use tempfile::TempDir;
 
     #[test]
     fn test_parse_pid_text_plain() {
@@ -281,5 +323,33 @@ mod tests {
     #[test]
     fn test_parse_pid_text_missing() {
         assert_eq!(CriuRuntime::parse_pid_text("no pid here"), None);
+    }
+
+    #[test]
+    fn test_parse_pidfile_strict() {
+        // BUG-22: parse_pid_text must prefer strict pidfile parsing
+        // A pidfile should contain just a number, not extract first number from error messages
+        assert_eq!(CriuRuntime::parse_pidfile("1234\n"), Some(1234));
+        assert_eq!(CriuRuntime::parse_pidfile("  5678  \n"), Some(5678));
+        // Error messages should NOT parse as PIDs
+        assert_eq!(CriuRuntime::parse_pidfile("Error code: 255 (EPERM)"), None);
+        assert_eq!(CriuRuntime::parse_pidfile("restored successfully pid=5678"), None);
+        assert_eq!(CriuRuntime::parse_pidfile(""), None);
+        assert_eq!(CriuRuntime::parse_pidfile("no pid here"), None);
+    }
+
+    #[test]
+    fn test_prepare_checkpoint_dir_rejects_symlinked_images_dir() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let images = tmp.path().join("images");
+        symlink(&target, &images).unwrap();
+
+        let err = CriuRuntime::prepare_checkpoint_dir(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got: {err}"
+        );
     }
 }

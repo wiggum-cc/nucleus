@@ -69,7 +69,7 @@ mod tests {
         let limits = ResourceLimits::unlimited().with_memory("1G").unwrap();
         let bytes = 1024u64 * 1024 * 1024;
         assert_eq!(limits.memory_bytes, Some(bytes));
-        assert_eq!(limits.memory_high, Some((bytes as f64 * 0.9) as u64));
+        assert_eq!(limits.memory_high, Some(bytes - bytes / 10));
     }
 
     #[test]

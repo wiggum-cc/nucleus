@@ -10,7 +10,7 @@ use crate::filesystem::{
     switch_root, verify_context_manifest, verify_rootfs_attestation, ContextPopulator,
     FilesystemState, LazyContextPopulator, TmpfsMount, resolve_container_destination,
 };
-use crate::isolation::NamespaceManager;
+use crate::isolation::{NamespaceCommandRunner, NamespaceManager, NamespaceProbe};
 use crate::network::{BridgeNetwork, NetworkMode};
 use crate::resources::Cgroup;
 use crate::security::{
@@ -277,23 +277,50 @@ impl Container {
                             target_pid,
                             &config.name,
                             probe,
+                            config.user_ns_config.is_some(),
+                            config.use_gvisor,
                             notify_socket.as_deref(),
                         )?;
                     }
 
                     // Start health check thread if configured
-                    if let Some(ref hc) = config.health_check {
+                    // BUG-18: Use an AtomicBool cancellation flag so the health
+                    // check thread exits promptly when the container stops.
+                    let cancel_flag = std::sync::Arc::new(
+                        std::sync::atomic::AtomicBool::new(false),
+                    );
+                    let health_handle = if let Some(ref hc) = config.health_check {
                         if !hc.command.is_empty() {
                             let hc = hc.clone();
                             let pid = target_pid;
                             let container_name = config.name.clone();
-                            std::thread::spawn(move || {
-                                Self::health_check_loop(pid, &container_name, &hc);
-                            });
+                            let rootless = config.user_ns_config.is_some();
+                            let using_gvisor = config.use_gvisor;
+                            let cancel = cancel_flag.clone();
+                            Some(std::thread::spawn(move || {
+                                Self::health_check_loop(
+                                    pid,
+                                    &container_name,
+                                    rootless,
+                                    using_gvisor,
+                                    &hc,
+                                    &cancel,
+                                );
+                            }))
+                        } else {
+                            None
                         }
-                    }
+                    } else {
+                        None
+                    };
 
                     let exit_code = self.wait_for_child(child)?;
+
+                    // Signal the health check thread to stop and wait for it
+                    cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(handle) = health_handle {
+                        let _ = handle.join();
+                    }
                     child_waited = true;
                     Ok(exit_code)
                 })();
@@ -516,7 +543,8 @@ impl Container {
         )?;
 
         // 8b. Mask sensitive /proc paths to reduce kernel info leakage
-        mask_proc_paths(&proc_path)?;
+        // SEC-06: In production mode, failures to mask critical paths are fatal.
+        mask_proc_paths(&proc_path, self.config.service_mode == ServiceMode::Production)?;
 
         // 10. Switch root filesystem
         // Filesystem: Populated -> Pivoted
@@ -561,29 +589,42 @@ impl Container {
 
         // 12b. RLIMIT backstop: defense-in-depth against fork bombs and fd exhaustion.
         // Must be applied BEFORE seccomp, since SYS_setrlimit is not in the allowlist.
+        // SEC-05: In production mode, RLIMIT failures are fatal — a container
+        // without resource limits is a privilege escalation vector.
         {
+            let is_production = self.config.service_mode == ServiceMode::Production;
+
             let nproc_limit = self.config.limits.pids_max.unwrap_or(512);
             let rlim_nproc = libc::rlimit {
                 rlim_cur: nproc_limit,
                 rlim_max: nproc_limit,
             };
+            // SAFETY: setrlimit is a standard POSIX call with no memory safety concerns.
             if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc) } != 0 {
-                warn!(
-                    "Failed to set RLIMIT_NPROC to {}: {}",
-                    nproc_limit,
-                    std::io::Error::last_os_error()
-                );
+                let err = std::io::Error::last_os_error();
+                if is_production {
+                    return Err(NucleusError::SeccompError(format!(
+                        "Failed to set RLIMIT_NPROC to {} in production mode: {}",
+                        nproc_limit, err
+                    )));
+                }
+                warn!("Failed to set RLIMIT_NPROC to {}: {}", nproc_limit, err);
             }
 
             let rlim_nofile = libc::rlimit {
                 rlim_cur: 1024,
                 rlim_max: 1024,
             };
+            // SAFETY: setrlimit is a standard POSIX call with no memory safety concerns.
             if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim_nofile) } != 0 {
-                warn!(
-                    "Failed to set RLIMIT_NOFILE to 1024: {}",
-                    std::io::Error::last_os_error()
-                );
+                let err = std::io::Error::last_os_error();
+                if is_production {
+                    return Err(NucleusError::SeccompError(format!(
+                        "Failed to set RLIMIT_NOFILE to 1024 in production mode: {}",
+                        err
+                    )));
+                }
+                warn!("Failed to set RLIMIT_NOFILE to 1024: {}", err);
             }
 
             // RLIMIT_MEMLOCK: prevent container from pinning excessive physical
@@ -595,12 +636,16 @@ impl Container {
                 rlim_cur: memlock_limit,
                 rlim_max: memlock_limit,
             };
+            // SAFETY: setrlimit is a standard POSIX call with no memory safety concerns.
             if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim_memlock) } != 0 {
-                warn!(
-                    "Failed to set RLIMIT_MEMLOCK to {}: {}",
-                    memlock_limit,
-                    std::io::Error::last_os_error()
-                );
+                let err = std::io::Error::last_os_error();
+                if is_production {
+                    return Err(NucleusError::SeccompError(format!(
+                        "Failed to set RLIMIT_MEMLOCK to {} in production mode: {}",
+                        memlock_limit, err
+                    )));
+                }
+                warn!("Failed to set RLIMIT_MEMLOCK to {}: {}", memlock_limit, err);
             }
         }
 
@@ -853,9 +898,12 @@ impl Container {
                     mount.destination, e
                 ))
             })?;
-            let relative = normalized
-                .strip_prefix("/")
-                .expect("normalized OCI mount destination is always absolute");
+            let relative = normalized.strip_prefix("/").map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to convert OCI mount destination {:?} into a rootfs-relative path: {}",
+                    normalized, e
+                ))
+            })?;
             let target = rootfs.join(relative);
             if mount.mount_type == "bind" && std::path::Path::new(&mount.source).is_file() {
                 if let Some(parent) = target.parent() {
@@ -1310,9 +1358,18 @@ impl Container {
 
     fn notify_namespace_ready(fd: &OwnedFd, pid: u32) -> Result<()> {
         let payload = pid.to_ne_bytes();
-        write(fd, &payload).map_err(|e| {
-            NucleusError::ExecError(format!("Failed to notify namespace readiness: {}", e))
-        })?;
+        let mut written = 0;
+        while written < payload.len() {
+            let n = write(fd, &payload[written..]).map_err(|e| {
+                NucleusError::ExecError(format!("Failed to notify namespace readiness: {}", e))
+            })?;
+            if n == 0 {
+                return Err(NucleusError::ExecError(
+                    "Failed to notify namespace readiness: short write".to_string(),
+                ));
+            }
+            written += n;
+        }
         Ok(())
     }
 
@@ -1328,27 +1385,16 @@ impl Container {
         }
     }
 
-    /// Resolve nsenter to an absolute path when running as root.
-    fn resolve_nsenter() -> String {
-        if nix::unistd::Uid::effective().is_root() {
-            for path in &["/usr/bin/nsenter", "/usr/sbin/nsenter", "/bin/nsenter"] {
-                if std::path::Path::new(path).exists() {
-                    return path.to_string();
-                }
-            }
-        }
-        "nsenter".to_string()
-    }
-
     /// Run a readiness probe and, if sd_notify is active, send READY=1.
     fn run_readiness_probe(
         pid: u32,
         container_name: &str,
         probe: &crate::container::ReadinessProbe,
+        rootless: bool,
+        using_gvisor: bool,
         notify_socket: Option<&str>,
     ) -> Result<()> {
         use crate::container::ReadinessProbe;
-        use std::process::Command;
 
         info!("Running readiness probe for {}", container_name);
 
@@ -1365,37 +1411,21 @@ impl Container {
                 )));
             }
 
-            let nsenter_bin = Self::resolve_nsenter();
             let ready = match probe {
-                ReadinessProbe::Exec { command } => {
-                    let pid_str = pid.to_string();
-                    let mut cmd = Command::new(&nsenter_bin);
-                    cmd.arg("-t").arg(&pid_str).arg("-m").arg("-p").arg("-n");
-                    for arg in command {
-                        cmd.arg(arg);
-                    }
-                    cmd.stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false)
-                }
-                ReadinessProbe::TcpPort(port) => {
-                    // Probe TCP connectivity via the container's network namespace
-                    let pid_str = pid.to_string();
-                    Command::new(&nsenter_bin)
-                        .args(["-t", &pid_str, "-n", "--", "sh", "-c"])
-                        .arg(format!(
-                            "cat < /dev/tcp/127.0.0.1/{} > /dev/null 2>&1 || \
-                             exec 3<>/dev/tcp/127.0.0.1/{} 2>/dev/null",
-                            port, port
-                        ))
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false)
-                }
+                ReadinessProbe::Exec { command } => NamespaceCommandRunner::run(
+                    pid,
+                    rootless,
+                    using_gvisor,
+                    NamespaceProbe::Exec(command.clone()),
+                    Some(std::time::Duration::from_secs(5)),
+                )?,
+                ReadinessProbe::TcpPort(port) => NamespaceCommandRunner::run(
+                    pid,
+                    rootless,
+                    using_gvisor,
+                    NamespaceProbe::TcpConnect(*port),
+                    Some(std::time::Duration::from_secs(3)),
+                )?,
                 ReadinessProbe::SdNotify => {
                     // For SdNotify probe type, the container itself sends READY=1.
                     // We just pass through; the systemd integration handles it.
@@ -1449,16 +1479,40 @@ impl Container {
     }
 
     /// Run periodic health checks against the container via nsenter.
-    fn health_check_loop(pid: u32, container_name: &str, hc: &crate::container::HealthCheck) {
-        use std::process::Command;
+    fn health_check_loop(
+        pid: u32,
+        container_name: &str,
+        rootless: bool,
+        using_gvisor: bool,
+        hc: &crate::container::HealthCheck,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) {
+        // BUG-18: Use cancellable sleep so we exit promptly on container stop.
+        let cancellable_sleep = |dur: std::time::Duration| -> bool {
+            let step = std::time::Duration::from_millis(100);
+            let start = std::time::Instant::now();
+            while start.elapsed() < dur {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return true; // cancelled
+                }
+                std::thread::sleep(step.min(dur.saturating_sub(start.elapsed())));
+            }
+            cancel.load(std::sync::atomic::Ordering::Relaxed)
+        };
 
         // Wait for start_period before beginning checks
-        std::thread::sleep(hc.start_period);
+        if cancellable_sleep(hc.start_period) {
+            return;
+        }
 
         let mut consecutive_failures: u32 = 0;
-        let nsenter_bin = Self::resolve_nsenter();
 
         loop {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                debug!("Health check: cancelled for {}", container_name);
+                return;
+            }
+
             // Check if the container process is still alive
             let proc_path = format!("/proc/{}", pid);
             if !std::path::Path::new(&proc_path).exists() {
@@ -1466,45 +1520,14 @@ impl Container {
                 return;
             }
 
-            let pid_str = pid.to_string();
-            let mut cmd = Command::new(&nsenter_bin);
-            cmd.arg("-t").arg(&pid_str).arg("-m").arg("-p").arg("-n");
-            for arg in &hc.command {
-                cmd.arg(arg);
-            }
-
-            let result = cmd
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .and_then(|mut child| {
-                    let timeout = hc.timeout;
-                    let start = std::time::Instant::now();
-                    loop {
-                        match child.try_wait() {
-                            Ok(Some(status)) => return Ok(status),
-                            Ok(None) => {
-                                if start.elapsed() >= timeout {
-                                    let _ = child.kill();
-                                    let _ = child.wait();
-                                    warn!(
-                                        "Health check timed out after {:?} for {}",
-                                        timeout, container_name
-                                    );
-                                    return Err(std::io::Error::new(
-                                        std::io::ErrorKind::TimedOut,
-                                        "health check timed out",
-                                    ));
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                });
-
-            match result {
-                Ok(status) if status.success() => {
+            match NamespaceCommandRunner::run(
+                pid,
+                rootless,
+                using_gvisor,
+                NamespaceProbe::Exec(hc.command.clone()),
+                Some(hc.timeout),
+            ) {
+                Ok(true) => {
                     if consecutive_failures > 0 {
                         info!(
                             "Health check passed for {} after {} failures",
@@ -1513,7 +1536,7 @@ impl Container {
                     }
                     consecutive_failures = 0;
                 }
-                _ => {
+                Ok(false) => {
                     consecutive_failures += 1;
                     warn!(
                         "Health check failed for {} ({}/{})",
@@ -1530,9 +1553,16 @@ impl Container {
                         return;
                     }
                 }
+                Err(e) => {
+                    error!("Health check execution failed for {}: {}", container_name, e);
+                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                    return;
+                }
             }
 
-            std::thread::sleep(hc.interval);
+            if cancellable_sleep(hc.interval) {
+                return;
+            }
         }
     }
 
@@ -1757,5 +1787,92 @@ mod tests {
 
         Container::cleanup_gvisor_artifacts("cleanup-test").unwrap();
         assert!(!artifact_dir.exists());
+    }
+
+    #[test]
+    fn test_health_check_loop_supports_cancellation() {
+        // BUG-18: health_check_loop must accept an AtomicBool cancel flag
+        // and check it between iterations for prompt shutdown.
+        let source = include_str!("runtime.rs");
+        let fn_start = source.find("fn health_check_loop").unwrap();
+        let fn_body = &source[fn_start..fn_start + 2500];
+        assert!(
+            fn_body.contains("AtomicBool") && fn_body.contains("cancel"),
+            "health_check_loop must accept an AtomicBool cancellation flag"
+        );
+        // Must also check cancellation during sleep
+        assert!(
+            fn_body.contains("cancellable_sleep") || fn_body.contains("cancel.load"),
+            "health_check_loop must check cancellation during sleep intervals"
+        );
+    }
+
+    #[test]
+    fn test_runtime_probes_do_not_spawn_host_nsenter() {
+        let source = include_str!("runtime.rs");
+
+        let readiness_start = source.find("fn run_readiness_probe").unwrap();
+        let readiness_body = &source[readiness_start..readiness_start + 2500];
+        assert!(
+            !readiness_body.contains("Command::new(&nsenter_bin)"),
+            "readiness probes must not execute via host nsenter"
+        );
+
+        let health_start = source.find("fn health_check_loop").unwrap();
+        let health_body = &source[health_start..health_start + 2200];
+        assert!(
+            !health_body.contains("Command::new(&nsenter_bin)"),
+            "health checks must not execute via host nsenter"
+        );
+    }
+
+    #[test]
+    fn test_oci_mount_strip_prefix_no_expect() {
+        // BUG-08: prepare_oci_mountpoints must not use expect() - use ? instead
+        let source = include_str!("runtime.rs");
+        let fn_start = source.find("fn prepare_oci_mountpoints").unwrap();
+        let fn_body = &source[fn_start..fn_start + 600];
+        assert!(
+            !fn_body.contains(".expect("),
+            "prepare_oci_mountpoints must not use expect() — return Err instead"
+        );
+    }
+
+    #[test]
+    fn test_notify_namespace_ready_validates_write_length() {
+        // BUG-02: notify_namespace_ready must validate that all bytes were written
+        let source = include_str!("runtime.rs");
+        let fn_start = source.find("fn notify_namespace_ready").unwrap();
+        let fn_body = &source[fn_start..fn_start + 500];
+        // Must check the return value of write() for partial writes
+        assert!(
+            fn_body.contains("written") || fn_body.contains("4") || fn_body.contains("payload.len()"),
+            "notify_namespace_ready must validate complete write of all 4 bytes"
+        );
+    }
+
+    #[test]
+    fn test_rlimit_failures_fatal_in_production() {
+        // SEC-05: RLIMIT failures must be fatal in production mode
+        let source = include_str!("runtime.rs");
+        let rlimit_start = source.find("12b. RLIMIT backstop").unwrap();
+        let rlimit_section = &source[rlimit_start..rlimit_start + 2000];
+        assert!(
+            rlimit_section.contains("is_production")
+                && rlimit_section.contains("return Err"),
+            "RLIMIT failures must return Err in production mode"
+        );
+    }
+
+    #[test]
+    fn test_tcp_readiness_probe_uses_portable_check() {
+        // BUG-14: TCP readiness probe must not use /dev/tcp (bash-only)
+        let source = include_str!("runtime.rs");
+        let probe_fn = source.find("TcpPort(port)").unwrap();
+        let probe_body = &source[probe_fn..probe_fn + 500];
+        assert!(
+            !probe_body.contains("/dev/tcp"),
+            "TCP readiness probe must not use /dev/tcp (bash-specific, fails on dash/ash)"
+        );
     }
 }

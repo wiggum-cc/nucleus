@@ -592,7 +592,7 @@ fn main() -> Result<()> {
             // Generate a NEW container ID to avoid overwriting the original state file
             // (the original container may still be running with --leave-running).
             let metadata = nucleus::checkpoint::CheckpointMetadata::load(&input_path)?;
-            let new_id = nucleus::container::generate_container_id();
+            let new_id = nucleus::container::generate_container_id()?;
             let new_name = format!("{}-restored", metadata.container_name);
             let state_mgr = ContainerStateManager::new()?;
             let state = ContainerState::new(
@@ -820,7 +820,7 @@ fn main() -> Result<()> {
             }
 
             // Build configuration
-            let mut config = ContainerConfig::new(name, command)
+            let mut config = ContainerConfig::try_new(name, command)?
                 .with_limits(limits)
                 .with_namespaces(namespaces)
                 .with_network(net_mode)

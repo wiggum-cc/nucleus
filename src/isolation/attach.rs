@@ -1,14 +1,25 @@
 use crate::container::ContainerState;
 use crate::error::{NucleusError, Result};
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{fork, ForkResult, Pid};
 use std::ffi::CString;
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
+use std::thread;
+use std::time::{Duration, Instant};
 use tracing::info;
 
 /// Attach to a running container by entering its namespaces
 pub struct ContainerAttach;
+
+/// Minimal probe operations that can be executed after joining container namespaces.
+pub enum NamespaceProbe {
+    Exec(Vec<String>),
+    TcpConnect(u16),
+}
+
+/// Run trusted helper actions inside a container's namespaces.
+pub struct NamespaceCommandRunner;
 
 impl ContainerAttach {
     /// Attach to a running container and execute a command
@@ -45,30 +56,7 @@ impl ContainerAttach {
         let pid = state.pid;
         info!("Attaching to container {} (PID {})", state.id, pid);
 
-        // Open namespace file descriptors (include user namespace when present)
-        let ns_types = if state.rootless {
-            &["user", "pid", "mnt", "net", "uts", "ipc", "cgroup"][..]
-        } else {
-            &["pid", "mnt", "net", "uts", "ipc", "cgroup"][..]
-        };
-        let mut ns_fds: Vec<(String, File)> = Vec::new();
-
-        for ns in ns_types {
-            let ns_path = format!("/proc/{}/ns/{}", pid, ns);
-            match File::open(&ns_path) {
-                Ok(f) => ns_fds.push(((*ns).to_string(), f)),
-                Err(e) => {
-                    // Some namespaces may not be available
-                    info!("Skipping namespace {}: {}", ns, e);
-                }
-            }
-        }
-
-        if ns_fds.is_empty() {
-            return Err(NucleusError::AttachError(
-                "Could not open any namespace FDs".to_string(),
-            ));
-        }
+        let ns_fds = Self::open_namespace_fds(pid, state.rootless)?;
 
         // Fork child
         match unsafe { fork() }
@@ -98,6 +86,41 @@ impl ContainerAttach {
             ));
         }
 
+        Self::enter_namespaces(ns_fds)?;
+        Self::apply_exec_hardening()?;
+        let env = Self::default_exec_env()?;
+        Self::exec_with_env(command, &env)
+    }
+
+    fn open_namespace_fds(pid: u32, rootless: bool) -> Result<Vec<(String, File)>> {
+        let ns_types = if rootless {
+            &["user", "pid", "mnt", "net", "uts", "ipc", "cgroup"][..]
+        } else {
+            &["pid", "mnt", "net", "uts", "ipc", "cgroup"][..]
+        };
+        let mut ns_fds: Vec<(String, File)> = Vec::new();
+
+        for ns in ns_types {
+            let ns_path = format!("/proc/{}/ns/{}", pid, ns);
+            match File::open(&ns_path) {
+                Ok(f) => ns_fds.push(((*ns).to_string(), f)),
+                Err(e) => {
+                    // Some namespaces may not be available
+                    info!("Skipping namespace {}: {}", ns, e);
+                }
+            }
+        }
+
+        if ns_fds.is_empty() {
+            return Err(NucleusError::AttachError(
+                "Could not open any namespace FDs".to_string(),
+            ));
+        }
+
+        Ok(ns_fds)
+    }
+
+    fn enter_namespaces(ns_fds: &[(String, File)]) -> Result<()> {
         // Enter user namespace first (required before other setns calls in
         // rootless containers), then non-PID namespaces.
         // PID namespace membership only applies to future children after setns().
@@ -170,6 +193,10 @@ impl ContainerAttach {
         nix::unistd::chdir("/")
             .map_err(|e| NucleusError::AttachError(format!("chdir(\"/\") failed: {}", e)))?;
 
+        Ok(())
+    }
+
+    fn apply_exec_hardening() -> Result<()> {
         // Apply security hardening before exec: no_new_privs + capability drop
         let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
         if ret != 0 {
@@ -184,18 +211,32 @@ impl ContainerAttach {
             NucleusError::AttachError(format!("Failed to drop capabilities: {}", e))
         })?;
 
-        // Exec the command
+        Ok(())
+    }
+
+    fn default_exec_env() -> Result<Vec<CString>> {
+        Ok(vec![
+            CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+                .map_err(|e| NucleusError::AttachError(format!("Invalid PATH env: {}", e)))?,
+            CString::new("TERM=xterm")
+                .map_err(|e| NucleusError::AttachError(format!("Invalid TERM env: {}", e)))?,
+            CString::new("HOME=/")
+                .map_err(|e| NucleusError::AttachError(format!("Invalid HOME env: {}", e)))?,
+        ])
+    }
+
+    fn exec_with_env(command: &[String], env: &[CString]) -> Result<()> {
         let program = CString::new(command[0].as_str())
             .map_err(|e| NucleusError::AttachError(format!("Invalid program name: {}", e)))?;
 
         let args: std::result::Result<Vec<CString>, _> = command
             .iter()
             .map(|arg| CString::new(arg.as_str()))
-            .collect();
+        .collect();
         let args =
             args.map_err(|e| NucleusError::AttachError(format!("Invalid argument: {}", e)))?;
 
-        nix::unistd::execve::<CString, CString>(&program, &args, &[])
+        nix::unistd::execve::<CString, CString>(&program, &args, env)
             .map_err(|e| NucleusError::AttachError(format!("execve failed: {}", e)))?;
 
         Ok(())
@@ -223,6 +264,92 @@ impl ContainerAttach {
                 Err(nix::errno::Errno::EINTR) => continue,
                 Err(e) => {
                     return Err(NucleusError::AttachError(format!("waitpid failed: {}", e)));
+                }
+                _ => continue,
+            }
+        }
+    }
+}
+
+impl NamespaceCommandRunner {
+    /// Run a probe-style helper inside the target container's namespaces.
+    ///
+    /// This enters namespaces in-process, then immediately applies
+    /// `PR_SET_NO_NEW_PRIVS` and drops capabilities before executing any
+    /// container-controlled binary. That avoids running helpers via a privileged
+    /// host `nsenter` process.
+    pub fn run(
+        pid: u32,
+        rootless: bool,
+        using_gvisor: bool,
+        probe: NamespaceProbe,
+        timeout: Option<Duration>,
+    ) -> Result<bool> {
+        if using_gvisor {
+            return Err(NucleusError::ExecError(
+                "Namespace-local exec probes are unsupported for gVisor containers".to_string(),
+            ));
+        }
+
+        let ns_fds = ContainerAttach::open_namespace_fds(pid, rootless)?;
+
+        match unsafe { fork() }.map_err(|e| {
+            NucleusError::ExecError(format!("Failed to fork namespace helper: {}", e))
+        })? {
+            ForkResult::Parent { child } => Self::wait_for_probe(child, timeout),
+            ForkResult::Child => {
+                let exit_code = match Self::enter_and_run(&ns_fds, probe) {
+                    Ok(true) => 0,
+                    Ok(false) => 1,
+                    Err(e) => {
+                        eprintln!("Namespace helper failed: {}", e);
+                        125
+                    }
+                };
+                std::process::exit(exit_code);
+            }
+        }
+    }
+
+    fn enter_and_run(ns_fds: &[(String, File)], probe: NamespaceProbe) -> Result<bool> {
+        ContainerAttach::enter_namespaces(ns_fds)?;
+        ContainerAttach::apply_exec_hardening()?;
+
+        match probe {
+            NamespaceProbe::Exec(command) => {
+                let env = ContainerAttach::default_exec_env()?;
+                ContainerAttach::exec_with_env(&command, &env)?;
+                unreachable!()
+            }
+            NamespaceProbe::TcpConnect(port) => {
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                Ok(std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok())
+            }
+        }
+    }
+
+    fn wait_for_probe(child: Pid, timeout: Option<Duration>) -> Result<bool> {
+        let start = Instant::now();
+        loop {
+            match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) => {
+                    if let Some(limit) = timeout {
+                        if start.elapsed() >= limit {
+                            let _ = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
+                            let _ = waitpid(child, None);
+                            return Ok(false);
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Ok(WaitStatus::Exited(_, code)) => return Ok(code == 0),
+                Ok(WaitStatus::Signaled(_, _, _)) => return Ok(false),
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => {
+                    return Err(NucleusError::ExecError(format!(
+                        "Failed waiting for namespace helper: {}",
+                        e
+                    )));
                 }
                 _ => continue,
             }

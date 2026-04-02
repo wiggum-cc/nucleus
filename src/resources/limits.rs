@@ -165,7 +165,7 @@ impl ResourceLimits {
         let bytes = Self::parse_memory(limit)?;
         self.memory_bytes = Some(bytes);
         // Auto-set soft limit to 90% of hard limit (per spec)
-        self.memory_high = Some((bytes as f64 * 0.9) as u64);
+        self.memory_high = Some(bytes - bytes / 10);
         // Disable swap by default when memory limit is set
         if self.memory_swap_max.is_none() {
             self.memory_swap_max = Some(0);
@@ -181,10 +181,18 @@ impl ResourceLimits {
 
     /// Set CPU limit in cores (e.g., 2.5 cores)
     pub fn with_cpu_cores(mut self, cores: f64) -> Result<Self> {
+        const MAX_CPU_CORES: f64 = 65_536.0;
+
         if cores <= 0.0 || cores.is_nan() || cores.is_infinite() {
             return Err(NucleusError::InvalidResourceLimit(
                 "CPU cores must be a finite positive number".to_string(),
             ));
+        }
+        if cores > MAX_CPU_CORES {
+            return Err(NucleusError::InvalidResourceLimit(format!(
+                "CPU cores must be <= {}",
+                MAX_CPU_CORES
+            )));
         }
         // Convert cores to quota: cores * period
         let quota = (cores * self.cpu_period_us as f64) as u64;
@@ -290,10 +298,7 @@ mod tests {
         let expected_bytes = 1024 * 1024 * 1024u64;
         assert_eq!(limits.memory_bytes, Some(expected_bytes));
         // memory_high should be 90% of hard limit
-        assert_eq!(
-            limits.memory_high,
-            Some((expected_bytes as f64 * 0.9) as u64)
-        );
+        assert_eq!(limits.memory_high, Some(expected_bytes - expected_bytes / 10));
     }
 
     #[test]
@@ -385,5 +390,27 @@ mod tests {
         assert!(limits.cpu_weight.is_none());
         assert!(limits.pids_max.is_none());
         assert!(limits.io_limits.is_empty());
+    }
+
+    #[test]
+    fn test_memory_high_uses_integer_arithmetic() {
+        // BUG-13: memory_high must use integer arithmetic, not floating point
+        let limits = ResourceLimits::unlimited().with_memory("1G").unwrap();
+        let bytes = 1024u64 * 1024 * 1024;
+        let expected_high = bytes - bytes / 10; // 90% via integer
+        assert_eq!(
+            limits.memory_high,
+            Some(expected_high),
+            "memory_high must be exactly bytes - bytes/10 (integer arithmetic)"
+        );
+    }
+
+    #[test]
+    fn test_cpu_cores_rejects_extreme_values() {
+        // BUG-12: Extreme CPU core values must be rejected, not silently overflow
+        assert!(ResourceLimits::unlimited().with_cpu_cores(f64::NAN).is_err());
+        assert!(ResourceLimits::unlimited().with_cpu_cores(f64::INFINITY).is_err());
+        assert!(ResourceLimits::unlimited().with_cpu_cores(100_000.0).is_err(),
+            "CPU cores > 65536 must be rejected to prevent quota overflow");
     }
 }

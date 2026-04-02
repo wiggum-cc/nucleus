@@ -1,6 +1,7 @@
 //! Topology configuration: declarative multi-container definitions.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -243,6 +244,12 @@ impl TopologyConfig {
             // Validate volume mounts reference existing volume defs
             for vol_mount in &svc.volumes {
                 let vol_name = vol_mount.split(':').next().unwrap_or("");
+                if vol_name.starts_with('/') {
+                    return Err(crate::error::NucleusError::ConfigError(format!(
+                        "Service '{}' uses absolute host-path volume mount '{}'; topology configs must reference a named volume instead",
+                        name, vol_name
+                    )));
+                }
                 if !self.volumes.contains_key(vol_name) {
                     return Err(crate::error::NucleusError::ConfigError(format!(
                         "Service '{}' references unknown volume '{}'",
@@ -257,13 +264,12 @@ impl TopologyConfig {
 
     /// Get the config hash for change detection (using service definitions).
     pub fn service_config_hash(&self, service_name: &str) -> Option<u64> {
-        self.services.get(service_name).map(|svc| {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let json = serde_json::to_string(svc).unwrap_or_default();
-            let mut hasher = DefaultHasher::new();
-            json.hash(&mut hasher);
-            hasher.finish()
+        self.services.get(service_name).and_then(|svc| {
+            let json = serde_json::to_vec(svc).ok()?;
+            let digest = Sha256::digest(&json);
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&digest[..8]);
+            Some(u64::from_be_bytes(bytes))
         })
     }
 }
@@ -380,5 +386,55 @@ condition = "healthy"
         let config = TopologyConfig::from_toml(toml).unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("health_check"));
+    }
+
+    #[test]
+    fn test_service_config_hash_is_stable_across_invocations() {
+        // BUG-03: service_config_hash must be deterministic across binary versions.
+        // DefaultHasher is not guaranteed stable; we need a stable algorithm.
+        let toml = r#"
+name = "test"
+
+[services.web]
+rootfs = "/nix/store/web"
+command = ["/bin/web"]
+memory = "256M"
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        let hash1 = config.service_config_hash("web").unwrap();
+        let hash2 = config.service_config_hash("web").unwrap();
+        assert_eq!(hash1, hash2, "hash must be deterministic within same process");
+
+        // Verify we're NOT using DefaultHasher by checking source code
+        let source = include_str!("config.rs");
+        let hash_fn = source.find("fn service_config_hash").unwrap();
+        let hash_body = &source[hash_fn..hash_fn + 300];
+        assert!(
+            !hash_body.contains("DefaultHasher"),
+            "service_config_hash must not use DefaultHasher (unstable across Rust versions)"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_absolute_path_volume_mounts() {
+        // BUG-20: Docker-style absolute path volume mounts must produce
+        // a clear error, not a confusing "unknown volume" message
+        let toml = r#"
+name = "test"
+
+[services.web]
+rootfs = "/nix/store/web"
+command = ["/bin/web"]
+memory = "256M"
+volumes = ["/host/path:/container/path"]
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("absolute") || msg.contains("named volume"),
+            "Absolute path volume mount must produce a clear error about named volumes, got: {}",
+            msg
+        );
     }
 }

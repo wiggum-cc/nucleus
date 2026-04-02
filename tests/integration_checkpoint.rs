@@ -6,6 +6,8 @@
 mod tests {
     use nucleus::checkpoint::CheckpointMetadata;
     use nucleus::container::ContainerState;
+    use std::fs;
+    use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
     fn sample_state() -> ContainerState {
@@ -122,5 +124,36 @@ mod tests {
         let loaded = CheckpointMetadata::load(temp.path()).unwrap();
         assert!(loaded.using_gvisor);
         assert!(!loaded.rootless);
+    }
+
+    #[test]
+    fn test_metadata_save_rejects_symlinked_tempfile() {
+        let temp = TempDir::new().unwrap();
+        let victim = temp.path().join("victim.txt");
+        fs::write(&victim, "host-data").unwrap();
+        symlink(&victim, temp.path().join("metadata.json.tmp")).unwrap();
+
+        let meta = CheckpointMetadata::from_state(&sample_state());
+        let err = meta.save(temp.path()).unwrap_err();
+
+        assert!(
+            err.to_string().contains("temp metadata file"),
+            "save must fail closed on symlinked temp path"
+        );
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "host-data");
+    }
+
+    #[test]
+    fn test_metadata_load_rejects_symlink() {
+        let temp = TempDir::new().unwrap();
+        let victim = temp.path().join("victim.txt");
+        fs::write(&victim, "{\"container_id\":\"leak\"}").unwrap();
+        symlink(&victim, temp.path().join("metadata.json")).unwrap();
+
+        let err = CheckpointMetadata::load(temp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("metadata"),
+            "load must reject symlinked metadata files"
+        );
     }
 }

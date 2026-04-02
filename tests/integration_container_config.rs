@@ -21,14 +21,14 @@ mod tests {
 
     #[test]
     fn test_container_id_is_32_hex_chars() {
-        let id = generate_container_id();
+        let id = generate_container_id().unwrap();
         assert_eq!(id.len(), 32);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
     fn test_container_id_uniqueness() {
-        let ids: HashSet<String> = (0..100).map(|_| generate_container_id()).collect();
+        let ids: HashSet<String> = (0..100).map(|_| generate_container_id().unwrap()).collect();
         assert_eq!(ids.len(), 100, "Generated IDs should be unique");
     }
 
@@ -235,6 +235,7 @@ mod tests {
         let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
             .with_service_mode(ServiceMode::Production)
             .with_rootfs_path(PathBuf::from("/nix/store/fake-rootfs"))
+            .with_verify_rootfs_attestation(true)
             .with_limits(
                 ResourceLimits::unlimited()
                     .with_memory("512M")
@@ -244,6 +245,23 @@ mod tests {
             );
 
         assert!(config.validate_production_mode().is_ok());
+    }
+
+    #[test]
+    fn test_production_mode_requires_rootfs_attestation() {
+        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_service_mode(ServiceMode::Production)
+            .with_rootfs_path(PathBuf::from("/nix/store/fake-rootfs"))
+            .with_limits(
+                ResourceLimits::unlimited()
+                    .with_memory("512M")
+                    .unwrap()
+                    .with_cpu_cores(1.0)
+                    .unwrap(),
+            );
+
+        let err = config.validate_production_mode().unwrap_err();
+        assert!(err.to_string().contains("attestation"));
     }
 
     #[test]

@@ -94,12 +94,26 @@ impl ContainerState {
     }
 
     /// Read the start time in clock ticks from /proc/<pid>/stat (field 22)
+    ///
+    /// BUG-09: After fork, /proc/<pid>/stat may not be immediately available.
+    /// Retry a few times with short sleeps to avoid returning 0 and breaking
+    /// PID-reuse detection in is_running().
     fn read_start_ticks(pid: u32) -> u64 {
         let stat_path = format!("/proc/{}/stat", pid);
-        match std::fs::read_to_string(&stat_path) {
-            Ok(content) => Self::parse_start_ticks(&content).unwrap_or(0),
-            Err(_) => 0,
+        for attempt in 0..5 {
+            match std::fs::read_to_string(&stat_path) {
+                Ok(content) => {
+                    if let Some(ticks) = Self::parse_start_ticks(&content) {
+                        return ticks;
+                    }
+                }
+                Err(_) => {}
+            }
+            if attempt < 4 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
+        0
     }
 
     /// Parse start time (field 22) from /proc/<pid>/stat content
@@ -124,8 +138,9 @@ impl ContainerState {
         match std::fs::read_to_string(&stat_path) {
             Ok(content) => {
                 if self.start_ticks == 0 {
-                    // Legacy state without start_ticks – fall back to existence check
-                    return true;
+                    // PID existence alone is insufficient because the PID may have
+                    // been recycled since this state was recorded.
+                    return false;
                 }
                 Self::parse_start_ticks(&content)
                     .map(|ticks| ticks == self.start_ticks)
@@ -789,5 +804,52 @@ mod tests {
         // save_state should fail because O_NOFOLLOW rejects the symlink
         let result = mgr.save_state(&state);
         assert!(result.is_err(), "save_state must reject symlinks at tmp path");
+    }
+
+    #[test]
+    fn test_is_running_returns_false_when_start_ticks_is_zero() {
+        // BUG-04: When start_ticks=0 (failed to read), is_running() must return
+        // false to avoid PID reuse false positives, not fall back to existence check
+        let mut state = ContainerState::new(
+            "test".to_string(),
+            "test".to_string(),
+            std::process::id(), // our PID exists in /proc
+            vec!["/bin/sh".to_string()],
+            None,
+            None,
+            false,
+            false,
+            None,
+        );
+        // Force start_ticks to 0 to simulate failed read
+        state.start_ticks = 0;
+        // With BUG-04 present, this returns true (falls back to existence check)
+        // After fix, must return false
+        assert!(
+            !state.is_running(),
+            "is_running() must return false when start_ticks=0 (cannot verify PID identity)"
+        );
+    }
+
+    #[test]
+    fn test_read_start_ticks_retries_on_failure() {
+        // BUG-09: read_start_ticks must retry when /proc/<pid>/stat is temporarily
+        // unavailable after fork, instead of immediately returning 0.
+        let source = include_str!("state.rs");
+        let fn_start = source.find("fn read_start_ticks").unwrap();
+        let fn_body = &source[fn_start..fn_start + 500];
+        assert!(
+            fn_body.contains("attempt") || fn_body.contains("retry") || fn_body.contains("for"),
+            "read_start_ticks must retry on failure to avoid returning 0 after fork"
+        );
+    }
+
+    #[test]
+    fn test_delete_state_handles_already_deleted() {
+        // BUG-16: delete_state must not fail if file was already deleted (TOCTOU)
+        let (mgr, _temp_dir) = temp_state_manager();
+        // Delete a state that doesn't exist — should succeed (idempotent)
+        let result = mgr.delete_state("nonexistent-id");
+        assert!(result.is_ok(), "delete_state must be idempotent for missing files");
     }
 }

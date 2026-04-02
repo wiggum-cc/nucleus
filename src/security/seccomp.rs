@@ -81,7 +81,6 @@ impl SeccompManager {
             // Memory management
             libc::SYS_mmap,
             libc::SYS_munmap,
-            libc::SYS_mprotect,
             libc::SYS_brk,
             libc::SYS_mremap,
             libc::SYS_madvise,
@@ -312,6 +311,34 @@ impl SeccompManager {
             prctl_rules.push(rule);
         }
         rules.insert(libc::SYS_prctl, prctl_rules);
+
+        // mprotect: permit RW or RX transitions, but reject PROT_WRITE|PROT_EXEC.
+        let mut mprotect_rules = Vec::new();
+        for allowed in [
+            0,
+            libc::PROT_WRITE as u64,
+            libc::PROT_EXEC as u64,
+        ] {
+            let condition = SeccompCondition::new(
+                2, // arg2 is prot for mprotect(addr, len, prot)
+                seccompiler::SeccompCmpArgLen::Dword,
+                seccompiler::SeccompCmpOp::MaskedEq(
+                    (libc::PROT_WRITE | libc::PROT_EXEC) as u64,
+                ),
+                allowed,
+            )
+            .map_err(|e| {
+                NucleusError::SeccompError(format!(
+                    "Failed to create mprotect condition: {}",
+                    e
+                ))
+            })?;
+            let rule = SeccompRule::new(vec![condition]).map_err(|e| {
+                NucleusError::SeccompError(format!("Failed to create mprotect rule: {}", e))
+            })?;
+            mprotect_rules.push(rule);
+        }
+        rules.insert(libc::SYS_mprotect, mprotect_rules);
 
         // clone3: DENIED. clone3 passes flags inside a struct pointer that seccomp
         // BPF cannot dereference, so namespace-flag filtering is impossible. Rather
@@ -565,6 +592,29 @@ impl SeccompManager {
             }
         }
 
+        // SEC-01: Merge built-in argument filters for security-critical syscalls.
+        // Custom profiles that allow clone/ioctl/prctl/socket/mprotect by name
+        // without argument-level filters would silently remove all hardening.
+        // Overwrite their empty rules with the built-in argument-filtered rules.
+        let builtin_rules = Self::minimal_filter(true)?;
+        for syscall_name in Self::ARG_FILTERED_SYSCALLS {
+            if let Some(nr) = syscall_name_to_number(syscall_name) {
+                if rules.contains_key(&nr) {
+                    if let Some(builtin) = builtin_rules.get(&nr) {
+                        if !builtin.is_empty() {
+                            info!(
+                                "Merging built-in argument filters for '{}' into custom profile",
+                                syscall_name
+                            );
+                            rules.insert(nr, builtin.clone());
+                        }
+                    }
+                }
+            }
+        }
+        // Also enforce clone3 denial — it cannot be argument-filtered
+        rules.remove(&libc::SYS_clone3);
+
         let filter = SeccompFilter::new(
             rules,
             SeccompAction::Errno(libc::EPERM as u32),
@@ -636,7 +686,7 @@ impl SeccompManager {
     /// Syscalls that the built-in filter restricts at the argument level.
     /// Custom profiles allowing these without argument filters weaken security.
     const ARG_FILTERED_SYSCALLS: &'static [&'static str] =
-        &["clone", "clone3", "ioctl", "prctl", "socket"];
+        &["clone", "clone3", "ioctl", "mprotect", "prctl", "socket"];
 
     /// Warn when a custom seccomp profile allows security-critical syscalls
     /// without argument-level filtering.
@@ -694,6 +744,8 @@ impl SeccompManager {
         bpf_prog: &BpfProgram,
         flags: libc::c_ulong,
     ) -> std::io::Result<()> {
+        // SAFETY: `prctl(PR_SET_NO_NEW_PRIVS, ...)` has no pointer arguments here
+        // and only affects the current thread/process as required before seccomp.
         let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
         if rc != 0 {
             return Err(std::io::Error::last_os_error());
@@ -704,6 +756,8 @@ impl SeccompManager {
             filter: bpf_prog.as_ptr() as *mut libc::sock_filter,
         };
 
+        // SAFETY: `prog` points to a live BPF program buffer for the duration of
+        // the syscall and the kernel copies the pointed-to filter immediately.
         let rc = unsafe {
             libc::syscall(
                 libc::SYS_seccomp,
@@ -999,12 +1053,13 @@ mod tests {
         let net = SeccompManager::network_mode_syscalls(true);
 
         // Snapshot counts to catch unintended policy drift.
-        // +4 accounts for conditional rules inserted in minimal_filter(): socket/ioctl/prctl/clone.
+        // +5 accounts for conditional rules inserted in minimal_filter():
+        // socket/ioctl/prctl/mprotect/clone.
         // clone3 is blocked (not in rules map), so it does not count.
-        assert_eq!(base.len(), 135);
+        assert_eq!(base.len(), 134);
         assert_eq!(net.len(), 11);
-        assert_eq!(base.len() + 4, 139);
-        assert_eq!(base.len() + net.len() + 4, 150);
+        assert_eq!(base.len() + 5, 139);
+        assert_eq!(base.len() + net.len() + 5, 150);
     }
 
     #[test]
@@ -1065,6 +1120,73 @@ mod tests {
                 "syscall {} unexpectedly present in base allowlist",
                 syscall
             );
+        }
+    }
+
+    #[test]
+    fn test_custom_profile_preserves_clone_arg_filters() {
+        // SEC-01: Custom seccomp profiles that allow "clone" must still get
+        // argument-level filtering to block namespace-creating flags
+        let source = include_str!("seccomp.rs");
+        let profile_fn = source.find("pub fn apply_profile_from_file").unwrap();
+        let profile_body = &source[profile_fn..profile_fn + 2000];
+        // After building rules from custom profile, the code must merge
+        // built-in argument filters for security-critical syscalls
+        assert!(
+            profile_body.contains("merge") || profile_body.contains("arg_filter")
+                || profile_body.contains("clone_condition") || profile_body.contains("DENIED_CLONE"),
+            "apply_profile_from_file must merge built-in argument filters for clone/ioctl/prctl/socket"
+        );
+    }
+
+    #[test]
+    fn test_memfd_create_not_in_default_allowlist() {
+        // SEC-02: memfd_create enables fileless code execution when combined with execveat
+        let source = include_str!("seccomp.rs");
+        let base_fn = source.find("fn base_allowed_syscalls").unwrap();
+        let base_body = &source[base_fn..base_fn + 2000];
+        assert!(
+            !base_body.contains("memfd_create"),
+            "memfd_create must not be in the default seccomp allowlist (fileless exec risk)"
+        );
+    }
+
+    #[test]
+    fn test_mprotect_has_arg_filtering() {
+        // SEC-03: mprotect must filter PROT_WRITE|PROT_EXEC combinations
+        let source = include_str!("seccomp.rs");
+        let filter_fn = source.find("fn minimal_filter").unwrap();
+        let filter_body = &source[filter_fn..];
+        assert!(
+            filter_body.contains("mprotect") && (filter_body.contains("PROT_EXEC") || filter_body.contains("condition")),
+            "mprotect must have argument-level filtering to prevent W^X violations"
+        );
+        // mprotect must NOT be in the unconditional allowlist
+        let base_fn = source.find("fn base_allowed_syscalls").unwrap();
+        let base_body = &source[base_fn..base_fn + 2000];
+        assert!(
+            !base_body.contains("SYS_mprotect"),
+            "SYS_mprotect must not be unconditionally allowed - needs arg filtering"
+        );
+    }
+
+    #[test]
+    fn test_unsafe_blocks_have_safety_comments() {
+        // SEC-08: All unsafe blocks must have // SAFETY: documentation
+        let source = include_str!("seccomp.rs");
+        let mut pos = 0;
+        while let Some(idx) = source[pos..].find("unsafe {") {
+            let abs_idx = pos + idx;
+            // Check that there's a SAFETY comment within 200 chars before the unsafe block
+            let start = abs_idx.saturating_sub(200);
+            let context = &source[start..abs_idx];
+            assert!(
+                context.contains("SAFETY:"),
+                "unsafe block at byte {} must have a // SAFETY: comment. Context: ...{}...",
+                abs_idx,
+                &source[abs_idx.saturating_sub(80)..abs_idx + 10]
+            );
+            pos = abs_idx + 1;
         }
     }
 }

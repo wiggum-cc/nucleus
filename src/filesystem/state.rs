@@ -31,6 +31,8 @@ impl FilesystemState {
             (Unmounted, Mounted)
                 | (Mounted, Populated)
                 | (Populated, Pivoted)
+                | (Mounted, Unmounted)
+                | (Populated, Unmounted)
                 | (Pivoted, UnmountedFinal)
                 | (Unmounted, Unmounted)
                 | (Mounted, Mounted)
@@ -88,5 +90,18 @@ mod tests {
         assert!(!FilesystemState::Populated.is_terminal());
         assert!(!FilesystemState::Pivoted.is_terminal());
         assert!(FilesystemState::UnmountedFinal.is_terminal());
+    }
+
+    #[test]
+    fn test_cleanup_transitions() {
+        // BUG-10: Mounted and Populated must be able to transition to Unmounted (cleanup)
+        assert!(
+            FilesystemState::Mounted.can_transition_to(FilesystemState::Unmounted),
+            "Mounted must be able to transition back to Unmounted for cleanup"
+        );
+        assert!(
+            FilesystemState::Populated.can_transition_to(FilesystemState::Unmounted),
+            "Populated must be able to transition back to Unmounted for cleanup"
+        );
     }
 }

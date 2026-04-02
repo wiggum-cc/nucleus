@@ -50,6 +50,12 @@ impl DependencyGraph {
 
         for (name, svc) in &config.services {
             for dep in &svc.depends_on {
+                if !config.services.contains_key(&dep.service) {
+                    return Err(NucleusError::ConfigError(format!(
+                        "Service '{}' depends on undefined service '{}'",
+                        name, dep.service
+                    )));
+                }
                 *in_degree.entry(name.clone()).or_insert(0) += 1;
                 edges.entry(name.clone()).or_default().push(DependencyEdge {
                     service: dep.service.clone(),
@@ -230,5 +236,26 @@ mod tests {
         let (after, requires) = graph.systemd_deps("web", "myapp");
         assert_eq!(after, vec!["nucleus-myapp-db.service"]);
         assert_eq!(requires, vec!["nucleus-myapp-db.service"]);
+    }
+
+    #[test]
+    fn test_missing_dependency_gives_clear_error() {
+        // BUG-05: When a service depends on an undefined service, the error
+        // must say "undefined service", not "circular dependency"
+        let config = make_topology(&[("web", &[("nonexistent", "started")])]);
+        let result = DependencyGraph::resolve(&config);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("undefined") || err_msg.contains("unknown") || err_msg.contains("not found"),
+            "Error for missing dependency must mention 'undefined/unknown/not found', got: {}",
+            err_msg
+        );
+        // Must NOT say "circular"
+        assert!(
+            !err_msg.contains("ircular"),
+            "Missing dependency must not be reported as circular, got: {}",
+            err_msg
+        );
     }
 }

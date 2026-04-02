@@ -67,6 +67,9 @@ impl LazyContextPopulator {
             nix::mount::MsFlags::MS_BIND
                 | nix::mount::MsFlags::MS_REC
                 | nix::mount::MsFlags::MS_RDONLY
+                | nix::mount::MsFlags::MS_NOSUID
+                | nix::mount::MsFlags::MS_NODEV
+                | nix::mount::MsFlags::MS_NOEXEC
                 | nix::mount::MsFlags::MS_REMOUNT,
             None::<&str>,
         )
@@ -82,6 +85,9 @@ impl LazyContextPopulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+    use tempfile::TempDir;
 
     #[test]
     fn test_context_mode_default() {
@@ -96,5 +102,32 @@ mod tests {
             Path::new("/tmp/dest"),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_bind_mount_context_rejects_special_files() {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let fifo_path = src.join("agent.fifo");
+        mkfifo(&fifo_path, Mode::from_bits_truncate(0o600)).unwrap();
+
+        let err = LazyContextPopulator::bind_mount_context(&src, &dst).unwrap_err();
+        assert!(
+            err.to_string().contains("special file"),
+            "bind-mounted contexts must reject host special files"
+        );
+    }
+
+    #[test]
+    fn test_bind_mount_context_remount_adds_hardening_flags() {
+        let source = include_str!("lazy.rs");
+        let fn_start = source.find("fn bind_mount_context").unwrap();
+        let fn_body = &source[fn_start..];
+        assert!(fn_body.contains("MS_NOSUID"));
+        assert!(fn_body.contains("MS_NODEV"));
+        assert!(fn_body.contains("MS_NOEXEC"));
     }
 }

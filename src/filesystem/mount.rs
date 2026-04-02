@@ -502,8 +502,13 @@ pub const PROC_TMPFS_MASKED: &[&str] = &["acpi", "bus", "irq", "scsi", "sys"];
 ///
 /// This reduces kernel information leakage from the container. Follows OCI runtime
 /// conventions for masked paths.
-pub fn mask_proc_paths(proc_path: &Path) -> Result<()> {
+///
+/// SEC-06: When `production` is true, failures to mask critical paths
+/// (kcore, kallsyms, sysrq-trigger) are fatal instead of warn-and-continue.
+pub fn mask_proc_paths(proc_path: &Path, production: bool) -> Result<()> {
     info!("Masking sensitive /proc paths");
+
+    const CRITICAL_PROC_PATHS: &[&str] = &["kcore", "kallsyms", "sysrq-trigger"];
 
     let dev_null = Path::new("/dev/null");
 
@@ -520,7 +525,15 @@ pub fn mask_proc_paths(proc_path: &Path) -> Result<()> {
             None::<&str>,
         ) {
             Ok(_) => debug!("Masked /proc/{}", name),
-            Err(e) => warn!("Failed to mask /proc/{}: {} (continuing)", name, e),
+            Err(e) => {
+                if production && CRITICAL_PROC_PATHS.contains(&name) {
+                    return Err(NucleusError::FilesystemError(format!(
+                        "Failed to mask critical /proc/{} in production mode: {}",
+                        name, e
+                    )));
+                }
+                warn!("Failed to mask /proc/{}: {} (continuing)", name, e);
+            }
         }
     }
 
@@ -537,7 +550,15 @@ pub fn mask_proc_paths(proc_path: &Path) -> Result<()> {
             Some("size=0"),
         ) {
             Ok(_) => debug!("Masked /proc/{}", name),
-            Err(e) => warn!("Failed to mask /proc/{}: {} (continuing)", name, e),
+            Err(e) => {
+                if production {
+                    return Err(NucleusError::FilesystemError(format!(
+                        "Failed to mask /proc/{} in production mode: {}",
+                        name, e
+                    )));
+                }
+                warn!("Failed to mask /proc/{}: {} (continuing)", name, e);
+            }
         }
     }
 

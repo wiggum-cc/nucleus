@@ -3,6 +3,7 @@ use crate::error::{NucleusError, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::fs::OpenOptions;
+use std::io::Read;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -64,11 +65,32 @@ impl CheckpointMetadata {
             NucleusError::CheckpointError(format!("Failed to serialize metadata: {}", e))
         })?;
 
+        if tmp_path.exists() {
+            let meta = fs::symlink_metadata(&tmp_path).map_err(|e| {
+                NucleusError::CheckpointError(format!(
+                    "Failed to inspect temp metadata file {:?}: {}",
+                    tmp_path, e
+                ))
+            })?;
+            if meta.file_type().is_symlink() {
+                return Err(NucleusError::CheckpointError(format!(
+                    "Refusing symlink temp metadata file {:?}",
+                    tmp_path
+                )));
+            }
+            fs::remove_file(&tmp_path).map_err(|e| {
+                NucleusError::CheckpointError(format!(
+                    "Failed to remove stale temp metadata file {:?}: {}",
+                    tmp_path, e
+                ))
+            })?;
+        }
+
         let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .write(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp_path)
             .map_err(|e| {
                 NucleusError::CheckpointError(format!(
@@ -102,12 +124,38 @@ impl CheckpointMetadata {
     /// Load metadata from checkpoint directory
     pub fn load(dir: &Path) -> Result<Self> {
         let path = dir.join("metadata.json");
-        let json = fs::read_to_string(&path).map_err(|e| {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| {
+                NucleusError::CheckpointError(format!(
+                    "Failed to read metadata {:?}: {}",
+                    path, e
+                ))
+            })?;
+        let mut json = String::new();
+        file.read_to_string(&mut json).map_err(|e| {
             NucleusError::CheckpointError(format!("Failed to read metadata: {}", e))
         })?;
         let metadata: Self = serde_json::from_str(&json).map_err(|e| {
             NucleusError::CheckpointError(format!("Failed to parse metadata: {}", e))
         })?;
         Ok(metadata)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_save_uses_o_nofollow() {
+        // BUG-11: CheckpointMetadata::save must use O_NOFOLLOW like ContainerStateManager
+        let source = include_str!("metadata.rs");
+        let save_fn = source.find("pub fn save").unwrap();
+        let save_body = &source[save_fn..];
+        assert!(
+            save_body.contains("O_NOFOLLOW") || save_body.contains("NOFOLLOW"),
+            "CheckpointMetadata::save must use O_NOFOLLOW to prevent symlink attacks"
+        );
     }
 }

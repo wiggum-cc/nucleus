@@ -121,8 +121,14 @@ impl LandlockManager {
                     Ok(true)
                 }
                 RulesetStatus::NotEnforced => {
-                    warn!("Landlock not enforced (kernel does not support Landlock)");
-                    Ok(false)
+                    if best_effort {
+                        warn!("Landlock not enforced (kernel does not support Landlock)");
+                        Ok(false)
+                    } else {
+                        Err(NucleusError::LandlockError(
+                            "Landlock not enforced (kernel does not support Landlock)".to_string(),
+                        ))
+                    }
                 }
             },
             Err(e) => {
@@ -300,5 +306,22 @@ mod tests {
         // But it should still have write capabilities
         assert!(access_tmp.contains(AccessFs::WriteFile));
         assert!(access_tmp.contains(AccessFs::RemoveFile));
+    }
+
+    #[test]
+    fn test_not_enforced_returns_error_in_strict_mode() {
+        // SEC-11: When best_effort=false, NotEnforced must return Err, not Ok(false)
+        let source = include_str!("landlock.rs");
+        let apply_fn = source.find("fn apply_container_policy_with_mode").unwrap();
+        let apply_body = &source[apply_fn..apply_fn + 1400];
+        // In the NotEnforced match arm, when not best_effort, should return Err
+        let not_enforced_start = apply_body.find("NotEnforced").unwrap();
+        let not_enforced_end = std::cmp::min(apply_body.len(), not_enforced_start + 500);
+        let not_enforced_block = &apply_body[not_enforced_start..not_enforced_end];
+        assert!(
+            not_enforced_block.contains("best_effort") && not_enforced_block.contains("Err"),
+            "NotEnforced must return Err when best_effort=false. Block: {}",
+            not_enforced_block
+        );
     }
 }

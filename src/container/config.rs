@@ -7,18 +7,23 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Generate a unique 32-hex-char container ID (128-bit) using /dev/urandom.
-///
-/// Panics if /dev/urandom is unavailable. A system without /dev/urandom has
-/// bigger problems than container IDs, and a predictable ID could allow an
-/// attacker to pre-create state files or guess container references.
-pub fn generate_container_id() -> String {
+pub fn generate_container_id() -> crate::error::Result<String> {
     use std::io::Read;
 
     let mut buf = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .expect("/dev/urandom must be available for secure container ID generation");
-    hex::encode(buf)
+    let mut file = std::fs::File::open("/dev/urandom").map_err(|e| {
+        crate::error::NucleusError::ConfigError(format!(
+            "Failed to open /dev/urandom for container ID generation: {}",
+            e
+        ))
+    })?;
+    file.read_exact(&mut buf).map_err(|e| {
+        crate::error::NucleusError::ConfigError(format!(
+            "Failed to read secure random bytes for container ID generation: {}",
+            e
+        ))
+    })?;
+    Ok(hex::encode(buf))
 }
 
 /// Trust level for a container workload.
@@ -257,9 +262,13 @@ pub enum SeccompMode {
 
 impl ContainerConfig {
     pub fn new(name: Option<String>, command: Vec<String>) -> Self {
-        let id = generate_container_id();
+        Self::try_new(name, command).expect("secure container ID generation failed")
+    }
+
+    pub fn try_new(name: Option<String>, command: Vec<String>) -> crate::error::Result<Self> {
+        let id = generate_container_id()?;
         let name = name.unwrap_or_else(|| id.clone());
-        Self {
+        Ok(Self {
             id,
             name: name.clone(),
             command,
@@ -298,7 +307,7 @@ impl ContainerConfig {
             caps_policy_sha256: None,
             landlock_policy: None,
             landlock_policy_sha256: None,
-        }
+        })
     }
 
     /// Enable rootless mode with user namespace mapping
@@ -523,9 +532,15 @@ impl ContainerConfig {
         }
 
         // Production mode requires explicit rootfs (no host bind mount fallback)
-        if self.rootfs_path.is_none() {
+        let Some(rootfs_path) = self.rootfs_path.as_ref() else {
             return Err(crate::error::NucleusError::ConfigError(
                 "Production mode requires explicit --rootfs path (no host bind mounts)".to_string(),
+            ));
+        };
+
+        if !rootfs_path.starts_with("/nix/store") {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Production mode requires a /nix/store rootfs path".to_string(),
             ));
         }
 
@@ -545,6 +560,12 @@ impl ContainerConfig {
         if self.limits.cpu_quota_us.is_none() {
             return Err(crate::error::NucleusError::ConfigError(
                 "Production mode requires explicit --cpus limit".to_string(),
+            ));
+        }
+
+        if !self.verify_rootfs_attestation {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Production mode requires --verify-rootfs-attestation".to_string(),
             ));
         }
 
@@ -595,6 +616,23 @@ impl ContainerConfig {
             ));
         }
 
+        if self.health_check.is_some() {
+            return Err(crate::error::NucleusError::ConfigError(
+                "gVisor runtime does not support exec health checks; use --runtime native or remove --health-cmd"
+                    .to_string(),
+            ));
+        }
+
+        if matches!(
+            self.readiness_probe.as_ref(),
+            Some(ReadinessProbe::Exec { .. }) | Some(ReadinessProbe::TcpPort(_))
+        ) {
+            return Err(crate::error::NucleusError::ConfigError(
+                "gVisor runtime does not support exec/TCP readiness probes; use --runtime native or --readiness-sd-notify"
+                    .to_string(),
+            ));
+        }
+
         if self.verify_context_integrity
             && self.context_dir.is_some()
             && matches!(self.context_mode, crate::filesystem::ContextMode::BindMount)
@@ -616,7 +654,7 @@ mod tests {
 
     #[test]
     fn test_generate_container_id_is_32_hex_chars() {
-        let id = generate_container_id();
+        let id = generate_container_id().unwrap();
         assert_eq!(id.len(), 32, "Container ID must be full 128-bit (32 hex chars), got {}", id.len());
         assert!(
             id.chars().all(|c| c.is_ascii_hexdigit()),
@@ -627,8 +665,8 @@ mod tests {
 
     #[test]
     fn test_generate_container_id_is_unique() {
-        let id1 = generate_container_id();
-        let id2 = generate_container_id();
+        let id1 = generate_container_id().unwrap();
+        let id2 = generate_container_id().unwrap();
         assert_ne!(id1, id2, "Two consecutive IDs must differ");
     }
 
@@ -714,6 +752,7 @@ mod tests {
         let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
             .with_service_mode(ServiceMode::Production)
             .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
+            .with_verify_rootfs_attestation(true)
             .with_limits(
                 crate::resources::ResourceLimits::default()
                     .with_memory("512M")
@@ -722,6 +761,22 @@ mod tests {
                     .unwrap(),
             );
         assert!(cfg.validate_production_mode().is_ok());
+    }
+
+    #[test]
+    fn test_production_mode_requires_rootfs_attestation() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_service_mode(ServiceMode::Production)
+            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
+            .with_limits(
+                crate::resources::ResourceLimits::default()
+                    .with_memory("512M")
+                    .unwrap()
+                    .with_cpu_cores(2.0)
+                    .unwrap(),
+            );
+        let err = cfg.validate_production_mode().unwrap_err();
+        assert!(err.to_string().contains("attestation"));
     }
 
     #[test]
@@ -872,6 +927,34 @@ mod tests {
     }
 
     #[test]
+    fn test_gvisor_rejects_exec_health_checks() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()]).with_health_check(
+            HealthCheck {
+                command: vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
+                interval: Duration::from_secs(30),
+                retries: 3,
+                start_period: Duration::from_secs(1),
+                timeout: Duration::from_secs(5),
+            },
+        );
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("health checks"));
+    }
+
+    #[test]
+    fn test_gvisor_rejects_exec_readiness_probes() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()]).with_readiness_probe(
+            ReadinessProbe::Exec {
+                command: vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
+            },
+        );
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("readiness"));
+    }
+
+    #[test]
     fn test_gvisor_allows_copy_mode_context_integrity_verification() {
         let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
             .with_context(PathBuf::from("/tmp/context"))
@@ -896,5 +979,17 @@ mod tests {
         let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
         assert!(cfg.use_gvisor, "default must have gVisor enabled");
         assert_eq!(cfg.trust_level, TrustLevel::Untrusted, "default must be Untrusted");
+    }
+
+    #[test]
+    fn test_generate_container_id_returns_result() {
+        // BUG-07: generate_container_id must return Result, not panic
+        let source = include_str!("config.rs");
+        let fn_start = source.find("pub fn generate_container_id").unwrap();
+        let fn_sig = &source[fn_start..fn_start + 100];
+        assert!(
+            fn_sig.contains("Result"),
+            "generate_container_id must return Result<String>, not String (no panics in production)"
+        );
     }
 }

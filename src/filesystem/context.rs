@@ -183,6 +183,11 @@ impl ContextPopulator {
 
             if metadata.is_dir() {
                 self.validate_recursive(&src_path, depth + 1)?;
+            } else if !metadata.is_file() {
+                return Err(NucleusError::ContextError(format!(
+                    "Bind-mounted contexts may not contain special files: {:?}",
+                    src_path
+                )));
             }
         }
 

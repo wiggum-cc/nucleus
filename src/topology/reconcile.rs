@@ -8,6 +8,7 @@
 
 use crate::container::{ContainerLifecycle, ContainerStateManager};
 use crate::error::{NucleusError, Result};
+use crate::isolation::{NamespaceCommandRunner, NamespaceProbe};
 use crate::topology::config::{ServiceDef, TopologyConfig};
 use crate::topology::dag::DependencyGraph;
 use std::collections::BTreeMap;
@@ -130,6 +131,31 @@ pub fn execute_reconcile(
                 }
             }
             _ => {}
+        }
+    }
+
+    // Phase 1b: Stop removed services that are NOT in shutdown_order.
+    // shutdown_order only contains services from the desired topology, so
+    // services that were removed from config won't appear there at all.
+    for (service_name, action) in &plan.actions {
+        if *action != ReconcileAction::Stop {
+            continue;
+        }
+        // Already handled above if it happened to be in shutdown_order
+        if shutdown_order.contains(service_name) {
+            continue;
+        }
+        let container_name = format!("{}-{}", config.name, service_name);
+        info!("Stopping removed service: {}", container_name);
+        match state_mgr.resolve_container(&container_name) {
+            Ok(state) => {
+                if let Err(e) = ContainerLifecycle::stop(&state, stop_timeout) {
+                    warn!("Failed to stop {}: {} (continuing)", container_name, e);
+                }
+            }
+            Err(_) => {
+                // Container not found — already stopped
+            }
         }
     }
 
@@ -348,7 +374,7 @@ fn wait_for_healthy(
             )));
         }
 
-        if health_check_passes(state.pid, health_cmd)? {
+        if health_check_passes(state.pid, state.rootless, state.using_gvisor, health_cmd)? {
             info!("Service {} is healthy", container_name);
             return Ok(());
         }
@@ -390,32 +416,20 @@ fn validate_health_check_command(command: &str) -> Result<()> {
     Ok(())
 }
 
-fn health_check_passes(pid: u32, command: &str) -> Result<bool> {
+fn health_check_passes(pid: u32, rootless: bool, using_gvisor: bool, command: &str) -> Result<bool> {
     validate_health_check_command(command)?;
 
-    let pid_str = pid.to_string();
-    let status = Command::new(resolve_nsenter())
-        .args([
-            "-t", &pid_str, "-m", "-p", "-n", "--", "/bin/sh", "-c", command,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| {
-            NucleusError::ExecError(format!("Failed to run health check for PID {}: {}", pid, e))
-        })?;
-    Ok(status.success())
-}
-
-fn resolve_nsenter() -> String {
-    if nix::unistd::Uid::effective().is_root() {
-        for path in ["/usr/bin/nsenter", "/usr/sbin/nsenter", "/bin/nsenter"] {
-            if std::path::Path::new(path).exists() {
-                return path.to_string();
-            }
-        }
-    }
-    "nsenter".to_string()
+    NamespaceCommandRunner::run(
+        pid,
+        rootless,
+        using_gvisor,
+        NamespaceProbe::Exec(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            command.to_string(),
+        ]),
+        Some(Duration::from_secs(5)),
+    )
 }
 
 #[cfg(test)]
@@ -557,5 +571,70 @@ memory = "256M"
         assert!(validate_health_check_command("malware &").is_err());
         // Empty
         assert!(validate_health_check_command("").is_err());
+    }
+
+    #[test]
+    fn test_topology_health_checks_do_not_spawn_host_nsenter() {
+        let source = include_str!("reconcile.rs");
+        let fn_start = source.find("fn health_check_passes").unwrap();
+        let fn_body = &source[fn_start..fn_start + 900];
+        assert!(
+            !fn_body.contains("Command::new(resolve_nsenter())"),
+            "topology health checks must not execute via host nsenter"
+        );
+    }
+
+    #[test]
+    fn test_plan_stop_for_removed_services() {
+        // BUG-01: Services removed from topology must get ReconcileAction::Stop
+        let toml = r#"
+name = "test"
+
+[services.web]
+rootfs = "/nix/store/web"
+command = ["/bin/web"]
+memory = "256M"
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let state_mgr = ContainerStateManager::with_state_dir(temp.path().join("nucleus")).unwrap();
+
+        // Simulate a previously-running service "db" that is no longer in config
+        let state = ContainerState::new(
+            "old-db-id".to_string(),
+            "test-db".to_string(),
+            std::process::id(), // use our own PID so is_running() returns true
+            vec!["postgres".to_string()],
+            None,
+            None,
+            false,
+            false,
+            None,
+        );
+        state_mgr.save_state(&state).unwrap();
+
+        let plan = plan_reconcile(&config, &state_mgr).unwrap();
+
+        // The plan must include a Stop action for "db"
+        let stop_actions: Vec<_> = plan.actions.iter()
+            .filter(|(_, a)| *a == ReconcileAction::Stop)
+            .collect();
+        assert!(!stop_actions.is_empty(), "removed services must have Stop action");
+        assert_eq!(stop_actions[0].0, "db");
+
+        // BUG-01: execute_reconcile must actually stop removed services.
+        // Verify structurally: Phase 1b must iterate plan.actions for Stop
+        // actions that are NOT in shutdown_order (removed services).
+        let source = include_str!("reconcile.rs");
+        let execute_fn_start = source.find("pub fn execute_reconcile").unwrap();
+        let execute_fn = &source[execute_fn_start..];
+        let phase2_pos = execute_fn.find("Phase 2").unwrap();
+        let phase1_section = &execute_fn[..phase2_pos];
+        // Must contain a separate loop over plan.actions for removed services
+        assert!(
+            phase1_section.contains("Phase 1b") && phase1_section.contains("plan.actions"),
+            "execute_reconcile must have a Phase 1b loop over plan.actions \
+             to stop removed services not present in shutdown_order"
+        );
     }
 }

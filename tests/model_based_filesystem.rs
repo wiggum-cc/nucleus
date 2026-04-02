@@ -6,7 +6,7 @@
 /// Properties verified:
 /// - context_isolation: Once pivoted, can only move to pivoted or unmounted_final
 /// - ephemeral_guarantee: unmounted_final is terminal and stable
-/// - mount_ordering: populated can only transition to pivoted or unmounted_final
+/// - mount_ordering: populated can continue to pivot_root or abort cleanup
 use nucleus::filesystem::FilesystemState;
 
 #[test]
@@ -68,18 +68,19 @@ fn test_filesystem_property_ephemeral_guarantee() {
 
 #[test]
 fn test_filesystem_property_mount_ordering() {
-    // Property from TLA+: [][(state = populated) => ((state' = pivoted) \/ (state' = unmounted_final))]
-    // From populated, can only go to pivoted or unmounted_final
+    // Cleanup is allowed before pivot_root, so populated may either continue
+    // forward to pivoted or abort back to unmounted.
 
     let state = FilesystemState::Populated;
 
     // Valid transitions
     assert!(state.can_transition_to(FilesystemState::Populated)); // stuttering
     assert!(state.can_transition_to(FilesystemState::Pivoted));
+    assert!(state.can_transition_to(FilesystemState::Unmounted));
 
-    // Invalid transitions - cannot skip pivoted or go backwards
-    assert!(!state.can_transition_to(FilesystemState::Unmounted));
+    // Invalid transitions - cannot move to mounted or skip directly to final
     assert!(!state.can_transition_to(FilesystemState::Mounted));
+    assert!(!state.can_transition_to(FilesystemState::UnmountedFinal));
 }
 
 #[test]
@@ -94,9 +95,9 @@ fn test_filesystem_no_state_skipping() {
 
 #[test]
 fn test_filesystem_no_backwards_transitions() {
-    // Cannot move backwards in the state machine
+    // Cannot move backwards once the root has been pivoted or finalized.
 
-    assert!(!FilesystemState::Mounted.can_transition_to(FilesystemState::Unmounted));
+    assert!(FilesystemState::Mounted.can_transition_to(FilesystemState::Unmounted));
     assert!(!FilesystemState::Populated.can_transition_to(FilesystemState::Mounted));
     assert!(!FilesystemState::Pivoted.can_transition_to(FilesystemState::Populated));
     assert!(!FilesystemState::UnmountedFinal.can_transition_to(FilesystemState::Pivoted));

@@ -331,9 +331,16 @@ mod tests {
         assert!(FilesystemState::UnmountedFinal
             .transition(FilesystemState::Pivoted)
             .is_err());
+    }
+
+    #[test]
+    fn test_filesystem_state_allows_cleanup_to_unmounted() {
         assert!(FilesystemState::Mounted
             .transition(FilesystemState::Unmounted)
-            .is_err());
+            .is_ok());
+        assert!(FilesystemState::Populated
+            .transition(FilesystemState::Unmounted)
+            .is_ok());
     }
 
     #[test]
