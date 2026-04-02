@@ -4,7 +4,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
@@ -106,9 +106,14 @@ impl ContainerState {
     fn parse_start_ticks(content: &str) -> Option<u64> {
         // Field 2 (comm) is in parens and may contain spaces; find last ')'
         let after_comm = content.rfind(')')?;
-        let fields: Vec<&str> = content[after_comm + 2..].split_whitespace().collect();
         // After ')' we have fields 3..N; field 22 is index 19 (22 - 3 = 19)
-        fields.get(19)?.parse().ok()
+        // Use nth() instead of collecting into a Vec to avoid a heap allocation
+        // on every liveness check.
+        content[after_comm + 2..]
+            .split_whitespace()
+            .nth(19)?
+            .parse()
+            .ok()
     }
 
     /// Check if the container process is still running
@@ -192,7 +197,7 @@ impl ContainerStateManager {
         Ok(Self { state_dir })
     }
 
-    fn reject_symlink_path(state_dir: &PathBuf) -> Result<()> {
+    fn reject_symlink_path(state_dir: &Path) -> Result<()> {
         match fs::symlink_metadata(state_dir) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 Err(NucleusError::ConfigError(format!(
@@ -204,7 +209,7 @@ impl ContainerStateManager {
         }
     }
 
-    fn ensure_secure_state_dir_permissions(state_dir: &PathBuf) -> Result<()> {
+    fn ensure_secure_state_dir_permissions(state_dir: &Path) -> Result<()> {
         match fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700)) {
             Ok(()) => Ok(()),
             Err(e)
@@ -250,7 +255,7 @@ impl ContainerStateManager {
         }
     }
 
-    fn ensure_state_dir_writable(state_dir: &PathBuf) -> Result<()> {
+    fn ensure_state_dir_writable(state_dir: &Path) -> Result<()> {
         let probe_name = format!(
             ".nucleus-write-test-{}-{}",
             std::process::id(),
@@ -291,7 +296,7 @@ impl ContainerStateManager {
         }
 
         if nix::unistd::Uid::effective().is_root() {
-            return vec![PathBuf::from("/var/run/nucleus")];
+            vec![PathBuf::from("/var/run/nucleus")]
         } else {
             let mut candidates = Vec::new();
 
@@ -425,6 +430,18 @@ impl ContainerStateManager {
         Ok(())
     }
 
+    /// Read a file with O_NOFOLLOW to prevent symlink attacks.
+    fn read_file_nofollow(path: &std::path::Path) -> std::result::Result<String, std::io::Error> {
+        use std::io::Read;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let mut buf = String::new();
+        std::io::BufReader::new(file).read_to_string(&mut buf)?;
+        Ok(buf)
+    }
+
     /// Load container state
     ///
     /// Opens with O_NOFOLLOW to prevent symlink-based TOCTOU attacks.
@@ -493,7 +510,10 @@ impl ContainerStateManager {
 
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                match fs::read_to_string(&path) {
+                // Use O_NOFOLLOW to prevent symlink attacks, consistent with
+                // load_state/save_state. Without this, a symlink in the state
+                // directory could be used as a file-read oracle.
+                match Self::read_file_nofollow(&path) {
                     Ok(json) => match serde_json::from_str::<ContainerState>(&json) {
                         Ok(state) => states.push(state),
                         Err(e) => {
@@ -710,6 +730,38 @@ mod tests {
         // Loading through the symlink ID must fail (O_NOFOLLOW)
         let result = mgr.load_state("symlinked");
         assert!(result.is_err(), "load_state must reject symlinks");
+    }
+
+    #[test]
+    fn test_list_states_ignores_symlinks() {
+        // list_states must use O_NOFOLLOW, so symlinked state files are skipped
+        // rather than followed (which would be a file-read oracle).
+        let (mgr, temp_dir) = temp_state_manager();
+
+        // Create a real state file
+        let state = ContainerState::new(
+            "real123456789012345678".to_string(),
+            "real".to_string(),
+            1234,
+            vec!["/bin/sh".to_string()],
+            None,
+            None,
+            false,
+            false,
+            None,
+        );
+        mgr.save_state(&state).unwrap();
+
+        // Create a symlink masquerading as a state file
+        let real_path = temp_dir.path().join("real123456789012345678.json");
+        let symlink_path = temp_dir.path().join("evil.json");
+        std::os::unix::fs::symlink(&real_path, &symlink_path).unwrap();
+
+        // list_states should only return the real file, not follow the symlink
+        let states = mgr.list_states().unwrap();
+        // The symlink should fail to open with O_NOFOLLOW, leaving only the real state
+        assert_eq!(states.len(), 1, "symlinked state file must be skipped");
+        assert_eq!(states[0].id, "real123456789012345678");
     }
 
     #[test]

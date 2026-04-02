@@ -430,12 +430,23 @@ impl Container {
             Self::notify_namespace_ready(&fd, std::process::id())?;
         }
 
-        // 2. Set hostname if UTS namespace is enabled
+        // 2. Ensure no_new_privs BEFORE any mount operations.
+        // This prevents exploitation of setuid binaries on bind-mounted paths
+        // even if a subsequent MS_NOSUID remount fails.
+        self.enforce_no_new_privs()?;
+        audit(
+            &self.config.id,
+            &self.config.name,
+            AuditEventType::NoNewPrivsSet,
+            "prctl(PR_SET_NO_NEW_PRIVS, 1) applied (early, before mounts)",
+        );
+
+        // 3. Set hostname if UTS namespace is enabled
         if let Some(hostname) = &self.config.hostname {
             namespace_mgr.set_hostname(hostname)?;
         }
 
-        // 3. Mount tmpfs as container root
+        // 4. Mount tmpfs as container root
         // Filesystem: Unmounted -> Mounted
         let runtime_dir = Builder::new()
             .prefix("nucleus-runtime-")
@@ -522,16 +533,7 @@ impl Container {
             "all mount flags verified",
         );
 
-        // 11. Ensure no_new_privs before applying additional hardening.
-        self.enforce_no_new_privs()?;
-        audit(
-            &self.config.id,
-            &self.config.name,
-            AuditEventType::NoNewPrivsSet,
-            "prctl(PR_SET_NO_NEW_PRIVS, 1) applied",
-        );
-
-        // 12. Drop capabilities (from policy file or default drop-all)
+        // 11. Drop capabilities (from policy file or default drop-all)
         // Security: Privileged -> CapabilitiesDropped
         let mut cap_mgr = CapabilityManager::new();
         if let Some(ref policy_path) = self.config.caps_policy {
@@ -580,6 +582,23 @@ impl Container {
             if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim_nofile) } != 0 {
                 warn!(
                     "Failed to set RLIMIT_NOFILE to 1024: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            // RLIMIT_MEMLOCK: prevent container from pinning excessive physical
+            // memory via mlock(). Default 64KB matches unprivileged default, but
+            // in a user namespace the container appears as UID 0 and may have a
+            // higher inherited limit.
+            let memlock_limit: u64 = 64 * 1024; // 64KB
+            let rlim_memlock = libc::rlimit {
+                rlim_cur: memlock_limit,
+                rlim_max: memlock_limit,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim_memlock) } != 0 {
+                warn!(
+                    "Failed to set RLIMIT_MEMLOCK to {}: {}",
+                    memlock_limit,
                     std::io::Error::last_os_error()
                 );
             }
@@ -958,11 +977,7 @@ impl Container {
                 })?;
             }
 
-            for byte in content.iter_mut() {
-                unsafe {
-                    std::ptr::write_volatile(byte, 0);
-                }
-            }
+            zeroize::Zeroize::zeroize(&mut content);
 
             staged.push(crate::container::SecretMount {
                 source: staged_source,

@@ -477,6 +477,27 @@ pub fn mount_procfs(
     }
 }
 
+/// Paths to mask with /dev/null (files) — matches OCI runtime spec masked paths.
+/// Exposed for testing; the canonical list of sensitive /proc entries that must
+/// be hidden from container processes.
+pub const PROC_NULL_MASKED: &[&str] = &[
+    "kallsyms",
+    "kcore",
+    "sched_debug",
+    "timer_list",
+    "timer_stats",
+    "keys",
+    "latency_stats",
+    "config.gz",
+    "sysrq-trigger",
+    "kpagecount",
+    "kpageflags",
+    "kpagecgroup",
+];
+
+/// Paths to mask with empty tmpfs (directories).
+pub const PROC_TMPFS_MASKED: &[&str] = &["acpi", "bus", "irq", "scsi", "sys"];
+
 /// Mask sensitive /proc paths by bind-mounting /dev/null or tmpfs over them
 ///
 /// This reduces kernel information leakage from the container. Follows OCI runtime
@@ -484,23 +505,9 @@ pub fn mount_procfs(
 pub fn mask_proc_paths(proc_path: &Path) -> Result<()> {
     info!("Masking sensitive /proc paths");
 
-    // Paths to mask with /dev/null (files) — matches OCI runtime spec masked paths
-    let null_masked = [
-        "kallsyms",
-        "kcore",
-        "sched_debug",
-        "timer_list",
-        "keys",
-        "latency_stats",
-        "config.gz",
-    ];
-
-    // Paths to mask with empty tmpfs (directories)
-    let tmpfs_masked = ["acpi", "bus", "irq", "scsi", "sys"];
-
     let dev_null = Path::new("/dev/null");
 
-    for name in &null_masked {
+    for name in PROC_NULL_MASKED {
         let target = proc_path.join(name);
         if !target.exists() {
             continue;
@@ -517,7 +524,7 @@ pub fn mask_proc_paths(proc_path: &Path) -> Result<()> {
         }
     }
 
-    for name in &tmpfs_masked {
+    for name in PROC_TMPFS_MASKED {
         let target = proc_path.join(name);
         if !target.exists() {
             continue;
@@ -885,6 +892,51 @@ pub fn mount_secrets_inmemory(
 
 #[cfg(test)]
 mod tests {
-    // Note: Testing pivot_root and chroot requires root privileges
-    // These are tested in integration tests
+    use super::*;
+
+    #[test]
+    fn test_proc_mask_includes_sysrq_trigger() {
+        assert!(
+            PROC_NULL_MASKED.contains(&"sysrq-trigger"),
+            "/proc/sysrq-trigger must be masked to prevent host DoS"
+        );
+    }
+
+    #[test]
+    fn test_proc_mask_includes_timer_stats() {
+        assert!(
+            PROC_NULL_MASKED.contains(&"timer_stats"),
+            "/proc/timer_stats must be masked to prevent kernel info leakage"
+        );
+    }
+
+    #[test]
+    fn test_proc_mask_includes_kpage_files() {
+        for path in &["kpagecount", "kpageflags", "kpagecgroup"] {
+            assert!(
+                PROC_NULL_MASKED.contains(path),
+                "/proc/{} must be masked to prevent host memory layout leakage",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn test_proc_mask_includes_oci_standard_paths() {
+        // OCI runtime spec required masked paths
+        for path in &["kallsyms", "kcore", "sched_debug", "keys", "config.gz"] {
+            assert!(
+                PROC_NULL_MASKED.contains(path),
+                "/proc/{} must be in null-masked list (OCI spec)",
+                path
+            );
+        }
+        for path in &["acpi", "bus", "scsi", "sys"] {
+            assert!(
+                PROC_TMPFS_MASKED.contains(path),
+                "/proc/{} must be in tmpfs-masked list (OCI spec)",
+                path
+            );
+        }
+    }
 }

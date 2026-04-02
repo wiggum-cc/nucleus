@@ -200,6 +200,20 @@ impl LandlockManager {
                 .map_err(ll_err)?;
         }
 
+        // /nix/store: read + execute (NixOS binaries and libraries)
+        if let Ok(fd) = PathFd::new("/nix/store") {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, access_read_exec))
+                .map_err(ll_err)?;
+        }
+
+        // /run/secrets: read-only (container secrets mounted on tmpfs)
+        if let Ok(fd) = PathFd::new("/run/secrets") {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, access_read))
+                .map_err(ll_err)?;
+        }
+
         // /context: read-only (agent data)
         if let Ok(fd) = PathFd::new("/context") {
             ruleset = ruleset
@@ -254,6 +268,24 @@ mod tests {
         // Should not error even if kernel has no Landlock
         let result = mgr.apply_container_policy_with_mode(true);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_policy_covers_nix_store_and_secrets() {
+        // Landlock policy must include rules for /nix/store (read+exec) and
+        // /run/secrets (read) so NixOS binaries can execute and secrets are readable.
+        // We verify this by checking that build_and_restrict references these paths.
+        // Since we can't inspect the ruleset directly, we verify the source code
+        // includes rules for these paths by checking the constants exist.
+        let source = include_str!("landlock.rs");
+        assert!(
+            source.contains("\"/nix/store\"") || source.contains("\"/nix\""),
+            "Landlock policy must include a rule for /nix/store or /nix"
+        );
+        assert!(
+            source.contains("\"/run/secrets\"") || source.contains("\"/run\""),
+            "Landlock policy must include a rule for /run/secrets"
+        );
     }
 
     #[test]

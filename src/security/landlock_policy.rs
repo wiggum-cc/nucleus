@@ -157,10 +157,22 @@ fn parse_access_flags(names: &[String]) -> Result<landlock::BitFlags<AccessFs>> 
             }
             "remove" => AccessFs::RemoveDir | AccessFs::RemoveFile,
             "readdir" => AccessFs::ReadDir.into(),
-            "all" => AccessFs::from_all(TARGET_ABI),
+            "all" => {
+                tracing::warn!(
+                    "Landlock policy uses 'all' access flag which includes Execute. \
+                     Consider 'all_except_execute' for writable paths to prevent \
+                     drop-and-exec attacks."
+                );
+                AccessFs::from_all(TARGET_ABI)
+            }
+            "all_except_execute" => {
+                let mut a = AccessFs::from_all(TARGET_ABI);
+                a.remove(AccessFs::Execute);
+                a
+            }
             _ => {
                 return Err(NucleusError::ConfigError(format!(
-                    "Unknown Landlock access flag: '{}'. Valid: read, write, execute, create, remove, readdir, all",
+                    "Unknown Landlock access flag: '{}'. Valid: read, write, execute, create, remove, readdir, all, all_except_execute",
                     name
                 )));
             }
@@ -246,6 +258,20 @@ access = ["read", "write", "create", "remove"]
         assert!(matches!(abi_from_version(5), Ok(ABI::V5)));
         assert!(abi_from_version(0).is_err());
         assert!(abi_from_version(6).is_err());
+    }
+
+    #[test]
+    fn test_all_except_execute_excludes_execute() {
+        let flags = parse_access_flags(&["all_except_execute".into()]).unwrap();
+        assert!(!flags.contains(AccessFs::Execute), "all_except_execute must not include Execute");
+        assert!(flags.contains(AccessFs::WriteFile), "all_except_execute must include WriteFile");
+        assert!(flags.contains(AccessFs::ReadFile), "all_except_execute must include ReadFile");
+    }
+
+    #[test]
+    fn test_all_includes_execute() {
+        let flags = parse_access_flags(&["all".into()]).unwrap();
+        assert!(flags.contains(AccessFs::Execute), "all must include Execute");
     }
 
     #[test]

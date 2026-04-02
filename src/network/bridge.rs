@@ -497,15 +497,17 @@ impl BridgeNetwork {
         // Use rejection sampling to avoid modulo bias.
         // Range is 2..=254 (253 values). We reject random bytes >= 253 to
         // ensure uniform distribution, then add 2 to shift into the valid range.
-        let mut buf = [0u8; 1];
-        for _ in 0..32 {
-            let _ = std::fs::File::open("/dev/urandom")
-                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf));
+        // Open /dev/urandom once and read all randomness in a single batch.
+        let mut rand_buf = [0u8; 32];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut rand_buf))
+            .map_err(|e| NucleusError::NetworkError(format!("Failed to read /dev/urandom: {}", e)))?;
+        for &byte in &rand_buf {
             // Rejection sampling: discard values that would cause modulo bias
-            if buf[0] >= 253 {
+            if byte >= 253 {
                 continue;
             }
-            let offset = buf[0] as u32 + 2;
+            let offset = byte as u32 + 2;
             let candidate = format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], offset);
             if reserved.contains(&candidate) {
                 continue;

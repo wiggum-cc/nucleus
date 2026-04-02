@@ -473,27 +473,19 @@ impl OciConfig {
     /// common executables such as `/bin/sh` remain available inside the OCI
     /// rootfs when no explicit rootfs is configured.
     pub fn with_host_runtime_binds(mut self) -> Self {
-        let mut host_paths = BTreeSet::new();
-        host_paths.extend([
-            "/bin".to_string(),
-            "/usr".to_string(),
-            "/lib".to_string(),
-            "/lib64".to_string(),
-            "/nix/store".to_string(),
-        ]);
-
-        if let Ok(path_var) = std::env::var("PATH") {
-            for dir in path_var.split(':') {
-                if dir.is_empty() || !dir.starts_with('/') {
-                    continue;
-                }
-                if dir.starts_with("/nix/store/") {
-                    host_paths.insert("/nix/store".to_string());
-                    continue;
-                }
-                host_paths.insert(dir.to_string());
-            }
-        }
+        // Use a fixed set of standard FHS paths only. Do NOT scan host $PATH,
+        // which would expose arbitrary host directories inside the container.
+        let host_paths: BTreeSet<String> = [
+            "/bin",
+            "/sbin",
+            "/usr",
+            "/lib",
+            "/lib64",
+            "/nix/store",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
         for host_path in host_paths {
             let source = Path::new(&host_path);
@@ -719,6 +711,22 @@ mod tests {
         let deserialized: OciConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.oci_version, config.oci_version);
         assert_eq!(deserialized.process.args, config.process.args);
+    }
+
+    #[test]
+    fn test_host_runtime_binds_uses_fixed_paths_not_host_path() {
+        // with_host_runtime_binds must NOT scan the host $PATH. Only standard
+        // FHS paths should be bind-mounted to prevent leaking arbitrary host
+        // directories into the container.
+        let source = include_str!("oci.rs");
+        // Check that with_host_runtime_binds does not call env::var("PATH")
+        // We look for non-comment lines that reference env::var and PATH
+        let fn_start = source.find("fn with_host_runtime_binds").unwrap();
+        let fn_body = &source[fn_start..fn_start + 800];
+        assert!(
+            !fn_body.contains("env::var"),
+            "with_host_runtime_binds must not read host $PATH"
+        );
     }
 
     #[test]

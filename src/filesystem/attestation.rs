@@ -30,7 +30,7 @@ pub fn verify_context_integrity(source: &Path, dest: &Path) -> Result<()> {
 
 pub fn verify_context_manifest(expected: &DirectoryManifest, dest: &Path) -> Result<()> {
     let actual = snapshot_context_dir(dest)?;
-    compare_manifests(&expected, &actual, "context")
+    compare_manifests(expected, &actual, "context")
 }
 
 pub fn verify_rootfs_attestation(root: &Path) -> Result<()> {
@@ -142,7 +142,7 @@ fn scan_dir(
         .map_err(|e| {
             NucleusError::FilesystemError(format!("Failed to enumerate {:?}: {}", current, e))
         })?;
-    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    entries.sort_by_key(|a| a.file_name());
 
     for entry in entries {
         let path = entry.path();

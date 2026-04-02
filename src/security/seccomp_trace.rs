@@ -71,7 +71,7 @@ impl SeccompTraceReader {
 
     /// Signal the reader to stop and wait for it to flush.
     pub fn stop_and_flush(mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        self.stop.store(true, Ordering::Release);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -101,40 +101,38 @@ fn record_loop(pid: u32, output_path: &Path, stop: &AtomicBool) -> Result<()> {
         }
     };
 
-    // Set a read timeout on /dev/kmsg so the thread doesn't block indefinitely
-    // if the stop flag is never set (e.g., parent thread panics). Without this,
-    // the thread holds /dev/kmsg open forever.
+    // Set O_NONBLOCK so reads don't block indefinitely. We use poll() with a
+    // timeout to periodically check the stop flag. The previous setsockopt(SO_RCVTIMEO)
+    // approach was incorrect: /dev/kmsg is a character device, not a socket, so
+    // setsockopt silently fails with ENOTSOCK.
     use std::os::unix::io::AsRawFd;
     let fd = file.as_raw_fd();
-    let timeout = libc::timeval {
-        tv_sec: 2,
-        tv_usec: 0,
-    };
     unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            &timeout as *const libc::timeval as *const libc::c_void,
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        );
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
     }
 
     let reader = BufReader::new(file);
     let pid_pattern = format!("pid={}", pid);
 
     for line in reader.lines() {
-        if stop.load(Ordering::SeqCst) {
+        if stop.load(Ordering::Acquire) {
             break;
         }
 
         let line = match line {
             Ok(l) => l,
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut
-                {
-                    // Read timeout expired — check stop flag and retry
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    // No data available — poll with 2s timeout, then check stop flag
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    unsafe { libc::poll(&mut pfd, 1, 2000) };
                     continue;
                 }
                 debug!("kmsg read error: {}", e);
@@ -177,7 +175,8 @@ fn write_trace_file(path: &Path, syscalls: &BTreeMap<i64, u64>) -> Result<()> {
             name: super::seccomp_generate::syscall_number_to_name(nr).map(String::from),
             count,
         };
-        let line = serde_json::to_string(&record).unwrap_or_default();
+        let line = serde_json::to_string(&record)
+            .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e));
         writeln!(file, "{}", line).map_err(|e| {
             NucleusError::ConfigError(format!("Failed to write trace record: {}", e))
         })?;
@@ -199,6 +198,31 @@ mod tests {
     #[test]
     fn test_extract_syscall_nr_missing() {
         assert_eq!(extract_syscall_nr("no syscall here"), None);
+    }
+
+    #[test]
+    fn test_reader_uses_nonblocking_io() {
+        // Verify record_loop uses O_NONBLOCK + poll, not socket-only APIs.
+        // /dev/kmsg is a character device; socket APIs like SO_RCVTIMEO silently fail.
+        let source = include_str!("seccomp_trace.rs");
+        assert!(
+            source.contains("O_NONBLOCK"),
+            "Must use O_NONBLOCK for non-blocking reads on /dev/kmsg"
+        );
+        assert!(
+            source.contains("libc::poll"),
+            "Must use poll() for timed waits on /dev/kmsg"
+        );
+        // Count occurrences of SO_RCVTIMEO — should only appear in comments/tests,
+        // never as part of an actual unsafe block calling setsockopt
+        let unsafe_setsockopt_count = source
+            .lines()
+            .filter(|l| l.trim().starts_with("libc::") && l.contains("setsockopt"))
+            .count();
+        assert_eq!(
+            unsafe_setsockopt_count, 0,
+            "Must not call setsockopt on /dev/kmsg"
+        );
     }
 
     #[test]

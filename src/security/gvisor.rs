@@ -364,10 +364,9 @@ impl GVisorRuntime {
             Ok(())
         };
 
-        let path = std::env::var("PATH").unwrap_or_else(|_| {
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
-        });
-        push("PATH", path)?;
+        // Use a hardcoded PATH for the runsc supervisor process to prevent
+        // host PATH from leaking into the gVisor environment.
+        push("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string())?;
         let runtime_dir = runtime_dir.to_string_lossy().to_string();
         push("TMPDIR", runtime_dir.clone())?;
         push("XDG_RUNTIME_DIR", runtime_dir)?;
@@ -458,6 +457,22 @@ mod tests {
             65534,
             1000
         ));
+    }
+
+    #[test]
+    fn test_exec_environment_uses_hardcoded_path() {
+        // The gVisor supervisor must NOT inherit the host PATH, to prevent
+        // host filesystem layout leaking into the container environment.
+        let source = include_str!("gvisor.rs");
+        // exec_environment must not call std::env::var("PATH")
+        let env_var_path = source
+            .lines()
+            .filter(|l| !l.trim().starts_with("//"))
+            .any(|l| l.contains("env::var(\"PATH\")") || l.contains("env::var(\"PATH\")"));
+        assert!(
+            !env_var_path,
+            "exec_environment must use hardcoded PATH, not read host PATH"
+        );
     }
 
     #[test]

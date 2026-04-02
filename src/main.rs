@@ -1051,14 +1051,11 @@ fn main() -> Result<()> {
                 println!("Tearing down topology '{}'...", config.name);
                 for service_name in graph.shutdown_order() {
                     let container_name = format!("{}-{}", config.name, service_name);
-                    match state_mgr.resolve_container(&container_name) {
-                        Ok(state) => {
-                            if state.is_running() {
-                                println!("Stopping {}...", container_name);
-                                ContainerLifecycle::stop(&state, timeout)?;
-                            }
+                    if let Ok(state) = state_mgr.resolve_container(&container_name) {
+                        if state.is_running() {
+                            println!("Stopping {}...", container_name);
+                            ContainerLifecycle::stop(&state, timeout)?;
                         }
-                        Err(_) => {}
                     }
                 }
                 println!("Topology '{}' is down", config.name);
@@ -1181,7 +1178,7 @@ fn apply_runtime_selection(mut config: ContainerConfig, runtime: &str, oci: bool
             if oci {
                 anyhow::bail!("--oci requires gVisor runtime; use --runtime gvisor");
             }
-            config = config.with_gvisor(false);
+            config = config.with_gvisor(false).with_trust_level(TrustLevel::Trusted);
         }
         "gvisor" => {
             config = config.with_gvisor(true);
@@ -1251,6 +1248,11 @@ mod tests {
         assert!(
             !config.use_gvisor,
             "native runtime selection must disable gVisor"
+        );
+        assert_eq!(
+            config.trust_level,
+            TrustLevel::Trusted,
+            "native runtime must set TrustLevel::Trusted"
         );
     }
 
