@@ -62,8 +62,8 @@ enum Commands {
         #[arg(long)]
         swap: bool,
 
-        /// Container runtime (default: native, or gvisor)
-        #[arg(long, default_value = "native")]
+        /// Container runtime (default: gvisor, or native)
+        #[arg(long, default_value = "gvisor")]
         runtime: String,
 
         /// Run in rootless mode with user namespace
@@ -726,9 +726,7 @@ fn main() -> Result<()> {
                     command: vec!["/bin/sh".to_string(), "-c".to_string(), cmd],
                     interval: std::time::Duration::from_secs(health_interval.unwrap_or(30)),
                     retries: health_retries.unwrap_or(3),
-                    start_period: std::time::Duration::from_secs(
-                        health_start_period.unwrap_or(5),
-                    ),
+                    start_period: std::time::Duration::from_secs(health_start_period.unwrap_or(5)),
                     timeout: std::time::Duration::from_secs(5),
                 };
                 config = config.with_health_check(hc);
@@ -738,10 +736,7 @@ fn main() -> Result<()> {
             for spec in &secrets {
                 let parts: Vec<&str> = spec.splitn(2, ':').collect();
                 if parts.len() != 2 {
-                    eprintln!(
-                        "Invalid secret format '{}', expected SOURCE:DEST",
-                        spec
-                    );
+                    eprintln!("Invalid secret format '{}', expected SOURCE:DEST", spec);
                     std::process::exit(1);
                 }
                 config = config.with_secret(SecretMount {
@@ -756,10 +751,7 @@ fn main() -> Result<()> {
                 if let Some((key, value)) = spec.split_once('=') {
                     config = config.with_env(key.to_string(), value.to_string());
                 } else {
-                    eprintln!(
-                        "Invalid env var format '{}', expected KEY=VALUE",
-                        spec
-                    );
+                    eprintln!("Invalid env var format '{}', expected KEY=VALUE", spec);
                     std::process::exit(1);
                 }
             }

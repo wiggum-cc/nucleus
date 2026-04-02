@@ -5,9 +5,7 @@
 #[cfg(test)]
 mod tests {
     use nucleus::resources::ResourceLimits;
-    use nucleus::security::{
-        GVisorRuntime, OciBundle, OciConfig, SecurityState,
-    };
+    use nucleus::security::{GVisorRuntime, OciBundle, OciConfig, SecurityState};
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
@@ -46,7 +44,11 @@ mod tests {
     #[test]
     fn test_oci_config_default_mounts() {
         let config = OciConfig::new(vec!["/bin/sh".to_string()], None);
-        let mount_dests: Vec<&str> = config.mounts.iter().map(|m| m.destination.as_str()).collect();
+        let mount_dests: Vec<&str> = config
+            .mounts
+            .iter()
+            .map(|m| m.destination.as_str())
+            .collect();
         assert!(mount_dests.contains(&"/proc"));
         assert!(mount_dests.contains(&"/dev"));
         assert!(mount_dests.contains(&"/tmp"));
@@ -120,8 +122,7 @@ mod tests {
 
     #[test]
     fn test_oci_config_with_user_namespace() {
-        let config =
-            OciConfig::new(vec!["/bin/sh".to_string()], None).with_user_namespace();
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None).with_user_namespace();
         let linux = config.linux.unwrap();
         let namespaces = linux.namespaces.unwrap();
         let ns_types: Vec<&str> = namespaces
@@ -129,6 +130,55 @@ mod tests {
             .map(|n| n.namespace_type.as_str())
             .collect();
         assert!(ns_types.contains(&"user"));
+    }
+
+    #[test]
+    fn test_oci_config_with_rootless_user_namespace_mappings() {
+        use nucleus::isolation::UserNamespaceConfig;
+
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None)
+            .with_rootless_user_namespace(&UserNamespaceConfig::rootless());
+        let linux = config.linux.unwrap();
+        let namespaces = linux.namespaces.unwrap();
+        let ns_types: Vec<&str> = namespaces
+            .iter()
+            .map(|n| n.namespace_type.as_str())
+            .collect();
+
+        assert!(ns_types.contains(&"user"));
+        assert!(!ns_types.contains(&"network"));
+        assert_eq!(linux.uid_mappings.len(), 1);
+        assert_eq!(linux.gid_mappings.len(), 1);
+        assert_eq!(linux.uid_mappings[0].container_id, 0);
+        assert_eq!(linux.uid_mappings[0].size, 1);
+        assert_eq!(linux.gid_mappings[0].container_id, 0);
+        assert_eq!(linux.gid_mappings[0].size, 1);
+    }
+
+    #[test]
+    fn test_oci_config_with_host_runtime_binds() {
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None).with_host_runtime_binds();
+        let mount_dests: Vec<&str> = config
+            .mounts
+            .iter()
+            .map(|m| m.destination.as_str())
+            .collect();
+
+        assert!(mount_dests.contains(&"/bin"));
+        assert!(mount_dests.contains(&"/usr"));
+    }
+
+    #[test]
+    fn test_oci_config_with_context_bind() {
+        let temp = TempDir::new().unwrap();
+        let config =
+            OciConfig::new(vec!["/bin/sh".to_string()], None).with_context_bind(temp.path());
+        let context_mount = config.mounts.iter().find(|m| m.destination == "/context");
+
+        assert!(context_mount.is_some());
+        let mount = context_mount.unwrap();
+        assert_eq!(mount.mount_type, "bind");
+        assert!(mount.options.contains(&"rw".to_string()));
     }
 
     #[test]
@@ -140,8 +190,7 @@ mod tests {
             mode: 0o400,
         }];
 
-        let config =
-            OciConfig::new(vec!["/bin/sh".to_string()], None).with_secret_mounts(&secrets);
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None).with_secret_mounts(&secrets);
 
         let secret_mount = config
             .mounts
@@ -157,7 +206,11 @@ mod tests {
     #[test]
     fn test_oci_config_serialization_roundtrip() {
         let config = OciConfig::new(
-            vec!["/bin/sh".to_string(), "-c".to_string(), "echo hi".to_string()],
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo hi".to_string(),
+            ],
             Some("myhost".to_string()),
         );
 
@@ -253,7 +306,9 @@ mod tests {
     #[test]
     fn test_security_state_happy_path() {
         let state = SecurityState::Privileged;
-        let state = state.transition(SecurityState::CapabilitiesDropped).unwrap();
+        let state = state
+            .transition(SecurityState::CapabilitiesDropped)
+            .unwrap();
         let state = state.transition(SecurityState::SeccompApplied).unwrap();
         let state = state.transition(SecurityState::LandlockApplied).unwrap();
         let state = state.transition(SecurityState::Locked).unwrap();

@@ -19,8 +19,14 @@ mod tests {
     fn test_parse_memory_suffixes() {
         assert_eq!(ResourceLimits::parse_memory("1K").unwrap(), 1024);
         assert_eq!(ResourceLimits::parse_memory("1k").unwrap(), 1024);
-        assert_eq!(ResourceLimits::parse_memory("512M").unwrap(), 512 * 1024 * 1024);
-        assert_eq!(ResourceLimits::parse_memory("512m").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(
+            ResourceLimits::parse_memory("512M").unwrap(),
+            512 * 1024 * 1024
+        );
+        assert_eq!(
+            ResourceLimits::parse_memory("512m").unwrap(),
+            512 * 1024 * 1024
+        );
         assert_eq!(
             ResourceLimits::parse_memory("2G").unwrap(),
             2 * 1024 * 1024 * 1024
@@ -37,7 +43,10 @@ mod tests {
 
     #[test]
     fn test_parse_memory_whitespace_trimmed() {
-        assert_eq!(ResourceLimits::parse_memory("  512M  ").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(
+            ResourceLimits::parse_memory("  512M  ").unwrap(),
+            512 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -96,8 +105,12 @@ mod tests {
     fn test_cpu_cores_invalid() {
         assert!(ResourceLimits::unlimited().with_cpu_cores(0.0).is_err());
         assert!(ResourceLimits::unlimited().with_cpu_cores(-1.0).is_err());
-        assert!(ResourceLimits::unlimited().with_cpu_cores(f64::NAN).is_err());
-        assert!(ResourceLimits::unlimited().with_cpu_cores(f64::INFINITY).is_err());
+        assert!(ResourceLimits::unlimited()
+            .with_cpu_cores(f64::NAN)
+            .is_err());
+        assert!(ResourceLimits::unlimited()
+            .with_cpu_cores(f64::INFINITY)
+            .is_err());
     }
 
     // --- ResourceLimits: CPU weight ---
@@ -206,7 +219,11 @@ mod tests {
 
         std::fs::write(p.join("memory.current"), "2097152\n").unwrap();
         std::fs::write(p.join("memory.max"), "268435456\n").unwrap();
-        std::fs::write(p.join("cpu.stat"), "usage_usec 500000\nuser_usec 300000\nsystem_usec 200000\n").unwrap();
+        std::fs::write(
+            p.join("cpu.stat"),
+            "usage_usec 500000\nuser_usec 300000\nsystem_usec 200000\n",
+        )
+        .unwrap();
         std::fs::write(p.join("pids.current"), "10\n").unwrap();
 
         let stats = ResourceStats::from_cgroup(p.to_str().unwrap()).unwrap();

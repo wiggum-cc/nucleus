@@ -167,9 +167,8 @@ impl ContainerAttach {
         }
 
         // Change to root directory of the namespace
-        nix::unistd::chdir("/").map_err(|e| {
-            NucleusError::AttachError(format!("chdir(\"/\") failed: {}", e))
-        })?;
+        nix::unistd::chdir("/")
+            .map_err(|e| NucleusError::AttachError(format!("chdir(\"/\") failed: {}", e)))?;
 
         // Apply security hardening before exec: no_new_privs + capability drop
         let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };

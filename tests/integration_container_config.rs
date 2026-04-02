@@ -49,7 +49,7 @@ mod tests {
         assert!(config.secrets.is_empty());
         assert!(config.environment.is_empty());
         assert!(!config.sd_notify);
-        assert!(!config.use_gvisor);
+        assert!(config.use_gvisor);
         assert!(config.rootfs_path.is_none());
         assert!(config.egress_policy.is_none());
         assert!(config.health_check.is_none());
@@ -64,16 +64,14 @@ mod tests {
 
     #[test]
     fn test_config_custom_name() {
-        let config =
-            ContainerConfig::new(Some("my-app".to_string()), vec!["/bin/sh".to_string()]);
+        let config = ContainerConfig::new(Some("my-app".to_string()), vec!["/bin/sh".to_string()]);
         assert_eq!(config.name, "my-app");
         assert_ne!(config.id, "my-app"); // ID is always generated
     }
 
     #[test]
     fn test_config_hostname_defaults_to_name() {
-        let config =
-            ContainerConfig::new(Some("myhost".to_string()), vec!["/bin/sh".to_string()]);
+        let config = ContainerConfig::new(Some("myhost".to_string()), vec!["/bin/sh".to_string()]);
         assert_eq!(config.hostname, Some("myhost".to_string()));
     }
 
@@ -112,7 +110,10 @@ mod tests {
         assert!(config.allow_degraded_security);
         assert!(config.allow_chroot_fallback);
         assert!(!config.proc_readonly);
-        assert_eq!(config.environment, vec![("FOO".to_string(), "bar".to_string())]);
+        assert_eq!(
+            config.environment,
+            vec![("FOO".to_string(), "bar".to_string())]
+        );
         assert!(config.sd_notify);
     }
 
@@ -126,8 +127,7 @@ mod tests {
 
     #[test]
     fn test_config_with_oci_bundle_enables_gvisor() {
-        let config =
-            ContainerConfig::new(None, vec!["/bin/sh".to_string()]).with_oci_bundle();
+        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]).with_oci_bundle();
         assert!(config.use_gvisor);
     }
 
@@ -170,15 +170,18 @@ mod tests {
     #[test]
     fn test_config_with_health_check() {
         let hc = HealthCheck {
-            command: vec!["curl".to_string(), "-f".to_string(), "http://localhost/health".to_string()],
+            command: vec![
+                "curl".to_string(),
+                "-f".to_string(),
+                "http://localhost/health".to_string(),
+            ],
             interval: Duration::from_secs(10),
             retries: 5,
             start_period: Duration::from_secs(30),
             timeout: Duration::from_secs(3),
         };
 
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
-            .with_health_check(hc);
+        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]).with_health_check(hc);
 
         assert!(config.health_check.is_some());
         let hc = config.health_check.unwrap();
@@ -190,10 +193,11 @@ mod tests {
 
     #[test]
     fn test_config_with_readiness_probe_exec() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
-            .with_readiness_probe(ReadinessProbe::Exec {
+        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]).with_readiness_probe(
+            ReadinessProbe::Exec {
                 command: vec!["pg_isready".to_string()],
-            });
+            },
+        );
 
         assert!(config.readiness_probe.is_some());
         assert!(matches!(
@@ -369,7 +373,11 @@ mod tests {
             "abc123".to_string(),
             "myapp".to_string(),
             12345,
-            vec!["/bin/sh".to_string(), "-c".to_string(), "echo hi".to_string()],
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo hi".to_string(),
+            ],
             Some(512 * 1024 * 1024),
             Some(2000),
             true,

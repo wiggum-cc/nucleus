@@ -45,7 +45,10 @@ impl CapabilityManager {
         for cap in caps::all() {
             if let Err(e) = caps::drop(None, CapSet::Bounding, cap) {
                 // Some capabilities may not be in the bounding set; log and continue
-                debug!("Failed to drop bounding cap {:?}: {} (may not be present)", cap, e);
+                debug!(
+                    "Failed to drop bounding cap {:?}: {} (may not be present)",
+                    cap, e
+                );
             }
         }
 

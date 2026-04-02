@@ -4,15 +4,14 @@ use crate::container::{
 use crate::error::{NucleusError, Result};
 use crate::filesystem::{
     bind_mount_host_paths, bind_mount_rootfs, create_dev_nodes, create_minimal_fs, mask_proc_paths,
-    mount_procfs, mount_secrets, switch_root, ContextPopulator, FilesystemState,
-    LazyContextPopulator, TmpfsMount,
+    mount_procfs, mount_secrets, switch_root, FilesystemState, LazyContextPopulator, TmpfsMount,
 };
 use crate::isolation::NamespaceManager;
 use crate::network::{BridgeNetwork, NetworkMode};
 use crate::resources::Cgroup;
 use crate::security::{
     CapabilityManager, GVisorNetworkMode, GVisorRuntime, LandlockManager, OciBundle, OciConfig,
-    SeccompManager, SecurityState,
+    OciMount, SeccompManager, SecurityState,
 };
 use nix::sys::signal::{kill, Signal};
 use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
@@ -33,11 +32,17 @@ use tracing::{debug, error, info, warn};
 /// 5. Execute target process
 pub struct Container {
     config: ContainerConfig,
+    /// Pre-resolved runsc path, resolved before fork so that user-namespace
+    /// UID changes don't block PATH-based lookup.
+    runsc_path: Option<String>,
 }
 
 impl Container {
     pub fn new(config: ContainerConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            runsc_path: None,
+        }
     }
 
     /// Run the container
@@ -150,6 +155,17 @@ impl Container {
             }
         };
 
+        // Resolve runsc path before fork, while still unprivileged.
+        // After user-namespace unshare the child appears as UID 0, which blocks
+        // PATH-based lookup as a security measure.
+        let runsc_path = if config.use_gvisor {
+            Some(GVisorRuntime::resolve_path().map_err(|e| {
+                NucleusError::GVisorError(format!("Failed to resolve runsc path: {}", e))
+            })?)
+        } else {
+            None
+        };
+
         // Child notifies parent after namespaces are ready.
         let (ready_read, ready_write) = pipe().map_err(|e| {
             NucleusError::ExecError(format!("Failed to create namespace sync pipe: {}", e))
@@ -196,9 +212,7 @@ impl Container {
                             Ok(net) => {
                                 // Apply egress policy if configured
                                 if let Some(ref egress) = config.egress_policy {
-                                    if let Err(e) =
-                                        net.apply_egress_policy(target_pid, egress)
-                                    {
+                                    if let Err(e) = net.apply_egress_policy(target_pid, egress) {
                                         if config.service_mode == ServiceMode::Production {
                                             return Err(NucleusError::NetworkError(format!(
                                                 "Failed to apply egress policy: {}",
@@ -288,7 +302,7 @@ impl Container {
             ForkResult::Child => {
                 drop(ready_read);
                 // Child process - set up container environment
-                let temp_container = Container { config };
+                let temp_container = Container { config, runsc_path };
                 match temp_container.setup_and_exec(Some(ready_write)) {
                     Ok(_) => {
                         unreachable!()
@@ -313,6 +327,16 @@ impl Container {
         // Initialize state machines
         let mut fs_state = FilesystemState::Unmounted;
         let mut sec_state = SecurityState::Privileged;
+
+        // gVisor is the runtime that should create the container's namespaces.
+        // Running runsc after pre-unsharing our own namespaces breaks its gofer
+        // re-exec path on some systems and duplicates the OCI namespace config.
+        if self.config.use_gvisor {
+            if let Some(fd) = ready_pipe {
+                Self::notify_namespace_ready(&fd, std::process::id())?;
+            }
+            return self.setup_and_exec_gvisor();
+        }
 
         // 1. Create namespaces in child and optionally configure user mapping.
         let mut namespace_mgr = NamespaceManager::new(self.config.namespaces.clone());
@@ -342,11 +366,6 @@ impl Container {
         // 2. Set hostname if UTS namespace is enabled
         if let Some(hostname) = &self.config.hostname {
             namespace_mgr.set_hostname(hostname)?;
-        }
-
-        // gVisor flow uses OCI/runsc instead of native mount/isolation path.
-        if self.config.use_gvisor {
-            return self.setup_and_exec_gvisor();
         }
 
         // 3. Mount tmpfs as container root
@@ -491,9 +510,13 @@ impl Container {
     fn setup_and_exec_gvisor(&self) -> Result<()> {
         info!("Using gVisor runtime");
 
-        let gvisor = GVisorRuntime::new().map_err(|e| {
-            NucleusError::GVisorError(format!("Failed to initialize gVisor runtime: {}", e))
-        })?;
+        let gvisor = if let Some(ref path) = self.runsc_path {
+            GVisorRuntime::with_path(path.clone())
+        } else {
+            GVisorRuntime::new().map_err(|e| {
+                NucleusError::GVisorError(format!("Failed to initialize gVisor runtime: {}", e))
+            })?
+        };
 
         self.setup_and_exec_gvisor_oci(&gvisor)
     }
@@ -520,6 +543,12 @@ impl Container {
         // Mount pre-built rootfs if provided
         if let Some(ref rootfs_path) = self.config.rootfs_path {
             oci_config = oci_config.with_rootfs_binds(rootfs_path);
+        } else {
+            oci_config = oci_config.with_host_runtime_binds();
+        }
+
+        if let Some(context_dir) = &self.config.context_dir {
+            oci_config = oci_config.with_context_bind(context_dir);
         }
 
         // Mount secrets into OCI bundle
@@ -527,8 +556,8 @@ impl Container {
             oci_config = oci_config.with_secret_mounts(&self.config.secrets);
         }
 
-        if self.config.user_ns_config.is_some() {
-            oci_config = oci_config.with_user_namespace();
+        if let Some(user_ns_config) = &self.config.user_ns_config {
+            oci_config = oci_config.with_rootless_user_namespace(user_ns_config);
         }
 
         let bundle_dir = Builder::new()
@@ -538,20 +567,16 @@ impl Container {
                 NucleusError::FilesystemError(format!("Failed to create OCI bundle dir: {}", e))
             })?;
         let bundle_path = bundle_dir.path().to_path_buf();
+        let oci_mounts = oci_config.mounts.clone();
         let bundle = OciBundle::new(bundle_path, oci_config);
         bundle.create()?;
 
         let rootfs = bundle.rootfs_path();
         create_minimal_fs(&rootfs)?;
+        Self::prepare_oci_mountpoints(&rootfs, &oci_mounts)?;
 
         let dev_path = rootfs.join("dev");
         create_dev_nodes(&dev_path, false)?;
-
-        if let Some(context_dir) = &self.config.context_dir {
-            let context_dest = rootfs.join("context");
-            let populator = ContextPopulator::new(context_dir, &context_dest);
-            populator.populate()?;
-        }
 
         // Write resolv.conf for bridge networking into the OCI rootfs
         if let NetworkMode::Bridge(ref bridge_config) = self.config.network {
@@ -565,7 +590,46 @@ impl Container {
             NetworkMode::Bridge(_) => GVisorNetworkMode::Sandbox,
         };
 
-        gvisor.exec_with_oci_bundle_network(&self.config.id, &bundle, gvisor_net)?;
+        let rootless_oci = self.config.user_ns_config.is_some();
+        gvisor.exec_with_oci_bundle_network(&self.config.id, &bundle, gvisor_net, rootless_oci)?;
+
+        Ok(())
+    }
+
+    fn prepare_oci_mountpoints(rootfs: &std::path::Path, mounts: &[OciMount]) -> Result<()> {
+        for mount in mounts {
+            let relative = mount.destination.trim_start_matches('/');
+            if relative.is_empty() {
+                continue;
+            }
+
+            let target = rootfs.join(relative);
+            if mount.mount_type == "bind" && std::path::Path::new(&mount.source).is_file() {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        NucleusError::FilesystemError(format!(
+                            "Failed to create OCI mount parent {:?}: {}",
+                            parent, e
+                        ))
+                    })?;
+                }
+                if !target.exists() {
+                    std::fs::File::create(&target).map_err(|e| {
+                        NucleusError::FilesystemError(format!(
+                            "Failed to create OCI mount target {:?}: {}",
+                            target, e
+                        ))
+                    })?;
+                }
+            } else {
+                std::fs::create_dir_all(&target).map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to create OCI mount target {:?}: {}",
+                        target, e
+                    ))
+                })?;
+            }
+        }
 
         Ok(())
     }
@@ -615,7 +679,10 @@ impl Container {
         // Append user-configured environment variables
         for (key, value) in &self.config.environment {
             env.push(CString::new(format!("{}={}", key, value)).map_err(|e| {
-                NucleusError::ExecError(format!("Invalid environment variable {}={}: {}", key, value, e))
+                NucleusError::ExecError(format!(
+                    "Invalid environment variable {}={}: {}",
+                    key, value, e
+                ))
             })?);
         }
 
@@ -696,17 +763,23 @@ impl Container {
             match read(ready_read.as_raw_fd(), &mut pid_buf) {
                 Err(nix::errno::Errno::EINTR) => continue,
                 Ok(4) => return Ok(u32::from_ne_bytes(pid_buf)),
-                Ok(0) => return Err(NucleusError::ExecError(format!(
-                    "Child {} exited before namespace initialization",
-                    child
-                ))),
-                Ok(_) => return Err(NucleusError::ExecError(
-                    "Invalid namespace sync payload from child".to_string(),
-                )),
-                Err(e) => return Err(NucleusError::ExecError(format!(
-                    "Failed waiting for child namespace setup: {}",
-                    e
-                ))),
+                Ok(0) => {
+                    return Err(NucleusError::ExecError(format!(
+                        "Child {} exited before namespace initialization",
+                        child
+                    )))
+                }
+                Ok(_) => {
+                    return Err(NucleusError::ExecError(
+                        "Invalid namespace sync payload from child".to_string(),
+                    ))
+                }
+                Err(e) => {
+                    return Err(NucleusError::ExecError(format!(
+                        "Failed waiting for child namespace setup: {}",
+                        e
+                    )))
+                }
             }
         }
     }
@@ -852,11 +925,7 @@ impl Container {
     }
 
     /// Run periodic health checks against the container via nsenter.
-    fn health_check_loop(
-        pid: u32,
-        container_name: &str,
-        hc: &crate::container::HealthCheck,
-    ) {
+    fn health_check_loop(pid: u32, container_name: &str, hc: &crate::container::HealthCheck) {
         use std::process::Command;
 
         // Wait for start_period before beginning checks
@@ -933,10 +1002,7 @@ impl Container {
                             container_name, consecutive_failures
                         );
                         // Signal the container to stop — the parent will handle cleanup
-                        let _ = kill(
-                            Pid::from_raw(pid as i32),
-                            Signal::SIGTERM,
-                        );
+                        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
                         return;
                     }
                 }
@@ -1033,7 +1099,7 @@ mod tests {
         let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
         assert!(!config.id.is_empty());
         assert_eq!(config.command, vec!["/bin/sh"]);
-        assert!(!config.use_gvisor);
+        assert!(config.use_gvisor);
     }
 
     #[test]

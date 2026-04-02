@@ -153,10 +153,7 @@ impl ResourceLimits {
         })?;
 
         num.checked_mul(multiplier).ok_or_else(|| {
-            NucleusError::InvalidResourceLimit(format!(
-                "Memory value overflows u64: {}",
-                s
-            ))
+            NucleusError::InvalidResourceLimit(format!("Memory value overflows u64: {}", s))
         })
     }
 

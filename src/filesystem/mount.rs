@@ -10,7 +10,22 @@ pub fn create_minimal_fs(root: &Path) -> Result<()> {
     info!("Creating minimal filesystem structure at {:?}", root);
 
     // Create essential directories
-    let dirs = vec!["dev", "proc", "sys", "tmp", "bin", "etc", "context"];
+    let dirs = vec![
+        "dev",
+        "proc",
+        "sys",
+        "tmp",
+        "bin",
+        "sbin",
+        "usr",
+        "lib",
+        "lib64",
+        "etc",
+        "nix",
+        "nix/store",
+        "run",
+        "context",
+    ];
 
     for dir in dirs {
         let path = root.join(dir);
@@ -440,10 +455,7 @@ fn chroot_impl(new_root: &Path) -> Result<()> {
 ///
 /// Each secret is bind-mounted read-only from its source to the destination
 /// path inside the container. Intermediate directories are created as needed.
-pub fn mount_secrets(
-    root: &Path,
-    secrets: &[crate::container::SecretMount],
-) -> Result<()> {
+pub fn mount_secrets(root: &Path, secrets: &[crate::container::SecretMount]) -> Result<()> {
     if secrets.is_empty() {
         return Ok(());
     }
@@ -534,7 +546,10 @@ pub fn mount_secrets(
             }
         }
 
-        debug!("Mounted secret {:?} -> {:?} (mode {:04o})", secret.source, secret.dest, secret.mode);
+        debug!(
+            "Mounted secret {:?} -> {:?} (mode {:04o})",
+            secret.source, secret.dest, secret.mode
+        );
     }
 
     Ok(())

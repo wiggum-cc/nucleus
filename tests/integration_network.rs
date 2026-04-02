@@ -87,12 +87,12 @@ mod tests {
     fn test_bridge_config_invalid_subnet_rejected() {
         let cases = vec![
             "not-a-cidr",
-            "10.0.0.0",       // missing prefix
-            "10.0.0.0/33",    // prefix too large
-            "999.0.0.0/24",   // invalid octet
-            "10.0.0.0/abc",   // non-numeric prefix
-            "-1.0.0.0/24",    // negative octet
-            "10.0.0/24",      // only 3 octets
+            "10.0.0.0",     // missing prefix
+            "10.0.0.0/33",  // prefix too large
+            "999.0.0.0/24", // invalid octet
+            "10.0.0.0/abc", // non-numeric prefix
+            "-1.0.0.0/24",  // negative octet
+            "10.0.0/24",    // only 3 octets
         ];
         for subnet in cases {
             let mut config = BridgeConfig::default();
@@ -228,11 +228,9 @@ mod tests {
     #[test]
     fn test_container_with_bridge_network() {
         let bridge = BridgeConfig::default().with_public_dns();
-        let config = ContainerConfig::new(
-            Some("test-bridge".to_string()),
-            vec!["/bin/sh".to_string()],
-        )
-        .with_network(NetworkMode::Bridge(bridge));
+        let config =
+            ContainerConfig::new(Some("test-bridge".to_string()), vec!["/bin/sh".to_string()])
+                .with_network(NetworkMode::Bridge(bridge));
 
         assert!(matches!(config.network, NetworkMode::Bridge(_)));
     }
@@ -240,10 +238,7 @@ mod tests {
     #[test]
     fn test_container_with_egress_policy() {
         let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
-            .with_egress_policy(
-                EgressPolicy::deny_all()
-                    .with_allowed_tcp_ports(vec![443]),
-            );
+            .with_egress_policy(EgressPolicy::deny_all().with_allowed_tcp_ports(vec![443]));
 
         assert!(config.egress_policy.is_some());
         let policy = config.egress_policy.unwrap();

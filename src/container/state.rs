@@ -222,10 +222,8 @@ impl ContainerStateManager {
         }
 
         // Try exact name match (must be unambiguous)
-        let name_matches: Vec<&ContainerState> = states
-            .iter()
-            .filter(|s| s.name == reference)
-            .collect();
+        let name_matches: Vec<&ContainerState> =
+            states.iter().filter(|s| s.name == reference).collect();
         match name_matches.len() {
             1 => return Ok(name_matches[0].clone()),
             n if n > 1 => {

@@ -131,7 +131,10 @@ impl ContainerLifecycle {
             let cgroup = std::path::Path::new(cgroup_path);
             if cgroup.exists() {
                 if let Err(e) = std::fs::remove_dir(cgroup) {
-                    warn!("Failed to remove cgroup {}: {} (may still have processes)", cgroup_path, e);
+                    warn!(
+                        "Failed to remove cgroup {}: {} (may still have processes)",
+                        cgroup_path, e
+                    );
                 } else {
                     info!("Removed cgroup {}", cgroup_path);
                 }

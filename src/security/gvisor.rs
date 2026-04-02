@@ -37,6 +37,22 @@ impl GVisorRuntime {
         Ok(Self { runsc_path })
     }
 
+    /// Create a GVisor runtime with a pre-resolved runsc path.
+    ///
+    /// Use this when the path was resolved before privilege changes
+    /// (e.g. before entering a user namespace where UID 0 would block
+    /// PATH-based lookup).
+    pub fn with_path(runsc_path: String) -> Self {
+        Self { runsc_path }
+    }
+
+    /// Resolve the runsc path without constructing a full runtime.
+    /// Call this before fork/unshare so the path is resolved while
+    /// still unprivileged.
+    pub fn resolve_path() -> Result<String> {
+        Self::find_runsc()
+    }
+
     /// Find the runsc binary
     fn find_runsc() -> Result<String> {
         // Try common locations
@@ -89,22 +105,61 @@ impl GVisorRuntime {
                 path, e
             ))
         })?;
-        let metadata = std::fs::metadata(&canonical).map_err(|e| {
-            NucleusError::GVisorError(format!("Failed to stat runsc path {:?}: {}", canonical, e))
+
+        // If the candidate is a shell wrapper script (common on NixOS where
+        // nix wraps binaries to inject PATH), look for the real ELF binary
+        // next to it.  runsc's gofer subprocess re-execs via /proc/self/exe,
+        // which must point to the real binary — not a bash wrapper.
+        let resolved = Self::unwrap_nix_wrapper(&canonical).unwrap_or_else(|| canonical.clone());
+
+        let metadata = std::fs::metadata(&resolved).map_err(|e| {
+            NucleusError::GVisorError(format!("Failed to stat runsc path {:?}: {}", resolved, e))
         })?;
 
         let mode = metadata.permissions().mode();
         if mode & 0o022 != 0 {
             return Err(NucleusError::GVisorError(format!(
                 "Refusing insecure runsc binary permissions at {:?} (mode {:o})",
-                canonical, mode
+                resolved, mode
             )));
         }
         if mode & 0o111 == 0 {
             return Ok(None);
         }
 
-        Ok(Some(canonical.to_string_lossy().to_string()))
+        Ok(Some(resolved.to_string_lossy().to_string()))
+    }
+
+    /// If `path` is a Nix wrapper script, extract the real binary path.
+    ///
+    /// Nix wrapper scripts end with a line like:
+    ///   exec -a "$0" "/nix/store/…/.runsc-wrapped"  "$@"
+    /// We parse that to find the actual ELF binary.
+    fn unwrap_nix_wrapper(path: &Path) -> Option<std::path::PathBuf> {
+        let content = std::fs::read_to_string(path).ok()?;
+        // Only process short scripts (wrapper scripts are small)
+        if content.len() > 4096 || !content.starts_with("#!") {
+            return None;
+        }
+        // Look for the exec line that references the wrapped binary
+        for line in content.lines().rev() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("exec ") {
+                // Parse: exec -a "$0" "/nix/store/.../bin/.runsc-wrapped"  "$@"
+                // or:    exec "/nix/store/.../bin/.runsc-wrapped"  "$@"
+                for token in trimmed.split_whitespace() {
+                    let unquoted = token.trim_matches('"');
+                    if unquoted.starts_with('/') && unquoted.contains("runsc") {
+                        let candidate = std::path::PathBuf::from(unquoted);
+                        if candidate.exists() && candidate.is_file() {
+                            debug!("Resolved Nix wrapper {:?} → {:?}", path, candidate);
+                            return Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Execute using gVisor with an OCI bundle
@@ -114,20 +169,24 @@ impl GVisorRuntime {
     /// - `GVisorNetworkMode::None` → `--network none` (fully isolated, original behavior)
     /// - `GVisorNetworkMode::Sandbox` → `--network sandbox` (gVisor user-space network stack)
     /// - `GVisorNetworkMode::Host` → `--network host` (share host network namespace)
-    pub fn exec_with_oci_bundle(
-        &self,
-        container_id: &str,
-        bundle: &OciBundle,
-    ) -> Result<()> {
-        self.exec_with_oci_bundle_network(container_id, bundle, GVisorNetworkMode::None)
+    pub fn exec_with_oci_bundle(&self, container_id: &str, bundle: &OciBundle) -> Result<()> {
+        self.exec_with_oci_bundle_network(container_id, bundle, GVisorNetworkMode::None, false)
     }
 
     /// Execute using gVisor with an OCI bundle and explicit network mode.
+    ///
+    /// When `rootless` is true, the OCI spec is expected to carry explicit
+    /// user namespace mappings. In that mode we do not pass runsc's CLI
+    /// `--rootless` flag, because gVisor documents that flag as the
+    /// `runsc do`-oriented path rather than the OCI `run` path. We still skip runsc's
+    /// internal cgroup configuration because Nucleus already manages cgroups
+    /// externally and unprivileged callers cannot configure them directly.
     pub fn exec_with_oci_bundle_network(
         &self,
         container_id: &str,
         bundle: &OciBundle,
         network_mode: GVisorNetworkMode,
+        rootless: bool,
     ) -> Result<()> {
         info!(
             "Executing with gVisor using OCI bundle at {:?} (network: {:?})",
@@ -141,19 +200,43 @@ impl GVisorRuntime {
             GVisorNetworkMode::Host => "host",
         };
 
-        // Build runsc run command with OCI bundle
-        // runsc run --bundle <bundle-path> <container-id>
-        let args = vec![
+        // Create a per-container root directory for runsc state.
+        // By default runsc uses /var/run/runsc which requires root privileges.
+        // We place it next to the OCI bundle so it is cleaned up together.
+        let runsc_root = bundle
+            .bundle_path()
+            .parent()
+            .unwrap_or(bundle.bundle_path())
+            .join(format!("runsc-root-{}", container_id));
+        std::fs::create_dir_all(&runsc_root).map_err(|e| {
+            NucleusError::GVisorError(format!("Failed to create runsc root directory: {}", e))
+        })?;
+
+        // Build runsc command with OCI bundle.
+        // Global flags (--root, --network, --platform) must come BEFORE the subcommand.
+        // runsc --root <dir> --network <mode> --platform <plat> run --bundle <path> <id>
+        let mut args = vec![
             self.runsc_path.clone(),
-            "run".to_string(),
-            "--bundle".to_string(),
-            bundle.bundle_path().to_string_lossy().to_string(),
+            "--root".to_string(),
+            runsc_root.to_string_lossy().to_string(),
+        ];
+
+        // Rootless OCI mode relies on user namespace mappings in config.json.
+        // We intentionally do not pass runsc's CLI `--rootless` flag here.
+        if rootless {
+            args.push("--ignore-cgroups".to_string());
+        }
+
+        args.extend([
             "--network".to_string(),
             network_flag.to_string(),
             "--platform".to_string(),
-            "ptrace".to_string(), // Use ptrace platform (works without KVM)
+            "systrap".to_string(), // Use systrap platform (works without KVM)
+            "run".to_string(),
+            "--bundle".to_string(),
+            bundle.bundle_path().to_string_lossy().to_string(),
             container_id.to_string(),
-        ];
+        ]);
 
         debug!("runsc OCI args: {:?}", args);
 
@@ -170,8 +253,10 @@ impl GVisorRuntime {
             .collect();
         let c_args = c_args?;
 
+        let c_env = self.exec_environment()?;
+
         // execve - this replaces the current process with runsc
-        nix::unistd::execve::<std::ffi::CString, std::ffi::CString>(&program, &c_args, &[])?;
+        nix::unistd::execve::<std::ffi::CString, std::ffi::CString>(&program, &c_args, &c_env)?;
 
         // Should never reach here
         Ok(())
@@ -197,6 +282,30 @@ impl GVisorRuntime {
 
         let version = String::from_utf8_lossy(&output.stdout).to_string();
         Ok(version.trim().to_string())
+    }
+
+    fn exec_environment(&self) -> Result<Vec<CString>> {
+        let mut env = Vec::new();
+        let mut push = |key: &str, value: String| -> Result<()> {
+            env.push(
+                CString::new(format!("{}={}", key, value))
+                    .map_err(|e| NucleusError::GVisorError(format!("Invalid {}: {}", key, e)))?,
+            );
+            Ok(())
+        };
+
+        let path = std::env::var("PATH").unwrap_or_else(|_| {
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
+        });
+        push("PATH", path)?;
+
+        for key in ["HOME", "TMPDIR", "XDG_RUNTIME_DIR", "USER", "LOGNAME"] {
+            if let Ok(value) = std::env::var(key) {
+                push(key, value)?;
+            }
+        }
+
+        Ok(env)
     }
 }
 

@@ -197,9 +197,8 @@ impl BridgeNetwork {
     pub fn apply_egress_policy(&self, pid: u32, policy: &EgressPolicy) -> Result<()> {
         // Validate egress CIDRs before passing to iptables
         for cidr in &policy.allowed_cidrs {
-            crate::network::config::validate_egress_cidr(cidr).map_err(|e| {
-                NucleusError::NetworkError(format!("Invalid egress CIDR: {}", e))
-            })?;
+            crate::network::config::validate_egress_cidr(cidr)
+                .map_err(|e| NucleusError::NetworkError(format!("Invalid egress CIDR: {}", e)))?;
         }
 
         let pid_str = pid.to_string();
@@ -333,12 +332,13 @@ impl BridgeNetwork {
         // Drop everything else
         Self::run_cmd(
             "nsenter",
-            &[
-                "-t", &pid_str, "-n", "iptables", "-P", "OUTPUT", "DROP",
-            ],
+            &["-t", &pid_str, "-n", "iptables", "-P", "OUTPUT", "DROP"],
         )?;
 
-        info!("Egress policy applied: {} allowed CIDRs", policy.allowed_cidrs.len());
+        info!(
+            "Egress policy applied: {} allowed CIDRs",
+            policy.allowed_cidrs.len()
+        );
         debug!("Egress policy details: {:?}", policy);
 
         Ok(())
@@ -608,11 +608,7 @@ impl BridgeNetwork {
         if nix::unistd::Uid::effective().is_root() {
             let search_dirs: &[&str] = match name {
                 "ip" => &["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"],
-                "iptables" => &[
-                    "/usr/sbin/iptables",
-                    "/sbin/iptables",
-                    "/usr/bin/iptables",
-                ],
+                "iptables" => &["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"],
                 "nsenter" => &["/usr/bin/nsenter", "/usr/sbin/nsenter", "/bin/nsenter"],
                 _ => &[],
             };
@@ -627,15 +623,9 @@ impl BridgeNetwork {
 
     fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
         let resolved = Self::resolve_bin(program);
-        let output = Command::new(&resolved)
-            .args(args)
-            .output()
-            .map_err(|e| {
-                NucleusError::NetworkError(format!(
-                    "Failed to run {} {:?}: {}",
-                    resolved, args, e
-                ))
-            })?;
+        let output = Command::new(&resolved).args(args).output().map_err(|e| {
+            NucleusError::NetworkError(format!("Failed to run {} {:?}: {}", resolved, args, e))
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -716,10 +706,7 @@ impl BridgeNetwork {
             None::<&str>,
         )
         .map_err(|e| {
-            NucleusError::NetworkError(format!(
-                "Failed to bind mount resolv.conf: {}",
-                e
-            ))
+            NucleusError::NetworkError(format!("Failed to bind mount resolv.conf: {}", e))
         })?;
 
         info!("Bind-mounted resolv.conf for bridge networking (rootfs mode)");

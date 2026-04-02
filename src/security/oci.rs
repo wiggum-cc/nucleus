@@ -1,6 +1,8 @@
 use crate::error::{NucleusError, Result};
+use crate::isolation::{IdMapping, UserNamespaceConfig};
 use crate::resources::ResourceLimits;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -74,6 +76,10 @@ pub struct OciLinux {
     pub namespaces: Option<Vec<OciNamespace>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<OciResources>,
+    #[serde(rename = "uidMappings", skip_serializing_if = "Vec::is_empty", default)]
+    pub uid_mappings: Vec<OciIdMapping>,
+    #[serde(rename = "gidMappings", skip_serializing_if = "Vec::is_empty", default)]
+    pub gid_mappings: Vec<OciIdMapping>,
     #[serde(rename = "maskedPaths", skip_serializing_if = "Vec::is_empty", default)]
     pub masked_paths: Vec<String>,
     #[serde(
@@ -88,6 +94,15 @@ pub struct OciLinux {
 pub struct OciNamespace {
     #[serde(rename = "type")]
     pub namespace_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OciIdMapping {
+    #[serde(rename = "containerID")]
+    pub container_id: u32,
+    #[serde(rename = "hostID")]
+    pub host_id: u32,
+    pub size: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,9 +151,12 @@ impl OciConfig {
                     additional_gids: None,
                 },
                 args: command,
-                env: vec![
-                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-                ],
+                env: vec![format!(
+                    "PATH={}",
+                    std::env::var("PATH").unwrap_or_else(|_| {
+                        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
+                    })
+                )],
                 cwd: "/".to_string(),
                 no_new_privileges: true,
                 capabilities: Some(OciCapabilities {
@@ -216,6 +234,8 @@ impl OciConfig {
                     },
                 ]),
                 resources: None,
+                uid_mappings: vec![],
+                gid_mappings: vec![],
                 masked_paths: vec![
                     "/proc/acpi".to_string(),
                     "/proc/asound".to_string(),
@@ -310,6 +330,25 @@ impl OciConfig {
         self
     }
 
+    /// Bind mount the host context directory into the container.
+    ///
+    /// The gVisor integration path expects `/context` to be writable so test
+    /// workloads can write results back to the host.
+    pub fn with_context_bind(mut self, context_dir: &std::path::Path) -> Self {
+        self.mounts.push(OciMount {
+            destination: "/context".to_string(),
+            source: context_dir.to_string_lossy().to_string(),
+            mount_type: "bind".to_string(),
+            options: vec![
+                "bind".to_string(),
+                "rw".to_string(),
+                "nosuid".to_string(),
+                "nodev".to_string(),
+            ],
+        });
+        self
+    }
+
     /// Add rootfs bind mounts from a pre-built rootfs path.
     pub fn with_rootfs_binds(mut self, rootfs_path: &std::path::Path) -> Self {
         let subdirs = ["bin", "sbin", "lib", "lib64", "usr", "etc", "nix"];
@@ -332,6 +371,55 @@ impl OciConfig {
         self
     }
 
+    /// Add read-only bind mounts for host runtime paths.
+    ///
+    /// This mirrors the native fallback path for non-production containers so
+    /// common executables such as `/bin/sh` remain available inside the OCI
+    /// rootfs when no explicit rootfs is configured.
+    pub fn with_host_runtime_binds(mut self) -> Self {
+        let mut host_paths = BTreeSet::new();
+        host_paths.extend([
+            "/bin".to_string(),
+            "/usr".to_string(),
+            "/lib".to_string(),
+            "/lib64".to_string(),
+            "/nix/store".to_string(),
+        ]);
+
+        if let Ok(path_var) = std::env::var("PATH") {
+            for dir in path_var.split(':') {
+                if dir.is_empty() || !dir.starts_with('/') {
+                    continue;
+                }
+                if dir.starts_with("/nix/store/") {
+                    host_paths.insert("/nix/store".to_string());
+                    continue;
+                }
+                host_paths.insert(dir.to_string());
+            }
+        }
+
+        for host_path in host_paths {
+            let source = Path::new(&host_path);
+            if !source.exists() {
+                continue;
+            }
+
+            self.mounts.push(OciMount {
+                destination: host_path.clone(),
+                source: source.to_string_lossy().to_string(),
+                mount_type: "bind".to_string(),
+                options: vec![
+                    "bind".to_string(),
+                    "ro".to_string(),
+                    "nosuid".to_string(),
+                    "nodev".to_string(),
+                ],
+            });
+        }
+        self
+    }
+
     /// Add user namespace configuration
     pub fn with_user_namespace(mut self) -> Self {
         if let Some(linux) = &mut self.linux {
@@ -342,6 +430,38 @@ impl OciConfig {
             }
         }
         self
+    }
+
+    /// Configure gVisor's true rootless OCI path.
+    ///
+    /// gVisor expects UID/GID mappings in the OCI spec for this mode, and its
+    /// rootless OCI implementation does not currently support a network
+    /// namespace entry in the spec. We still control networking through
+    /// runsc's top-level `--network` flag.
+    pub fn with_rootless_user_namespace(mut self, config: &UserNamespaceConfig) -> Self {
+        if let Some(linux) = &mut self.linux {
+            if let Some(namespaces) = &mut linux.namespaces {
+                namespaces.retain(|ns| ns.namespace_type != "network");
+                if !namespaces.iter().any(|ns| ns.namespace_type == "user") {
+                    namespaces.push(OciNamespace {
+                        namespace_type: "user".to_string(),
+                    });
+                }
+            }
+            linux.uid_mappings = config.uid_mappings.iter().map(OciIdMapping::from).collect();
+            linux.gid_mappings = config.gid_mappings.iter().map(OciIdMapping::from).collect();
+        }
+        self
+    }
+}
+
+impl From<&IdMapping> for OciIdMapping {
+    fn from(mapping: &IdMapping) -> Self {
+        Self {
+            container_id: mapping.container_id,
+            host_id: mapping.host_id,
+            size: mapping.count,
+        }
     }
 }
 

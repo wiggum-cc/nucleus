@@ -193,7 +193,7 @@ impl ContainerConfig {
             namespaces: NamespaceConfig::default(),
             user_ns_config: None,
             hostname: Some(name),
-            use_gvisor: false,
+            use_gvisor: true,
             trust_level: TrustLevel::default(),
             network: crate::network::NetworkMode::None,
             context_mode: crate::filesystem::ContextMode::Copy,

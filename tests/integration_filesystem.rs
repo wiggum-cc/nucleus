@@ -71,11 +71,7 @@ mod tests {
 
         for dir in &[".env", ".ssh", ".gnupg", ".aws", ".docker"] {
             std::fs::create_dir(src.path().join(dir)).unwrap();
-            std::fs::write(
-                src.path().join(format!("{}/secret", dir)),
-                "sensitive",
-            )
-            .unwrap();
+            std::fs::write(src.path().join(format!("{}/secret", dir)), "sensitive").unwrap();
         }
         std::fs::write(src.path().join("safe.txt"), "ok").unwrap();
 
@@ -83,11 +79,7 @@ mod tests {
         populator.populate().unwrap();
 
         for dir in &[".env", ".ssh", ".gnupg", ".aws", ".docker"] {
-            assert!(
-                !dst.path().join(dir).exists(),
-                "{} should be excluded",
-                dir
-            );
+            assert!(!dst.path().join(dir).exists(), "{} should be excluded", dir);
         }
         assert!(dst.path().join("safe.txt").exists());
     }
@@ -147,11 +139,7 @@ mod tests {
         populator.populate().unwrap();
 
         for dir in &["target", "node_modules", "__pycache__"] {
-            assert!(
-                !dst.path().join(dir).exists(),
-                "{} should be excluded",
-                dir
-            );
+            assert!(!dst.path().join(dir).exists(), "{} should be excluded", dir);
         }
     }
 
@@ -197,11 +185,8 @@ mod tests {
         let dst = TempDir::new().unwrap();
 
         std::fs::write(src.path().join("real.txt"), "content").unwrap();
-        std::os::unix::fs::symlink(
-            src.path().join("real.txt"),
-            src.path().join("link.txt"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(src.path().join("real.txt"), src.path().join("link.txt"))
+            .unwrap();
 
         let populator = ContextPopulator::new(src.path(), dst.path());
         populator.populate().unwrap();

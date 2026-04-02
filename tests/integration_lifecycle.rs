@@ -339,6 +339,7 @@ mod tests {
             Some("test-untrusted-no-gvisor".to_string()),
             vec!["/bin/sh".to_string()],
         )
+        .with_gvisor(false)
         .with_trust_level(TrustLevel::Untrusted)
         .with_namespaces(NamespaceConfig::minimal());
 

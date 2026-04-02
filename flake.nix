@@ -185,6 +185,9 @@
             sccache
             just
 
+            # Container runtime
+            gvisor
+
             # Formal verification tools
             z3
             apalache

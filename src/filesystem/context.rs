@@ -66,7 +66,8 @@ impl ContextPopulator {
         if depth > Self::MAX_RECURSION_DEPTH {
             return Err(NucleusError::ContextError(format!(
                 "Maximum directory depth ({}) exceeded at {:?}",
-                Self::MAX_RECURSION_DEPTH, src
+                Self::MAX_RECURSION_DEPTH,
+                src
             )));
         }
         let entries = fs::read_dir(src).map_err(|e| {

@@ -1105,10 +1105,7 @@ fn test_trusted_does_not_enforce_gvisor() {
 
     let result = m.apply_trust_level_policy("c1");
     assert!(result.is_ok(), "Trusted workloads should always pass");
-    assert!(
-        !m.c("c1").use_gvisor,
-        "Trusted should not force gVisor on"
-    );
+    assert!(!m.c("c1").use_gvisor, "Trusted should not force gVisor on");
 }
 
 #[test]
