@@ -1,5 +1,7 @@
+use crate::error::StateTransition;
+
 /// Network state tracking
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkState {
     /// No network configured
     Unconfigured,
@@ -11,8 +13,8 @@ pub enum NetworkState {
     Cleaned,
 }
 
-impl NetworkState {
-    pub fn can_transition_to(&self, next: &NetworkState) -> bool {
+impl StateTransition for NetworkState {
+    fn can_transition_to(&self, next: &NetworkState) -> bool {
         matches!(
             (self, next),
             (NetworkState::Unconfigured, NetworkState::Configuring)
@@ -21,19 +23,7 @@ impl NetworkState {
         )
     }
 
-    pub fn is_terminal(&self) -> bool {
+    fn is_terminal(&self) -> bool {
         matches!(self, NetworkState::Cleaned)
-    }
-
-    /// Transition to the next state, returning an error if the transition is invalid
-    pub fn transition(self, next: NetworkState) -> crate::error::Result<NetworkState> {
-        if self.can_transition_to(&next) {
-            Ok(next)
-        } else {
-            Err(crate::error::NucleusError::InvalidStateTransition {
-                from: format!("{:?}", self),
-                to: format!("{:?}", next),
-            })
-        }
     }
 }

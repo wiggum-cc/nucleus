@@ -1,5 +1,7 @@
+use crate::error::StateTransition;
+
 /// Checkpoint state tracking
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointState {
     /// No checkpoint in progress
     None,
@@ -13,8 +15,8 @@ pub enum CheckpointState {
     Restored,
 }
 
-impl CheckpointState {
-    pub fn can_transition_to(&self, next: &CheckpointState) -> bool {
+impl StateTransition for CheckpointState {
+    fn can_transition_to(&self, next: &CheckpointState) -> bool {
         matches!(
             (self, next),
             (CheckpointState::None, CheckpointState::Dumping)
@@ -24,6 +26,10 @@ impl CheckpointState {
                 | (CheckpointState::Restoring, CheckpointState::Restored)
                 | (CheckpointState::Restoring, CheckpointState::None)
         )
+    }
+
+    fn is_terminal(&self) -> bool {
+        false
     }
 }
 

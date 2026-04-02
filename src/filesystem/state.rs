@@ -1,3 +1,5 @@
+use crate::error::StateTransition;
+
 /// Filesystem lifecycle state machine matching Nucleus_Filesystem_FilesystemLifecycle.tla
 ///
 /// State transitions:
@@ -21,9 +23,8 @@ pub enum FilesystemState {
     UnmountedFinal,
 }
 
-impl FilesystemState {
-    /// Check if transition is valid according to TLA+ spec
-    pub fn can_transition_to(&self, next: FilesystemState) -> bool {
+impl StateTransition for FilesystemState {
+    fn can_transition_to(&self, next: &FilesystemState) -> bool {
         use FilesystemState::*;
 
         matches!(
@@ -42,21 +43,8 @@ impl FilesystemState {
         )
     }
 
-    /// Check if this is a terminal state
-    pub fn is_terminal(&self) -> bool {
+    fn is_terminal(&self) -> bool {
         matches!(self, FilesystemState::UnmountedFinal)
-    }
-
-    /// Transition to the next state, returning an error if the transition is invalid
-    pub fn transition(self, next: FilesystemState) -> crate::error::Result<FilesystemState> {
-        if self.can_transition_to(next) {
-            Ok(next)
-        } else {
-            Err(crate::error::NucleusError::InvalidStateTransition {
-                from: format!("{:?}", self),
-                to: format!("{:?}", next),
-            })
-        }
     }
 }
 
@@ -66,21 +54,21 @@ mod tests {
 
     #[test]
     fn test_valid_transitions() {
-        assert!(FilesystemState::Unmounted.can_transition_to(FilesystemState::Mounted));
-        assert!(FilesystemState::Mounted.can_transition_to(FilesystemState::Populated));
-        assert!(FilesystemState::Populated.can_transition_to(FilesystemState::Pivoted));
-        assert!(FilesystemState::Pivoted.can_transition_to(FilesystemState::UnmountedFinal));
+        assert!(FilesystemState::Unmounted.can_transition_to(&FilesystemState::Mounted));
+        assert!(FilesystemState::Mounted.can_transition_to(&FilesystemState::Populated));
+        assert!(FilesystemState::Populated.can_transition_to(&FilesystemState::Pivoted));
+        assert!(FilesystemState::Pivoted.can_transition_to(&FilesystemState::UnmountedFinal));
     }
 
     #[test]
     fn test_invalid_transitions() {
         // Cannot skip states
-        assert!(!FilesystemState::Unmounted.can_transition_to(FilesystemState::Populated));
-        assert!(!FilesystemState::Mounted.can_transition_to(FilesystemState::Pivoted));
+        assert!(!FilesystemState::Unmounted.can_transition_to(&FilesystemState::Populated));
+        assert!(!FilesystemState::Mounted.can_transition_to(&FilesystemState::Pivoted));
 
         // Cannot go backwards
-        assert!(!FilesystemState::Pivoted.can_transition_to(FilesystemState::Populated));
-        assert!(!FilesystemState::UnmountedFinal.can_transition_to(FilesystemState::Pivoted));
+        assert!(!FilesystemState::Pivoted.can_transition_to(&FilesystemState::Populated));
+        assert!(!FilesystemState::UnmountedFinal.can_transition_to(&FilesystemState::Pivoted));
     }
 
     #[test]
@@ -96,11 +84,11 @@ mod tests {
     fn test_cleanup_transitions() {
         // BUG-10: Mounted and Populated must be able to transition to Unmounted (cleanup)
         assert!(
-            FilesystemState::Mounted.can_transition_to(FilesystemState::Unmounted),
+            FilesystemState::Mounted.can_transition_to(&FilesystemState::Unmounted),
             "Mounted must be able to transition back to Unmounted for cleanup"
         );
         assert!(
-            FilesystemState::Populated.can_transition_to(FilesystemState::Unmounted),
+            FilesystemState::Populated.can_transition_to(&FilesystemState::Unmounted),
             "Populated must be able to transition back to Unmounted for cleanup"
         );
     }

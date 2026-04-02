@@ -463,15 +463,25 @@ mod tests {
     fn test_exec_environment_uses_hardcoded_path() {
         // The gVisor supervisor must NOT inherit the host PATH, to prevent
         // host filesystem layout leaking into the container environment.
-        let source = include_str!("gvisor.rs");
-        // exec_environment must not call std::env::var("PATH")
-        let env_var_path = source
-            .lines()
-            .filter(|l| !l.trim().starts_with("//"))
-            .any(|l| l.contains("env::var(\"PATH\")") || l.contains("env::var(\"PATH\")"));
+        // Verify by setting a distinctive PATH and checking exec_environment
+        // returns a hardcoded value instead.
+        std::env::set_var("PATH", "/tmp/evil-inject/bin:/opt/attacker/sbin");
+        let rt = GVisorRuntime::with_path("/fake/runsc".to_string());
+        let tmp = tempfile::tempdir().unwrap();
+        let env = rt.exec_environment(tmp.path()).unwrap();
+        let path_entry = env.iter()
+            .find(|e| e.to_str().is_ok_and(|s| s.starts_with("PATH=")))
+            .expect("exec_environment must set PATH");
+        let path_val = path_entry.to_str().unwrap();
         assert!(
-            !env_var_path,
-            "exec_environment must use hardcoded PATH, not read host PATH"
+            !path_val.contains("evil-inject") && !path_val.contains("attacker"),
+            "exec_environment must use hardcoded PATH, not host PATH. Got: {}",
+            path_val
+        );
+        assert_eq!(
+            path_val,
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "exec_environment PATH must be the standard hardcoded value"
         );
     }
 

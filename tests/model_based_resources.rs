@@ -39,14 +39,14 @@ fn test_cgroup_property_resource_limits_enforced() {
     let state = CgroupState::Configured;
 
     // Valid transitions
-    assert!(state.can_transition_to(CgroupState::Configured)); // stuttering
-    assert!(state.can_transition_to(CgroupState::Attached));
-    assert!(state.can_transition_to(CgroupState::Removed)); // error path
+    assert!(state.can_transition_to(&CgroupState::Configured)); // stuttering
+    assert!(state.can_transition_to(&CgroupState::Attached));
+    assert!(state.can_transition_to(&CgroupState::Removed)); // error path
 
     // Invalid transitions
-    assert!(!state.can_transition_to(CgroupState::Nonexistent));
-    assert!(!state.can_transition_to(CgroupState::Created));
-    assert!(!state.can_transition_to(CgroupState::Monitoring)); // must go through Attached
+    assert!(!state.can_transition_to(&CgroupState::Nonexistent));
+    assert!(!state.can_transition_to(&CgroupState::Created));
+    assert!(!state.can_transition_to(&CgroupState::Monitoring)); // must go through Attached
 }
 
 #[test]
@@ -59,14 +59,14 @@ fn test_cgroup_property_no_resource_leak() {
     assert!(state.is_terminal());
 
     // Cannot transition to any other state
-    assert!(!state.can_transition_to(CgroupState::Nonexistent));
-    assert!(!state.can_transition_to(CgroupState::Created));
-    assert!(!state.can_transition_to(CgroupState::Configured));
-    assert!(!state.can_transition_to(CgroupState::Attached));
-    assert!(!state.can_transition_to(CgroupState::Monitoring));
+    assert!(!state.can_transition_to(&CgroupState::Nonexistent));
+    assert!(!state.can_transition_to(&CgroupState::Created));
+    assert!(!state.can_transition_to(&CgroupState::Configured));
+    assert!(!state.can_transition_to(&CgroupState::Attached));
+    assert!(!state.can_transition_to(&CgroupState::Monitoring));
 
     // Can stay in same state
-    assert!(state.can_transition_to(CgroupState::Removed));
+    assert!(state.can_transition_to(&CgroupState::Removed));
 }
 
 #[test]
@@ -117,18 +117,18 @@ fn test_cgroup_property_cleanup_guaranteed() {
 fn test_cgroup_error_paths() {
     // Cleanup paths allow jumping to Removed from Created, Configured, or Attached
 
-    assert!(CgroupState::Created.can_transition_to(CgroupState::Removed));
-    assert!(CgroupState::Configured.can_transition_to(CgroupState::Removed));
-    assert!(CgroupState::Attached.can_transition_to(CgroupState::Removed));
+    assert!(CgroupState::Created.can_transition_to(&CgroupState::Removed));
+    assert!(CgroupState::Configured.can_transition_to(&CgroupState::Removed));
+    assert!(CgroupState::Attached.can_transition_to(&CgroupState::Removed));
 }
 
 #[test]
 fn test_cgroup_no_backwards_transitions() {
     // Cannot move backwards in the state machine
 
-    assert!(!CgroupState::Created.can_transition_to(CgroupState::Nonexistent));
-    assert!(!CgroupState::Configured.can_transition_to(CgroupState::Created));
-    assert!(!CgroupState::Attached.can_transition_to(CgroupState::Configured));
-    assert!(!CgroupState::Monitoring.can_transition_to(CgroupState::Attached));
-    assert!(!CgroupState::Removed.can_transition_to(CgroupState::Monitoring));
+    assert!(!CgroupState::Created.can_transition_to(&CgroupState::Nonexistent));
+    assert!(!CgroupState::Configured.can_transition_to(&CgroupState::Created));
+    assert!(!CgroupState::Attached.can_transition_to(&CgroupState::Configured));
+    assert!(!CgroupState::Monitoring.can_transition_to(&CgroupState::Attached));
+    assert!(!CgroupState::Removed.can_transition_to(&CgroupState::Monitoring));
 }

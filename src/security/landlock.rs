@@ -276,21 +276,45 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Extract the body of a function from source text by brace-matching,
+    /// avoiding fragile hardcoded character-window offsets (SEC-MED-03).
+    fn extract_fn_body<'a>(source: &'a str, fn_signature: &str) -> &'a str {
+        let fn_start = source.find(fn_signature)
+            .unwrap_or_else(|| panic!("function '{}' not found in source", fn_signature));
+        let after = &source[fn_start..];
+        let open = after.find('{')
+            .unwrap_or_else(|| panic!("no opening brace found for '{}'", fn_signature));
+        let mut depth = 0u32;
+        let mut end = open;
+        for (i, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 { end = open + i + 1; break; }
+                }
+                _ => {}
+            }
+        }
+        &after[..end]
+    }
+
     #[test]
     fn test_policy_covers_nix_store_and_secrets() {
         // Landlock policy must include rules for /nix/store (read+exec) and
         // /run/secrets (read) so NixOS binaries can execute and secrets are readable.
-        // We verify this by checking that build_and_restrict references these paths.
-        // Since we can't inspect the ruleset directly, we verify the source code
-        // includes rules for these paths by checking the constants exist.
+        // NOTE: The Landlock API does not expose the ruleset for inspection, so
+        // this remains a source-text check — but uses brace-matched function
+        // body extraction instead of hardcoded char offsets.
         let source = include_str!("landlock.rs");
+        let fn_body = extract_fn_body(source, "fn build_and_restrict");
         assert!(
-            source.contains("\"/nix/store\"") || source.contains("\"/nix\""),
-            "Landlock policy must include a rule for /nix/store or /nix"
+            fn_body.contains("\"/nix/store\"") || fn_body.contains("\"/nix\""),
+            "Landlock build_and_restrict must include a rule for /nix/store or /nix"
         );
         assert!(
-            source.contains("\"/run/secrets\"") || source.contains("\"/run\""),
-            "Landlock policy must include a rule for /run/secrets"
+            fn_body.contains("\"/run/secrets\"") || fn_body.contains("\"/run\""),
+            "Landlock build_and_restrict must include a rule for /run/secrets"
         );
     }
 
@@ -312,12 +336,15 @@ mod tests {
     fn test_not_enforced_returns_error_in_strict_mode() {
         // SEC-11: When best_effort=false, NotEnforced must return Err, not Ok(false)
         let source = include_str!("landlock.rs");
-        let apply_fn = source.find("fn apply_container_policy_with_mode").unwrap();
-        let apply_body = &source[apply_fn..apply_fn + 1400];
-        // In the NotEnforced match arm, when not best_effort, should return Err
-        let not_enforced_start = apply_body.find("NotEnforced").unwrap();
-        let not_enforced_end = std::cmp::min(apply_body.len(), not_enforced_start + 500);
-        let not_enforced_block = &apply_body[not_enforced_start..not_enforced_end];
+        let fn_body = extract_fn_body(source, "fn apply_container_policy_with_mode");
+        // Find the NotEnforced match arm within the function body
+        let not_enforced_start = fn_body.find("NotEnforced")
+            .expect("function must handle NotEnforced status");
+        // Search from NotEnforced to the next match arm ('=>' after a '}')
+        let rest = &fn_body[not_enforced_start..];
+        let arm_end = rest.find("RestrictionStatus::")
+            .unwrap_or(rest.len().min(500));
+        let not_enforced_block = &rest[..arm_end];
         assert!(
             not_enforced_block.contains("best_effort") && not_enforced_block.contains("Err"),
             "NotEnforced must return Err when best_effort=false. Block: {}",

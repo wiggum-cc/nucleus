@@ -1,3 +1,5 @@
+use crate::error::StateTransition;
+
 /// Cgroup lifecycle state machine matching Nucleus_Resources_CgroupLifecycle.tla
 ///
 /// State transitions:
@@ -23,9 +25,8 @@ pub enum CgroupState {
     Removed,
 }
 
-impl CgroupState {
-    /// Check if transition is valid according to TLA+ spec
-    pub fn can_transition_to(&self, next: CgroupState) -> bool {
+impl StateTransition for CgroupState {
+    fn can_transition_to(&self, next: &CgroupState) -> bool {
         use CgroupState::*;
 
         matches!(
@@ -49,21 +50,8 @@ impl CgroupState {
         )
     }
 
-    /// Check if this is a terminal state
-    pub fn is_terminal(&self) -> bool {
+    fn is_terminal(&self) -> bool {
         matches!(self, CgroupState::Removed)
-    }
-
-    /// Transition to the next state, returning an error if the transition is invalid
-    pub fn transition(self, next: CgroupState) -> crate::error::Result<CgroupState> {
-        if self.can_transition_to(next) {
-            Ok(next)
-        } else {
-            Err(crate::error::NucleusError::InvalidStateTransition {
-                from: format!("{:?}", self),
-                to: format!("{:?}", next),
-            })
-        }
     }
 }
 
@@ -73,29 +61,29 @@ mod tests {
 
     #[test]
     fn test_valid_transitions() {
-        assert!(CgroupState::Nonexistent.can_transition_to(CgroupState::Created));
-        assert!(CgroupState::Created.can_transition_to(CgroupState::Configured));
-        assert!(CgroupState::Configured.can_transition_to(CgroupState::Attached));
-        assert!(CgroupState::Attached.can_transition_to(CgroupState::Monitoring));
-        assert!(CgroupState::Monitoring.can_transition_to(CgroupState::Removed));
+        assert!(CgroupState::Nonexistent.can_transition_to(&CgroupState::Created));
+        assert!(CgroupState::Created.can_transition_to(&CgroupState::Configured));
+        assert!(CgroupState::Configured.can_transition_to(&CgroupState::Attached));
+        assert!(CgroupState::Attached.can_transition_to(&CgroupState::Monitoring));
+        assert!(CgroupState::Monitoring.can_transition_to(&CgroupState::Removed));
     }
 
     #[test]
     fn test_error_paths() {
         // Can cleanup from Created or Configured on error
-        assert!(CgroupState::Created.can_transition_to(CgroupState::Removed));
-        assert!(CgroupState::Configured.can_transition_to(CgroupState::Removed));
+        assert!(CgroupState::Created.can_transition_to(&CgroupState::Removed));
+        assert!(CgroupState::Configured.can_transition_to(&CgroupState::Removed));
     }
 
     #[test]
     fn test_invalid_transitions() {
         // Cannot skip states
-        assert!(!CgroupState::Nonexistent.can_transition_to(CgroupState::Configured));
-        assert!(!CgroupState::Created.can_transition_to(CgroupState::Attached));
+        assert!(!CgroupState::Nonexistent.can_transition_to(&CgroupState::Configured));
+        assert!(!CgroupState::Created.can_transition_to(&CgroupState::Attached));
 
         // Cannot go backwards
-        assert!(!CgroupState::Configured.can_transition_to(CgroupState::Created));
-        assert!(!CgroupState::Removed.can_transition_to(CgroupState::Monitoring));
+        assert!(!CgroupState::Configured.can_transition_to(&CgroupState::Created));
+        assert!(!CgroupState::Removed.can_transition_to(&CgroupState::Monitoring));
     }
 
     #[test]

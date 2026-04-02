@@ -1,3 +1,5 @@
+use crate::error::StateTransition;
+
 /// Security state machine matching Nucleus_Security_SecurityEnforcement.tla
 ///
 /// State transitions:
@@ -21,9 +23,8 @@ pub enum SecurityState {
     Locked,
 }
 
-impl SecurityState {
-    /// Check if transition is valid according to TLA+ spec
-    pub fn can_transition_to(&self, next: SecurityState) -> bool {
+impl StateTransition for SecurityState {
+    fn can_transition_to(&self, next: &SecurityState) -> bool {
         use SecurityState::*;
 
         matches!(
@@ -40,21 +41,8 @@ impl SecurityState {
         )
     }
 
-    /// Check if this is a terminal state
-    pub fn is_terminal(&self) -> bool {
+    fn is_terminal(&self) -> bool {
         matches!(self, SecurityState::Locked)
-    }
-
-    /// Transition to the next state, returning an error if the transition is invalid
-    pub fn transition(self, next: SecurityState) -> crate::error::Result<SecurityState> {
-        if self.can_transition_to(next) {
-            Ok(next)
-        } else {
-            Err(crate::error::NucleusError::InvalidStateTransition {
-                from: format!("{:?}", self),
-                to: format!("{:?}", next),
-            })
-        }
     }
 }
 
@@ -64,47 +52,52 @@ mod tests {
 
     #[test]
     fn test_valid_transitions() {
-        assert!(SecurityState::Privileged.can_transition_to(SecurityState::CapabilitiesDropped));
-        assert!(SecurityState::CapabilitiesDropped.can_transition_to(SecurityState::SeccompApplied));
-        assert!(SecurityState::SeccompApplied.can_transition_to(SecurityState::LandlockApplied));
-        assert!(SecurityState::LandlockApplied.can_transition_to(SecurityState::Locked));
+        assert!(SecurityState::Privileged.can_transition_to(&SecurityState::CapabilitiesDropped));
+        assert!(
+            SecurityState::CapabilitiesDropped.can_transition_to(&SecurityState::SeccompApplied)
+        );
+        assert!(SecurityState::SeccompApplied.can_transition_to(&SecurityState::LandlockApplied));
+        assert!(SecurityState::LandlockApplied.can_transition_to(&SecurityState::Locked));
     }
 
     #[test]
     fn test_self_transitions() {
-        assert!(SecurityState::Privileged.can_transition_to(SecurityState::Privileged));
-        assert!(SecurityState::CapabilitiesDropped
-            .can_transition_to(SecurityState::CapabilitiesDropped));
-        assert!(SecurityState::SeccompApplied.can_transition_to(SecurityState::SeccompApplied));
-        assert!(SecurityState::LandlockApplied.can_transition_to(SecurityState::LandlockApplied));
-        assert!(SecurityState::Locked.can_transition_to(SecurityState::Locked));
+        assert!(SecurityState::Privileged.can_transition_to(&SecurityState::Privileged));
+        assert!(
+            SecurityState::CapabilitiesDropped
+                .can_transition_to(&SecurityState::CapabilitiesDropped)
+        );
+        assert!(SecurityState::SeccompApplied.can_transition_to(&SecurityState::SeccompApplied));
+        assert!(SecurityState::LandlockApplied.can_transition_to(&SecurityState::LandlockApplied));
+        assert!(SecurityState::Locked.can_transition_to(&SecurityState::Locked));
     }
 
     #[test]
     fn test_invalid_transitions() {
         // Cannot skip states
-        assert!(!SecurityState::Privileged.can_transition_to(SecurityState::SeccompApplied));
-        assert!(!SecurityState::Privileged.can_transition_to(SecurityState::LandlockApplied));
-        assert!(!SecurityState::Privileged.can_transition_to(SecurityState::Locked));
+        assert!(!SecurityState::Privileged.can_transition_to(&SecurityState::SeccompApplied));
+        assert!(!SecurityState::Privileged.can_transition_to(&SecurityState::LandlockApplied));
+        assert!(!SecurityState::Privileged.can_transition_to(&SecurityState::Locked));
         assert!(
-            !SecurityState::CapabilitiesDropped.can_transition_to(SecurityState::LandlockApplied)
+            !SecurityState::CapabilitiesDropped
+                .can_transition_to(&SecurityState::LandlockApplied)
         );
-        assert!(!SecurityState::CapabilitiesDropped.can_transition_to(SecurityState::Locked));
-        assert!(!SecurityState::SeccompApplied.can_transition_to(SecurityState::Locked));
+        assert!(!SecurityState::CapabilitiesDropped.can_transition_to(&SecurityState::Locked));
+        assert!(!SecurityState::SeccompApplied.can_transition_to(&SecurityState::Locked));
 
         // Cannot go backwards (no privilege escalation)
-        assert!(!SecurityState::CapabilitiesDropped.can_transition_to(SecurityState::Privileged));
-        assert!(!SecurityState::SeccompApplied.can_transition_to(SecurityState::Privileged));
+        assert!(!SecurityState::CapabilitiesDropped.can_transition_to(&SecurityState::Privileged));
+        assert!(!SecurityState::SeccompApplied.can_transition_to(&SecurityState::Privileged));
         assert!(
-            !SecurityState::SeccompApplied.can_transition_to(SecurityState::CapabilitiesDropped)
+            !SecurityState::SeccompApplied.can_transition_to(&SecurityState::CapabilitiesDropped)
         );
-        assert!(!SecurityState::LandlockApplied.can_transition_to(SecurityState::Privileged));
+        assert!(!SecurityState::LandlockApplied.can_transition_to(&SecurityState::Privileged));
         assert!(
-            !SecurityState::LandlockApplied.can_transition_to(SecurityState::CapabilitiesDropped)
+            !SecurityState::LandlockApplied.can_transition_to(&SecurityState::CapabilitiesDropped)
         );
-        assert!(!SecurityState::LandlockApplied.can_transition_to(SecurityState::SeccompApplied));
-        assert!(!SecurityState::Locked.can_transition_to(SecurityState::LandlockApplied));
-        assert!(!SecurityState::Locked.can_transition_to(SecurityState::SeccompApplied));
+        assert!(!SecurityState::LandlockApplied.can_transition_to(&SecurityState::SeccompApplied));
+        assert!(!SecurityState::Locked.can_transition_to(&SecurityState::LandlockApplied));
+        assert!(!SecurityState::Locked.can_transition_to(&SecurityState::SeccompApplied));
     }
 
     #[test]

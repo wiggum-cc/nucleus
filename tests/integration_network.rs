@@ -38,30 +38,38 @@ mod tests {
 
     #[test]
     fn test_bridge_config_empty_name_rejected() {
-        let mut config = BridgeConfig::default();
-        config.bridge_name = String::new();
+        let config = BridgeConfig {
+            bridge_name: String::new(),
+            ..BridgeConfig::default()
+        };
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_bridge_config_long_name_rejected() {
-        let mut config = BridgeConfig::default();
-        config.bridge_name = "a".repeat(16); // 16 chars, max is 15
+        let config = BridgeConfig {
+            bridge_name: "a".repeat(16), // 16 chars, max is 15
+            ..BridgeConfig::default()
+        };
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_bridge_config_name_at_limit() {
-        let mut config = BridgeConfig::default();
-        config.bridge_name = "a".repeat(15); // exactly 15 chars
+        let config = BridgeConfig {
+            bridge_name: "a".repeat(15), // exactly 15 chars
+            ..BridgeConfig::default()
+        };
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn test_bridge_config_special_chars_in_name_rejected() {
         for bad_name in &["my bridge", "br;rm", "br$(cmd)", "br/0", "br\nnet"] {
-            let mut config = BridgeConfig::default();
-            config.bridge_name = bad_name.to_string();
+            let config = BridgeConfig {
+                bridge_name: bad_name.to_string(),
+                ..BridgeConfig::default()
+            };
             assert!(
                 config.validate().is_err(),
                 "Bridge name '{}' should be rejected",
@@ -73,8 +81,10 @@ mod tests {
     #[test]
     fn test_bridge_config_valid_name_chars() {
         for good_name in &["br0", "my-bridge", "net_1", "ABC123"] {
-            let mut config = BridgeConfig::default();
-            config.bridge_name = good_name.to_string();
+            let config = BridgeConfig {
+                bridge_name: good_name.to_string(),
+                ..BridgeConfig::default()
+            };
             assert!(
                 config.validate().is_ok(),
                 "Bridge name '{}' should be valid",
@@ -95,8 +105,10 @@ mod tests {
             "10.0.0/24",    // only 3 octets
         ];
         for subnet in cases {
-            let mut config = BridgeConfig::default();
-            config.subnet = subnet.to_string();
+            let config = BridgeConfig {
+                subnet: subnet.to_string(),
+                ..BridgeConfig::default()
+            };
             assert!(
                 config.validate().is_err(),
                 "Subnet '{}' should be rejected",
@@ -108,8 +120,10 @@ mod tests {
     #[test]
     fn test_bridge_config_valid_subnets() {
         for subnet in &["10.0.0.0/8", "192.168.1.0/24", "172.16.0.0/12", "0.0.0.0/0"] {
-            let mut config = BridgeConfig::default();
-            config.subnet = subnet.to_string();
+            let config = BridgeConfig {
+                subnet: subnet.to_string(),
+                ..BridgeConfig::default()
+            };
             assert!(
                 config.validate().is_ok(),
                 "Subnet '{}' should be valid",
@@ -120,15 +134,19 @@ mod tests {
 
     #[test]
     fn test_bridge_config_invalid_container_ip() {
-        let mut config = BridgeConfig::default();
-        config.container_ip = Some("not-an-ip".to_string());
+        let config = BridgeConfig {
+            container_ip: Some("not-an-ip".to_string()),
+            ..BridgeConfig::default()
+        };
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_bridge_config_invalid_dns_rejected() {
-        let mut config = BridgeConfig::default();
-        config.dns = vec!["8.8.8.8".to_string(), "badip".to_string()];
+        let config = BridgeConfig {
+            dns: vec!["8.8.8.8".to_string(), "badip".to_string()],
+            ..BridgeConfig::default()
+        };
         assert!(config.validate().is_err());
     }
 

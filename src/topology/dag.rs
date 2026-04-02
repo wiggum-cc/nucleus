@@ -171,6 +171,7 @@ mod tests {
                     dns: vec![],
                     replicas: 1,
                     runtime: "native".to_string(),
+                    hooks: None,
                 },
             );
         }

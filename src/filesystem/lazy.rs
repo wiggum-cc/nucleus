@@ -123,11 +123,27 @@ mod tests {
 
     #[test]
     fn test_bind_mount_context_remount_adds_hardening_flags() {
+        // Verify bind_mount_context applies hardening mount flags.
+        // Uses brace-matched extraction instead of scanning to EOF (SEC-MED-03).
         let source = include_str!("lazy.rs");
         let fn_start = source.find("fn bind_mount_context").unwrap();
-        let fn_body = &source[fn_start..];
-        assert!(fn_body.contains("MS_NOSUID"));
-        assert!(fn_body.contains("MS_NODEV"));
-        assert!(fn_body.contains("MS_NOEXEC"));
+        let after = &source[fn_start..];
+        let open = after.find('{').unwrap();
+        let mut depth = 0u32;
+        let mut fn_end = open;
+        for (i, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 { fn_end = open + i + 1; break; }
+                }
+                _ => {}
+            }
+        }
+        let fn_body = &after[..fn_end];
+        assert!(fn_body.contains("MS_NOSUID"), "bind_mount_context must set MS_NOSUID");
+        assert!(fn_body.contains("MS_NODEV"), "bind_mount_context must set MS_NODEV");
+        assert!(fn_body.contains("MS_NOEXEC"), "bind_mount_context must set MS_NOEXEC");
     }
 }

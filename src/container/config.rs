@@ -247,6 +247,18 @@ pub struct ContainerConfig {
 
     /// Expected SHA-256 hash of the Landlock policy file.
     pub landlock_policy_sha256: Option<String>,
+
+    /// OCI lifecycle hooks to execute at various container lifecycle points.
+    pub hooks: Option<crate::security::OciHooks>,
+
+    /// Path to write the container PID (OCI --pid-file).
+    pub pid_file: Option<PathBuf>,
+
+    /// Path to AF_UNIX socket for console pseudo-terminal master (OCI --console-socket).
+    pub console_socket: Option<PathBuf>,
+
+    /// Override OCI bundle directory path (OCI --bundle).
+    pub bundle_dir: Option<PathBuf>,
 }
 
 /// Seccomp operating mode.
@@ -307,6 +319,10 @@ impl ContainerConfig {
             caps_policy_sha256: None,
             landlock_policy: None,
             landlock_policy_sha256: None,
+            hooks: None,
+            pid_file: None,
+            console_socket: None,
+            bundle_dir: None,
         })
     }
 
@@ -497,6 +513,21 @@ impl ContainerConfig {
 
     pub fn with_landlock_policy_sha256(mut self, hash: String) -> Self {
         self.landlock_policy_sha256 = Some(hash);
+        self
+    }
+
+    pub fn with_pid_file(mut self, path: PathBuf) -> Self {
+        self.pid_file = Some(path);
+        self
+    }
+
+    pub fn with_console_socket(mut self, path: PathBuf) -> Self {
+        self.console_socket = Some(path);
+        self
+    }
+
+    pub fn with_bundle_dir(mut self, path: PathBuf) -> Self {
+        self.bundle_dir = Some(path);
         self
     }
 
@@ -983,13 +1014,15 @@ mod tests {
 
     #[test]
     fn test_generate_container_id_returns_result() {
-        // BUG-07: generate_container_id must return Result, not panic
-        let source = include_str!("config.rs");
-        let fn_start = source.find("pub fn generate_container_id").unwrap();
-        let fn_sig = &source[fn_start..fn_start + 100];
+        // BUG-07: generate_container_id must return Result, not panic.
+        // Verify by calling it and checking the Ok value is valid hex.
+        let id: crate::error::Result<String> = generate_container_id();
+        let id = id.expect("generate_container_id must return Ok, not panic");
+        assert_eq!(id.len(), 32, "container ID must be 32 hex chars");
         assert!(
-            fn_sig.contains("Result"),
-            "generate_container_id must return Result<String>, not String (no panics in production)"
+            id.chars().all(|c| c.is_ascii_hexdigit()),
+            "container ID must be valid hex: {}",
+            id
         );
     }
 }

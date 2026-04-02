@@ -3,13 +3,13 @@ use crate::error::{NucleusError, Result};
 use crate::isolation::{IdMapping, NamespaceConfig, UserNamespaceConfig};
 use crate::resources::ResourceLimits;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// OCI Runtime Specification configuration
 ///
@@ -25,6 +25,10 @@ pub struct OciConfig {
     pub hostname: Option<String>,
     pub mounts: Vec<OciMount>,
     pub linux: Option<OciLinux>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<OciHooks>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub annotations: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +47,14 @@ pub struct OciProcess {
     #[serde(rename = "noNewPrivileges")]
     pub no_new_privileges: bool,
     pub capabilities: Option<OciCapabilities>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rlimits: Vec<OciRlimit>,
+    #[serde(rename = "consoleSize", default, skip_serializing_if = "Option::is_none")]
+    pub console_size: Option<OciConsoleSize>,
+    #[serde(rename = "apparmorProfile", default, skip_serializing_if = "Option::is_none")]
+    pub apparmor_profile: Option<String>,
+    #[serde(rename = "selinuxLabel", default, skip_serializing_if = "Option::is_none")]
+    pub selinux_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +101,22 @@ pub struct OciLinux {
         default
     )]
     pub readonly_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<OciDevice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seccomp: Option<OciSeccomp>,
+    #[serde(
+        rename = "rootfsPropagation",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rootfs_propagation: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub sysctl: HashMap<String, String>,
+    #[serde(rename = "cgroupsPath", default, skip_serializing_if = "Option::is_none")]
+    pub cgroups_path: Option<String>,
+    #[serde(rename = "intelRdt", default, skip_serializing_if = "Option::is_none")]
+    pub intel_rdt: Option<OciIntelRdt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +163,335 @@ pub struct OciPids {
     pub limit: i64,
 }
 
+/// OCI process resource limit.
+///
+/// Spec: https://github.com/opencontainers/runtime-spec/blob/main/config.md#posix-process
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OciRlimit {
+    /// Resource type (e.g. "RLIMIT_NOFILE", "RLIMIT_NPROC")
+    #[serde(rename = "type")]
+    pub limit_type: String,
+    /// Hard limit
+    pub hard: u64,
+    /// Soft limit
+    pub soft: u64,
+}
+
+/// OCI console size for terminal-attached processes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OciConsoleSize {
+    pub height: u32,
+    pub width: u32,
+}
+
+/// OCI linux device entry.
+///
+/// Spec: https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md#devices
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OciDevice {
+    /// Device type: "c" (char), "b" (block), "u" (unbuffered), "p" (FIFO)
+    #[serde(rename = "type")]
+    pub device_type: String,
+    /// Device path inside the container
+    pub path: String,
+    /// Major number
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub major: Option<i64>,
+    /// Minor number
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minor: Option<i64>,
+    /// File mode (permissions)
+    #[serde(rename = "fileMode", skip_serializing_if = "Option::is_none")]
+    pub file_mode: Option<u32>,
+    /// UID of the device owner
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    /// GID of the device owner
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gid: Option<u32>,
+}
+
+/// OCI seccomp configuration.
+///
+/// Spec: https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md#seccomp
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OciSeccomp {
+    /// Default action when no rule matches (e.g. "SCMP_ACT_ERRNO", "SCMP_ACT_ALLOW")
+    #[serde(rename = "defaultAction")]
+    pub default_action: String,
+    /// Target architectures
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub architectures: Vec<String>,
+    /// Syscall rules
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub syscalls: Vec<OciSeccompSyscall>,
+}
+
+/// A single seccomp syscall rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OciSeccompSyscall {
+    /// Syscall names this rule applies to
+    pub names: Vec<String>,
+    /// Action to take (e.g. "SCMP_ACT_ALLOW")
+    pub action: String,
+    /// Optional argument conditions
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<OciSeccompArg>,
+}
+
+/// Seccomp syscall argument filter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OciSeccompArg {
+    /// Argument index (0-based)
+    pub index: u32,
+    /// Value to compare against
+    pub value: u64,
+    /// Second value for masked operations
+    #[serde(rename = "valueTwo", default, skip_serializing_if = "is_zero")]
+    pub value_two: u64,
+    /// Comparison operator (e.g. "SCMP_CMP_EQ", "SCMP_CMP_MASKED_EQ")
+    pub op: String,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
+/// OCI Intel RDT (Resource Director Technology) configuration.
+///
+/// Spec: https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md#intel-rdt
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OciIntelRdt {
+    /// Unique identity for the container's cache and memory bandwidth allocation
+    #[serde(rename = "closID", default, skip_serializing_if = "Option::is_none")]
+    pub clos_id: Option<String>,
+    /// Schema for L3 cache allocation
+    #[serde(rename = "l3CacheSchema", default, skip_serializing_if = "Option::is_none")]
+    pub l3_cache_schema: Option<String>,
+    /// Schema for memory bandwidth allocation
+    #[serde(rename = "memBwSchema", default, skip_serializing_if = "Option::is_none")]
+    pub mem_bw_schema: Option<String>,
+}
+
+/// A single OCI lifecycle hook entry.
+///
+/// Spec: https://github.com/opencontainers/runtime-spec/blob/main/config.md#posix-platform-hooks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OciHook {
+    /// Absolute path to the hook binary.
+    pub path: String,
+    /// Arguments passed to the hook (argv[0] should be the binary name).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Environment variables for the hook process.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
+    /// Timeout in seconds. If the hook does not exit within this duration it is killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
+}
+
+/// OCI lifecycle hooks.
+///
+/// Spec: https://github.com/opencontainers/runtime-spec/blob/main/config.md#posix-platform-hooks
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OciHooks {
+    /// Called after the runtime environment has been created but before pivot_root.
+    #[serde(rename = "createRuntime", default, skip_serializing_if = "Vec::is_empty")]
+    pub create_runtime: Vec<OciHook>,
+    /// Called after pivot_root but before the start operation.
+    #[serde(rename = "createContainer", default, skip_serializing_if = "Vec::is_empty")]
+    pub create_container: Vec<OciHook>,
+    /// Called after the start operation but before the user process executes.
+    #[serde(rename = "startContainer", default, skip_serializing_if = "Vec::is_empty")]
+    pub start_container: Vec<OciHook>,
+    /// Called after the user-specified process has started.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub poststart: Vec<OciHook>,
+    /// Called after the container has been stopped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub poststop: Vec<OciHook>,
+}
+
+/// Container state JSON passed to OCI hooks on stdin.
+///
+/// Spec: https://github.com/opencontainers/runtime-spec/blob/main/runtime.md#state
+#[derive(Debug, Clone, Serialize)]
+pub struct OciContainerState {
+    #[serde(rename = "ociVersion")]
+    pub oci_version: String,
+    pub id: String,
+    pub status: String,
+    pub pid: u32,
+    pub bundle: String,
+}
+
+impl OciHooks {
+    /// Returns true if there are no hooks configured.
+    pub fn is_empty(&self) -> bool {
+        self.create_runtime.is_empty()
+            && self.create_container.is_empty()
+            && self.start_container.is_empty()
+            && self.poststart.is_empty()
+            && self.poststop.is_empty()
+    }
+
+    /// Execute a list of hooks in order, passing container state JSON on stdin.
+    ///
+    /// If any hook exits non-zero, an error is returned immediately (remaining hooks are skipped).
+    pub fn run_hooks(hooks: &[OciHook], state: &OciContainerState, phase: &str) -> Result<()> {
+        let state_json = serde_json::to_string(state).map_err(|e| {
+            NucleusError::HookError(format!("Failed to serialize container state for hook: {}", e))
+        })?;
+
+        for (i, hook) in hooks.iter().enumerate() {
+            info!(
+                "Running {} hook [{}/{}]: {}",
+                phase,
+                i + 1,
+                hooks.len(),
+                hook.path
+            );
+            Self::execute_hook(hook, &state_json, phase)?;
+        }
+
+        Ok(())
+    }
+
+    /// Execute a list of hooks best-effort (log errors but don't fail).
+    ///
+    /// Used for poststop hooks per the OCI spec: errors MUST be logged but MUST NOT
+    /// prevent cleanup.
+    pub fn run_hooks_best_effort(hooks: &[OciHook], state: &OciContainerState, phase: &str) {
+        let state_json = match serde_json::to_string(state) {
+            Ok(json) => json,
+            Err(e) => {
+                warn!(
+                    "Failed to serialize container state for {} hooks: {}",
+                    phase, e
+                );
+                return;
+            }
+        };
+
+        for (i, hook) in hooks.iter().enumerate() {
+            info!(
+                "Running {} hook [{}/{}]: {}",
+                phase,
+                i + 1,
+                hooks.len(),
+                hook.path
+            );
+            if let Err(e) = Self::execute_hook(hook, &state_json, phase) {
+                warn!("{} hook [{}] failed (continuing): {}", phase, i + 1, e);
+            }
+        }
+    }
+
+    fn execute_hook(hook: &OciHook, state_json: &str, phase: &str) -> Result<()> {
+        use std::process::{Command, Stdio};
+
+        let hook_path = Path::new(&hook.path);
+        if !hook_path.is_absolute() {
+            return Err(NucleusError::HookError(format!(
+                "{} hook path must be absolute: {}",
+                phase, hook.path
+            )));
+        }
+        if !hook_path.exists() {
+            return Err(NucleusError::HookError(format!(
+                "{} hook binary not found: {}",
+                phase, hook.path
+            )));
+        }
+
+        let mut cmd = Command::new(&hook.path);
+        if !hook.args.is_empty() {
+            // OCI spec: args[0] is the binary name (like execve argv); pass rest as arguments
+            cmd.args(&hook.args[1..]);
+        }
+
+        if !hook.env.is_empty() {
+            cmd.env_clear();
+            for entry in &hook.env {
+                if let Some((key, value)) = entry.split_once('=') {
+                    cmd.env(key, value);
+                }
+            }
+        }
+
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| {
+            NucleusError::HookError(format!(
+                "Failed to spawn {} hook {}: {}",
+                phase, hook.path, e
+            ))
+        })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write as IoWrite;
+            let _ = stdin.write_all(state_json.as_bytes());
+        }
+
+        let timeout_secs = hook.timeout.unwrap_or(30) as u64;
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if status.success() {
+                        debug!("{} hook {} completed successfully", phase, hook.path);
+                        return Ok(());
+                    } else {
+                        let stderr = child
+                            .stderr
+                            .take()
+                            .map(|mut e| {
+                                let mut buf = String::new();
+                                use std::io::Read;
+                                let _ = e.read_to_string(&mut buf);
+                                buf
+                            })
+                            .unwrap_or_default();
+                        return Err(NucleusError::HookError(format!(
+                            "{} hook {} exited with status: {}{}",
+                            phase,
+                            hook.path,
+                            status,
+                            if stderr.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" (stderr: {})", stderr.trim())
+                            }
+                        )));
+                    }
+                }
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(NucleusError::HookError(format!(
+                            "{} hook {} timed out after {}s",
+                            phase, hook.path, timeout_secs
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err(NucleusError::HookError(format!(
+                        "Failed to wait for {} hook {}: {}",
+                        phase, hook.path, e
+                    )));
+                }
+            }
+        }
+    }
+}
+
 impl OciConfig {
     /// Create a minimal OCI config for Nucleus containers
     pub fn new(command: Vec<String>, hostname: Option<String>) -> Self {
@@ -164,6 +521,10 @@ impl OciConfig {
                     permitted: vec![],
                     ambient: vec![],
                 }),
+                rlimits: vec![],
+                console_size: None,
+                apparmor_profile: None,
+                selinux_label: None,
             },
             hostname,
             mounts: vec![
@@ -213,6 +574,8 @@ impl OciConfig {
                     ],
                 },
             ],
+            hooks: None,
+            annotations: HashMap::new(),
             linux: Some(OciLinux {
                 namespaces: Some(vec![
                     OciNamespace {
@@ -253,6 +616,58 @@ impl OciConfig {
                     "/proc/sys".to_string(),
                     "/proc/sysrq-trigger".to_string(),
                 ],
+                devices: vec![
+                    OciDevice {
+                        device_type: "c".to_string(),
+                        path: "/dev/null".to_string(),
+                        major: Some(1),
+                        minor: Some(3),
+                        file_mode: Some(0o666),
+                        uid: Some(0),
+                        gid: Some(0),
+                    },
+                    OciDevice {
+                        device_type: "c".to_string(),
+                        path: "/dev/zero".to_string(),
+                        major: Some(1),
+                        minor: Some(5),
+                        file_mode: Some(0o666),
+                        uid: Some(0),
+                        gid: Some(0),
+                    },
+                    OciDevice {
+                        device_type: "c".to_string(),
+                        path: "/dev/full".to_string(),
+                        major: Some(1),
+                        minor: Some(7),
+                        file_mode: Some(0o666),
+                        uid: Some(0),
+                        gid: Some(0),
+                    },
+                    OciDevice {
+                        device_type: "c".to_string(),
+                        path: "/dev/random".to_string(),
+                        major: Some(1),
+                        minor: Some(8),
+                        file_mode: Some(0o666),
+                        uid: Some(0),
+                        gid: Some(0),
+                    },
+                    OciDevice {
+                        device_type: "c".to_string(),
+                        path: "/dev/urandom".to_string(),
+                        major: Some(1),
+                        minor: Some(9),
+                        file_mode: Some(0o666),
+                        uid: Some(0),
+                        gid: Some(0),
+                    },
+                ],
+                seccomp: None,
+                rootfs_propagation: Some("rprivate".to_string()),
+                sysctl: HashMap::new(),
+                cgroups_path: None,
+                intel_rdt: None,
             }),
         }
     }
@@ -541,6 +956,72 @@ impl OciConfig {
         }
         self
     }
+
+    /// Set OCI lifecycle hooks on the config.
+    pub fn with_hooks(mut self, hooks: OciHooks) -> Self {
+        if hooks.is_empty() {
+            self.hooks = None;
+        } else {
+            self.hooks = Some(hooks);
+        }
+        self
+    }
+
+    /// Set process rlimits from the hardcoded Nucleus defaults.
+    ///
+    /// Mirrors the RLIMIT backstops applied in-process for native containers
+    /// (runtime.rs), expressed as OCI config so gVisor can enforce them.
+    pub fn with_rlimits(mut self, pids_max: Option<u64>) -> Self {
+        let nproc_limit = pids_max.unwrap_or(512);
+        self.process.rlimits = vec![
+            OciRlimit {
+                limit_type: "RLIMIT_NPROC".to_string(),
+                hard: nproc_limit,
+                soft: nproc_limit,
+            },
+            OciRlimit {
+                limit_type: "RLIMIT_NOFILE".to_string(),
+                hard: 1024,
+                soft: 1024,
+            },
+            OciRlimit {
+                limit_type: "RLIMIT_MEMLOCK".to_string(),
+                hard: 64 * 1024,
+                soft: 64 * 1024,
+            },
+        ];
+        self
+    }
+
+    /// Set the linux.seccomp section from an OCI seccomp config.
+    pub fn with_seccomp(mut self, seccomp: OciSeccomp) -> Self {
+        if let Some(linux) = &mut self.linux {
+            linux.seccomp = Some(seccomp);
+        }
+        self
+    }
+
+    /// Set the linux.cgroupsPath field.
+    pub fn with_cgroups_path(mut self, path: String) -> Self {
+        if let Some(linux) = &mut self.linux {
+            linux.cgroups_path = Some(path);
+        }
+        self
+    }
+
+    /// Set sysctl key-value pairs on the linux config.
+    pub fn with_sysctl(mut self, sysctl: HashMap<String, String>) -> Self {
+        if let Some(linux) = &mut self.linux {
+            linux.sysctl = sysctl;
+        }
+        self
+    }
+
+    /// Set annotations on the OCI config.
+    pub fn with_annotations(mut self, annotations: HashMap<String, String>) -> Self {
+        self.annotations = annotations;
+        self
+    }
 }
 
 impl From<&IdMapping> for OciIdMapping {
@@ -717,16 +1198,37 @@ mod tests {
     fn test_host_runtime_binds_uses_fixed_paths_not_host_path() {
         // with_host_runtime_binds must NOT scan the host $PATH. Only standard
         // FHS paths should be bind-mounted to prevent leaking arbitrary host
-        // directories into the container.
-        let source = include_str!("oci.rs");
-        // Check that with_host_runtime_binds does not call env::var("PATH")
-        // We look for non-comment lines that reference env::var and PATH
-        let fn_start = source.find("fn with_host_runtime_binds").unwrap();
-        let fn_body = &source[fn_start..fn_start + 800];
-        assert!(
-            !fn_body.contains("env::var"),
-            "with_host_runtime_binds must not read host $PATH"
-        );
+        // directories into the container. Verify by setting a distinctive PATH
+        // and checking that none of its entries appear in the resulting mounts.
+        std::env::set_var("PATH", "/tmp/evil-inject-path/bin:/opt/attacker/sbin");
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None)
+            .with_host_runtime_binds();
+        let mount_dests: Vec<&str> = config.mounts.iter().map(|m| m.destination.as_str()).collect();
+        let mount_srcs: Vec<&str> = config.mounts.iter().map(|m| m.source.as_str()).collect();
+        // Verify no mount references the injected PATH entries
+        for path in &["/tmp/evil-inject-path", "/opt/attacker"] {
+            assert!(
+                !mount_dests.iter().any(|d| d.contains(path)),
+                "with_host_runtime_binds must not use host $PATH — found {:?} in mount destinations",
+                path
+            );
+            assert!(
+                !mount_srcs.iter().any(|s| s.contains(path)),
+                "with_host_runtime_binds must not use host $PATH — found {:?} in mount sources",
+                path
+            );
+        }
+        // Verify only standard FHS paths are mounted
+        let allowed_prefixes = ["/bin", "/sbin", "/usr", "/lib", "/lib64", "/nix/store"];
+        for mount in &config.mounts {
+            if mount.mount_type == "bind" {
+                assert!(
+                    allowed_prefixes.iter().any(|p| mount.destination.starts_with(p)),
+                    "unexpected bind mount destination: {} — only FHS paths allowed",
+                    mount.destination
+                );
+            }
+        }
     }
 
     #[test]
@@ -750,5 +1252,266 @@ mod tests {
             !path_env.contains("/nix/store/secret"),
             "Host PATH must not leak into container"
         );
+    }
+
+    #[test]
+    fn test_oci_hooks_serialization_roundtrip() {
+        let hooks = OciHooks {
+            create_runtime: vec![OciHook {
+                path: "/usr/bin/hook1".to_string(),
+                args: vec!["hook1".to_string(), "--arg1".to_string()],
+                env: vec!["FOO=bar".to_string()],
+                timeout: Some(10),
+            }],
+            create_container: vec![],
+            start_container: vec![],
+            poststart: vec![OciHook {
+                path: "/usr/bin/hook2".to_string(),
+                args: vec![],
+                env: vec![],
+                timeout: None,
+            }],
+            poststop: vec![],
+        };
+
+        let json = serde_json::to_string_pretty(&hooks).unwrap();
+        assert!(json.contains("createRuntime"));
+        assert!(json.contains("/usr/bin/hook1"));
+        assert!(!json.contains("createContainer")); // empty vecs are skipped
+
+        let deserialized: OciHooks = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.create_runtime.len(), 1);
+        assert_eq!(deserialized.create_runtime[0].path, "/usr/bin/hook1");
+        assert_eq!(deserialized.create_runtime[0].timeout, Some(10));
+        assert_eq!(deserialized.poststart.len(), 1);
+        assert!(deserialized.create_container.is_empty());
+    }
+
+    #[test]
+    fn test_oci_hooks_is_empty() {
+        let empty = OciHooks::default();
+        assert!(empty.is_empty());
+
+        let not_empty = OciHooks {
+            poststop: vec![OciHook {
+                path: "/bin/cleanup".to_string(),
+                args: vec![],
+                env: vec![],
+                timeout: None,
+            }],
+            ..Default::default()
+        };
+        assert!(!not_empty.is_empty());
+    }
+
+    #[test]
+    fn test_oci_config_with_hooks() {
+        let hooks = OciHooks {
+            create_runtime: vec![OciHook {
+                path: "/usr/bin/setup".to_string(),
+                args: vec![],
+                env: vec![],
+                timeout: None,
+            }],
+            ..Default::default()
+        };
+
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None).with_hooks(hooks);
+        assert!(config.hooks.is_some());
+
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        assert!(json.contains("hooks"));
+        assert!(json.contains("createRuntime"));
+
+        let deserialized: OciConfig = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.hooks.is_some());
+        assert_eq!(deserialized.hooks.unwrap().create_runtime.len(), 1);
+    }
+
+    #[test]
+    fn test_oci_config_with_empty_hooks_serializes_without_hooks() {
+        let config =
+            OciConfig::new(vec!["/bin/sh".to_string()], None).with_hooks(OciHooks::default());
+        assert!(config.hooks.is_none()); // empty hooks are set to None
+
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        assert!(!json.contains("hooks"));
+    }
+
+    #[test]
+    fn test_oci_hook_rejects_relative_path() {
+        let hook = OciHook {
+            path: "relative/path".to_string(),
+            args: vec![],
+            env: vec![],
+            timeout: None,
+        };
+        let state = OciContainerState {
+            oci_version: "1.0.2".to_string(),
+            id: "test".to_string(),
+            status: "creating".to_string(),
+            pid: 1234,
+            bundle: "/tmp/bundle".to_string(),
+        };
+        let result = OciHooks::run_hooks(&[hook], &state, "test");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("absolute"), "error: {}", err_msg);
+    }
+
+    /// Read the original PATH from /proc/self/environ.
+    ///
+    /// Other tests in this module call `std::env::set_var("PATH", ...)` which
+    /// corrupts the process environment. /proc/self/environ is frozen at
+    /// process startup so it always reflects the real PATH.
+    fn original_path() -> String {
+        if let Ok(environ) = std::fs::read("/proc/self/environ") {
+            for entry in environ.split(|&b| b == 0) {
+                if let Ok(s) = std::str::from_utf8(entry) {
+                    if let Some(val) = s.strip_prefix("PATH=") {
+                        return val.to_string();
+                    }
+                }
+            }
+        }
+        String::new()
+    }
+
+    /// Resolve the absolute path to bash for test scripts.
+    fn find_bash() -> String {
+        let candidates = ["/bin/bash", "/usr/bin/bash"];
+        for c in &candidates {
+            if std::path::Path::new(c).exists() {
+                return c.to_string();
+            }
+        }
+        for dir in original_path().split(':') {
+            let candidate = std::path::PathBuf::from(dir).join("bash");
+            if candidate.exists() {
+                return candidate.to_string_lossy().to_string();
+            }
+        }
+        panic!("Cannot find bash binary for test");
+    }
+
+    /// Write a script file with proper shebang and ensure it's fully flushed before execution.
+    /// Embeds the original PATH so scripts can find utilities like `cat`/`touch`
+    /// even when other tests have corrupted the process PATH.
+    fn write_script(path: &std::path::Path, body: &str) {
+        use std::io::Write as IoWrite;
+        let bash = find_bash();
+        let orig_path = original_path();
+        let content = format!("#!{}\nexport PATH='{}'\n{}", bash, orig_path, body);
+        let mut f = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o755)
+            .open(path)
+            .unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+    }
+
+    #[test]
+    fn test_oci_hook_executes_successfully() {
+        let temp_dir = TempDir::new().unwrap();
+        let hook_script = temp_dir.path().join("hook.sh");
+        let output_file = temp_dir.path().join("output.json");
+
+        write_script(
+            &hook_script,
+            &format!("cat > {}\n", output_file.to_string_lossy()),
+        );
+
+        let hook = OciHook {
+            path: hook_script.to_string_lossy().to_string(),
+            args: vec![],
+            env: vec![],
+            timeout: Some(5),
+        };
+        let state = OciContainerState {
+            oci_version: "1.0.2".to_string(),
+            id: "test-container".to_string(),
+            status: "creating".to_string(),
+            pid: 12345,
+            bundle: "/tmp/test-bundle".to_string(),
+        };
+
+        OciHooks::run_hooks(&[hook], &state, "createRuntime").unwrap();
+
+        // Verify the hook received the container state JSON on stdin
+        let written = std::fs::read_to_string(&output_file).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(parsed["id"], "test-container");
+        assert_eq!(parsed["pid"], 12345);
+        assert_eq!(parsed["status"], "creating");
+    }
+
+    #[test]
+    fn test_oci_hook_nonzero_exit_is_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let hook_script = temp_dir.path().join("fail.sh");
+        write_script(&hook_script, "exit 1\n");
+
+        let hook = OciHook {
+            path: hook_script.to_string_lossy().to_string(),
+            args: vec![],
+            env: vec![],
+            timeout: Some(5),
+        };
+        let state = OciContainerState {
+            oci_version: "1.0.2".to_string(),
+            id: "test".to_string(),
+            status: "creating".to_string(),
+            pid: 1,
+            bundle: "".to_string(),
+        };
+
+        let result = OciHooks::run_hooks(&[hook], &state, "test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exited with status"));
+    }
+
+    #[test]
+    fn test_oci_hooks_best_effort_continues_on_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        let fail_script = temp_dir.path().join("fail.sh");
+        write_script(&fail_script, "exit 1\n");
+
+        let marker = temp_dir.path().join("ran");
+        let ok_script = temp_dir.path().join("ok.sh");
+        write_script(
+            &ok_script,
+            &format!("touch {}\n", marker.to_string_lossy()),
+        );
+
+        let hooks = vec![
+            OciHook {
+                path: fail_script.to_string_lossy().to_string(),
+                args: vec![],
+                env: vec![],
+                timeout: Some(5),
+            },
+            OciHook {
+                path: ok_script.to_string_lossy().to_string(),
+                args: vec![],
+                env: vec![],
+                timeout: Some(5),
+            },
+        ];
+        let state = OciContainerState {
+            oci_version: "1.0.2".to_string(),
+            id: "test".to_string(),
+            status: "stopped".to_string(),
+            pid: 0,
+            bundle: "".to_string(),
+        };
+
+        // best_effort should not panic or return error
+        OciHooks::run_hooks_best_effort(&hooks, &state, "poststop");
+        // Second hook should have run despite first failing
+        assert!(marker.exists(), "second hook should run after first fails");
     }
 }

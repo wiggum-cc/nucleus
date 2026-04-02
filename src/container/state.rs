@@ -1,5 +1,6 @@
 use crate::error::{NucleusError, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -7,6 +8,31 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
+
+/// OCI-compliant container status
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OciStatus {
+    /// Container is being created
+    Creating,
+    /// Container has been created but not started
+    Created,
+    /// Container process is running
+    Running,
+    /// Container process has stopped
+    Stopped,
+}
+
+impl std::fmt::Display for OciStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OciStatus::Creating => write!(f, "creating"),
+            OciStatus::Created => write!(f, "created"),
+            OciStatus::Running => write!(f, "running"),
+            OciStatus::Stopped => write!(f, "stopped"),
+        }
+    }
+}
 
 /// Container state tracking information
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +79,22 @@ pub struct ContainerState {
     /// Used to detect PID reuse in is_running()
     #[serde(default)]
     pub start_ticks: u64,
+
+    /// OCI container status
+    #[serde(default = "default_oci_status")]
+    pub status: OciStatus,
+
+    /// OCI bundle path
+    #[serde(default)]
+    pub bundle_path: Option<String>,
+
+    /// OCI annotations
+    #[serde(default)]
+    pub annotations: HashMap<String, String>,
+}
+
+fn default_oci_status() -> OciStatus {
+    OciStatus::Stopped
 }
 
 impl ContainerState {
@@ -90,6 +132,9 @@ impl ContainerState {
             config_hash: None,
             creator_uid: nix::unistd::Uid::effective().as_raw(),
             start_ticks,
+            status: OciStatus::Creating,
+            bundle_path: None,
+            annotations: HashMap::new(),
         }
     }
 
@@ -101,13 +146,10 @@ impl ContainerState {
     fn read_start_ticks(pid: u32) -> u64 {
         let stat_path = format!("/proc/{}/stat", pid);
         for attempt in 0..5 {
-            match std::fs::read_to_string(&stat_path) {
-                Ok(content) => {
-                    if let Some(ticks) = Self::parse_start_ticks(&content) {
-                        return ticks;
-                    }
+            if let Ok(content) = std::fs::read_to_string(&stat_path) {
+                if let Some(ticks) = Self::parse_start_ticks(&content) {
+                    return ticks;
                 }
-                Err(_) => {}
             }
             if attempt < 4 {
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -133,7 +175,11 @@ impl ContainerState {
     /// Check if the container process is still running
     ///
     /// Cross-checks PID start time to detect PID reuse after process exit.
+    /// Also returns false if the OCI status is `Stopped`.
     pub fn is_running(&self) -> bool {
+        if self.status == OciStatus::Stopped {
+            return false;
+        }
         let stat_path = format!("/proc/{}/stat", self.pid);
         match std::fs::read_to_string(&stat_path) {
             Ok(content) => {
@@ -148,6 +194,25 @@ impl ContainerState {
             }
             Err(_) => false,
         }
+    }
+
+    /// Return OCI runtime state as a JSON value
+    pub fn oci_state(&self) -> serde_json::Value {
+        let live_status = match self.status {
+            OciStatus::Running if !self.is_running() => "stopped",
+            OciStatus::Creating => "creating",
+            OciStatus::Created => "created",
+            OciStatus::Running => "running",
+            OciStatus::Stopped => "stopped",
+        };
+        serde_json::json!({
+            "ociVersion": "1.0.2",
+            "id": self.id,
+            "status": live_status,
+            "pid": if live_status == "stopped" { 0 } else { self.pid },
+            "bundle": self.bundle_path.as_deref().unwrap_or(""),
+            "annotations": self.annotations,
+        })
     }
 
     /// Get uptime in seconds
@@ -362,6 +427,12 @@ impl ContainerStateManager {
         Ok(self.state_dir.join(format!("{}.json", container_id)))
     }
 
+    /// Return the path to the exec FIFO used for two-phase create/start.
+    pub fn exec_fifo_path(&self, container_id: &str) -> Result<PathBuf> {
+        Self::validate_container_id(container_id)?;
+        Ok(self.state_dir.join(format!("{}.exec", container_id)))
+    }
+
     /// Resolve a container reference by exact ID, name, or ID prefix
     pub fn resolve_container(&self, reference: &str) -> Result<ContainerState> {
         let states = self.list_states()?;
@@ -446,7 +517,7 @@ impl ContainerStateManager {
     }
 
     /// Read a file with O_NOFOLLOW to prevent symlink attacks.
-    fn read_file_nofollow(path: &std::path::Path) -> std::result::Result<String, std::io::Error> {
+    pub fn read_file_nofollow(path: &std::path::Path) -> std::result::Result<String, std::io::Error> {
         use std::io::Read;
         let file = OpenOptions::new()
             .read(true)
@@ -463,28 +534,9 @@ impl ContainerStateManager {
     pub fn load_state(&self, container_id: &str) -> Result<ContainerState> {
         let path = self.state_file_path(container_id)?;
 
-        // Use O_NOFOLLOW to atomically reject symlinks at open time
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|e| {
-                NucleusError::ConfigError(format!("Failed to read state file {:?}: {}", path, e))
-            })?;
-
-        let json: String = {
-            use std::io::Read;
-            let mut buf = String::new();
-            std::io::BufReader::new(file)
-                .read_to_string(&mut buf)
-                .map_err(|e| {
-                    NucleusError::ConfigError(format!(
-                        "Failed to read state file {:?}: {}",
-                        path, e
-                    ))
-                })?;
-            buf
-        };
+        let json = Self::read_file_nofollow(&path).map_err(|e| {
+            NucleusError::ConfigError(format!("Failed to read state file {:?}: {}", path, e))
+        })?;
 
         let state = serde_json::from_str(&json).map_err(|e| {
             NucleusError::ConfigError(format!("Failed to parse container state: {}", e))
@@ -835,13 +887,16 @@ mod tests {
     fn test_read_start_ticks_retries_on_failure() {
         // BUG-09: read_start_ticks must retry when /proc/<pid>/stat is temporarily
         // unavailable after fork, instead of immediately returning 0.
-        let source = include_str!("state.rs");
-        let fn_start = source.find("fn read_start_ticks").unwrap();
-        let fn_body = &source[fn_start..fn_start + 500];
+        // Verify by calling with our own PID (should succeed) and a non-existent
+        // PID (should return 0 after retries, not panic).
+        let own_ticks = ContainerState::read_start_ticks(std::process::id());
         assert!(
-            fn_body.contains("attempt") || fn_body.contains("retry") || fn_body.contains("for"),
-            "read_start_ticks must retry on failure to avoid returning 0 after fork"
+            own_ticks > 0,
+            "read_start_ticks must return non-zero for a live process"
         );
+        // Non-existent PID should gracefully return 0 (after retries)
+        let bogus_ticks = ContainerState::read_start_ticks(u32::MAX);
+        assert_eq!(bogus_ticks, 0, "read_start_ticks must return 0 for non-existent PID");
     }
 
     #[test]

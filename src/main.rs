@@ -3,7 +3,7 @@ use clap::Parser;
 use nucleus::checkpoint::CriuRuntime;
 use nucleus::container::{
     parse_signal, Container, ContainerConfig, ContainerLifecycle, ContainerState,
-    ContainerStateManager, HealthCheck, KernelLockdownMode, ReadinessProbe, SecretMount,
+    ContainerStateManager, HealthCheck, KernelLockdownMode, OciStatus, ReadinessProbe, SecretMount,
     ServiceMode, TrustLevel,
 };
 use nucleus::filesystem::ContextMode;
@@ -26,6 +26,18 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[command(name = "nucleus")]
 #[command(about = "Extremely lightweight Docker alternative for agents", long_about = None)]
 struct Cli {
+    /// Root directory for state storage (overrides default)
+    #[arg(long, global = true)]
+    root: Option<PathBuf>,
+
+    /// Log file path (OCI runtime interface)
+    #[arg(long, global = true)]
+    log: Option<PathBuf>,
+
+    /// Log format: text (default) or json (OCI runtime interface)
+    #[arg(long, global = true, default_value = "text")]
+    log_format: String,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -33,8 +45,8 @@ struct Cli {
 #[derive(Parser, Debug)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
-    /// Run a command in an isolated container
-    Run {
+    /// Create and run a container
+    Create {
         /// Container name (optional, auto-generated if not specified)
         #[arg(long)]
         name: Option<String>,
@@ -83,9 +95,17 @@ enum Commands {
         #[arg(long)]
         rootless: bool,
 
-        /// Use OCI bundle format (requires gVisor)
+        /// Path to OCI bundle directory (requires gVisor). Replaces --oci flag.
         #[arg(long)]
-        oci: bool,
+        bundle: Option<PathBuf>,
+
+        /// Write container PID to this file after creation
+        #[arg(long)]
+        pid_file: Option<PathBuf>,
+
+        /// Path to AF_UNIX socket for console pseudo-terminal master
+        #[arg(long)]
+        console_socket: Option<PathBuf>,
 
         /// Network mode: none, host, or bridge (default: none)
         #[arg(long, default_value = "none")]
@@ -243,6 +263,10 @@ enum Commands {
         #[arg(long = "disable-cgroup-namespace")]
         disable_cgroup_namespace: bool,
 
+        /// Path to OCI hooks JSON file (defines lifecycle hooks)
+        #[arg(long = "hooks")]
+        hooks: Option<String>,
+
         /// Internal: topology config hash for reconciliation diffing
         #[arg(long = "topology-config-hash", hide = true)]
         topology_config_hash: Option<u64>,
@@ -252,8 +276,11 @@ enum Commands {
         command: Vec<String>,
     },
 
-    /// List running containers
-    Ps {
+    /// Query container state
+    State {
+        /// Container ID, name, or ID prefix (outputs OCI state JSON)
+        container: Option<String>,
+
         /// Show all containers (including stopped)
         #[arg(short, long)]
         all: bool,
@@ -275,12 +302,18 @@ enum Commands {
         timeout: u64,
     },
 
-    /// Remove a stopped container
-    Rm {
+    /// Start (resume) a stopped container
+    Start {
+        /// Container ID, name, or ID prefix
+        container: String,
+    },
+
+    /// Delete a container
+    Delete {
         /// Container ID, name, or ID prefix
         container: String,
 
-        /// Force remove (stop if running)
+        /// Force delete (stop if running)
         #[arg(short, long)]
         force: bool,
     },
@@ -291,7 +324,7 @@ enum Commands {
         container: String,
 
         /// Signal to send (default: SIGKILL)
-        #[arg(short, long, default_value = "KILL")]
+        #[arg(default_value = "KILL")]
         signal: String,
     },
 
@@ -372,8 +405,8 @@ enum ComposeCommands {
         timeout: u64,
     },
 
-    /// Show topology status
-    Ps {
+    /// Show topology state
+    State {
         /// Path to topology TOML file
         #[arg(short, long)]
         file: String,
@@ -394,14 +427,31 @@ enum ComposeCommands {
     },
 }
 
-fn main() -> Result<()> {
-    init_tracing()?;
+/// Truncate a container ID to 12 chars for display.
+fn truncate_id(id: &str) -> &str {
+    if id.len() > 12 { &id[..12] } else { id }
+}
 
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Apply --root before any ContainerStateManager is created
+    if let Some(ref root) = cli.root {
+        std::env::set_var("NUCLEUS_STATE_DIR", root);
+    }
+
+    init_tracing()?;
+
     match cli.command {
-        Commands::Ps { all } => {
+        Commands::State { container, all } => {
             let state_mgr = ContainerStateManager::new()?;
+
+            // If a specific container is given, output OCI state JSON
+            if let Some(ref id) = container {
+                let state = state_mgr.resolve_container(id)?;
+                println!("{}", serde_json::to_string_pretty(&state.oci_state())?);
+                return Ok(());
+            }
 
             let states = if all {
                 state_mgr.list_states()?
@@ -421,9 +471,9 @@ fn main() -> Result<()> {
 
             for state in states {
                 let status = if state.is_running() {
-                    "Running"
+                    state.status.to_string()
                 } else {
-                    "Stopped"
+                    OciStatus::Stopped.to_string()
                 };
                 let runtime = if state.using_gvisor {
                     "gvisor"
@@ -438,11 +488,7 @@ fn main() -> Result<()> {
                     command
                 };
 
-                let id_display = if state.id.len() > 12 {
-                    &state.id[..12]
-                } else {
-                    &state.id
-                };
+                let id_display = truncate_id(&state.id);
 
                 let name_display = if state.name.len() > 18 {
                     format!("{}...", &state.name[..15])
@@ -532,7 +578,22 @@ fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::Rm { container, force } => {
+        Commands::Start { container } => {
+            let state_mgr = ContainerStateManager::new()?;
+            let state = state_mgr.resolve_container(&container)?;
+            if state.status != OciStatus::Created {
+                anyhow::bail!(
+                    "Container {} is in '{}' state, not 'created'",
+                    state.id,
+                    state.status
+                );
+            }
+            Container::trigger_start(&state.id)?;
+            println!("{}", state.id);
+            Ok(())
+        }
+
+        Commands::Delete { container, force } => {
             let state_mgr = ContainerStateManager::new()?;
             let state = state_mgr.resolve_container(&container)?;
             ContainerLifecycle::remove(&state_mgr, &state, force)?;
@@ -588,7 +649,7 @@ fn main() -> Result<()> {
             let input_path = PathBuf::from(&input);
             let pid = criu.restore(&input_path)?;
 
-            // Register restored container in state manager so ps/stop/kill/attach work.
+            // Register restored container in state manager so state/stop/kill/attach work.
             // Generate a NEW container ID to avoid overwriting the original state file
             // (the original container may still be running with --leave-running).
             let metadata = nucleus::checkpoint::CheckpointMetadata::load(&input_path)?;
@@ -616,7 +677,7 @@ fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::Run {
+        Commands::Create {
             name,
             context,
             memory,
@@ -629,7 +690,9 @@ fn main() -> Result<()> {
             runtime,
             quiet_id,
             rootless,
-            oci,
+            bundle,
+            pid_file,
+            console_socket,
             network,
             allow_host_network,
             allow_degraded_security,
@@ -669,6 +732,7 @@ fn main() -> Result<()> {
             gvisor_platform,
             time_namespace,
             disable_cgroup_namespace,
+            hooks,
             topology_config_hash,
             command,
         } => {
@@ -854,7 +918,17 @@ fn main() -> Result<()> {
                 config = config.with_hostname(Some(host));
             }
 
-            config = apply_runtime_selection(config, &runtime, oci)?;
+            config = apply_runtime_selection(config, &runtime, bundle.is_some())?;
+
+            // OCI bundle directory override
+            if let Some(ref bundle_dir) = bundle {
+                config = config.with_bundle_dir(bundle_dir.clone());
+            }
+
+            // Console socket
+            if let Some(ref socket_path) = console_socket {
+                config = config.with_console_socket(socket_path.clone());
+            }
 
             if rootless {
                 info!("Enabling rootless mode");
@@ -981,6 +1055,23 @@ fn main() -> Result<()> {
                 }
             }
 
+            // OCI lifecycle hooks
+            if let Some(hooks_path) = hooks {
+                let hooks_json = std::fs::read_to_string(&hooks_path).map_err(|e| {
+                    anyhow::anyhow!("Failed to read hooks file '{}': {}", hooks_path, e)
+                })?;
+                let oci_hooks: nucleus::security::OciHooks =
+                    serde_json::from_str(&hooks_json).map_err(|e| {
+                        anyhow::anyhow!("Failed to parse hooks file '{}': {}", hooks_path, e)
+                    })?;
+                config.hooks = Some(oci_hooks);
+            }
+
+            // PID file path (OCI runtime interface)
+            if let Some(ref pid_path) = pid_file {
+                config = config.with_pid_file(pid_path.clone());
+            }
+
             if !quiet_id {
                 println!("{}", config.id);
             }
@@ -1062,7 +1153,7 @@ fn main() -> Result<()> {
                 Ok(())
             }
 
-            ComposeCommands::Ps { file } => {
+            ComposeCommands::State { file } => {
                 let config = TopologyConfig::from_file(&PathBuf::from(&file))?;
                 let state_mgr = ContainerStateManager::new()?;
 
@@ -1076,9 +1167,9 @@ fn main() -> Result<()> {
                     match state_mgr.resolve_container(&container_name) {
                         Ok(state) => {
                             let status = if state.is_running() {
-                                "Running"
+                                state.status.to_string()
                             } else {
-                                "Stopped"
+                                OciStatus::Stopped.to_string()
                             };
                             let cmd = state.command.join(" ");
                             let cmd_display = if cmd.len() > 28 {
@@ -1127,17 +1218,14 @@ fn main() -> Result<()> {
     }
 }
 
-fn init_tracing() -> Result<()> {
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let fmt_layer = tracing_subscriber::fmt::layer();
-
-    let otlp_endpoint = std::env::var("NUCLEUS_OTLP_ENDPOINT")
+/// Build an OTLP tracer if endpoint env vars are set.
+fn build_otlp_tracer() -> Result<Option<opentelemetry_sdk::trace::SdkTracer>> {
+    let endpoint = std::env::var("NUCLEUS_OTLP_ENDPOINT")
         .ok()
         .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())
         .filter(|value| !value.trim().is_empty());
 
-    if let Some(endpoint) = otlp_endpoint {
+    if let Some(endpoint) = endpoint {
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
             .with_protocol(Protocol::HttpBinary)
@@ -1155,19 +1243,40 @@ fn init_tracing() -> Result<()> {
             )
             .with_simple_exporter(exporter)
             .build();
-        let tracer = provider.tracer("nucleus");
-
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer)
-            .with(tracing_opentelemetry::layer().with_tracer(tracer))
-            .init();
+        Ok(Some(provider.tracer("nucleus")))
     } else {
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer)
-            .init();
+        Ok(None)
     }
+}
+
+/// Initialize tracing with optional --log file and --log-format (text/json).
+///
+/// Uses a macro internally because tracing-subscriber layer types are not
+/// object-safe and each combination produces a distinct concrete type.
+macro_rules! init_subscriber {
+    ($env_filter:expr, $fmt_layer:expr, $tracer:expr) => {
+        if let Some(tracer) = $tracer {
+            tracing_subscriber::registry()
+                .with($env_filter)
+                .with($fmt_layer)
+                .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                .init();
+        } else {
+            tracing_subscriber::registry()
+                .with($env_filter)
+                .with($fmt_layer)
+                .init();
+        }
+    };
+}
+
+fn init_tracing() -> Result<()> {
+    let tracer = build_otlp_tracer()?;
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let fmt_layer = tracing_subscriber::fmt::layer();
+    init_subscriber!(env_filter, fmt_layer, tracer);
 
     Ok(())
 }
@@ -1176,7 +1285,7 @@ fn apply_runtime_selection(mut config: ContainerConfig, runtime: &str, oci: bool
     match runtime {
         "native" => {
             if oci {
-                anyhow::bail!("--oci requires gVisor runtime; use --runtime gvisor");
+                anyhow::bail!("--bundle requires gVisor runtime; use --runtime gvisor");
             }
             config = config.with_gvisor(false).with_trust_level(TrustLevel::Trusted);
         }
@@ -1257,12 +1366,12 @@ mod tests {
     }
 
     #[test]
-    fn test_native_runtime_rejects_oci_flag() {
+    fn test_native_runtime_rejects_bundle_flag() {
         let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
         let err = apply_runtime_selection(config, "native", true).unwrap_err();
         assert!(
             err.to_string().contains("requires gVisor"),
-            "native runtime with --oci must be rejected explicitly"
+            "native runtime with --bundle must be rejected explicitly"
         );
     }
 }

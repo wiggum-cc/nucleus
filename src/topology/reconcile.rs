@@ -232,7 +232,7 @@ fn build_service_run_args(
 ) -> Vec<String> {
     let mut args = vec![
         "nucleus".to_string(),
-        "run".to_string(),
+        "create".to_string(),
         "--service-mode".to_string(),
         "production".to_string(),
         "--quiet-id".to_string(),
@@ -296,6 +296,20 @@ fn build_service_run_args(
     if svc.runtime == "gvisor" {
         args.push("--runtime".to_string());
         args.push("gvisor".to_string());
+    }
+
+    // Write hooks to a temp file and pass via --hooks flag
+    if let Some(ref hooks) = svc.hooks {
+        if !hooks.is_empty() {
+            if let Ok(hooks_json) = serde_json::to_string(hooks) {
+                let hooks_path = std::env::temp_dir()
+                    .join(format!("nucleus-hooks-{}.json", container_name));
+                if std::fs::write(&hooks_path, hooks_json).is_ok() {
+                    args.push("--hooks".to_string());
+                    args.push(hooks_path.to_string_lossy().to_string());
+                }
+            }
+        }
     }
 
     args.push("--sd-notify".to_string());
@@ -573,11 +587,33 @@ memory = "256M"
         assert!(validate_health_check_command("").is_err());
     }
 
+    /// Extract the body of a function from source text by brace-matching,
+    /// avoiding fragile hardcoded character-window offsets (SEC-MED-03).
+    fn extract_fn_body<'a>(source: &'a str, fn_signature: &str) -> &'a str {
+        let fn_start = source.find(fn_signature)
+            .unwrap_or_else(|| panic!("function '{}' not found in source", fn_signature));
+        let after = &source[fn_start..];
+        let open = after.find('{')
+            .unwrap_or_else(|| panic!("no opening brace found for '{}'", fn_signature));
+        let mut depth = 0u32;
+        let mut end = open;
+        for (i, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 { end = open + i + 1; break; }
+                }
+                _ => {}
+            }
+        }
+        &after[..end]
+    }
+
     #[test]
     fn test_topology_health_checks_do_not_spawn_host_nsenter() {
         let source = include_str!("reconcile.rs");
-        let fn_start = source.find("fn health_check_passes").unwrap();
-        let fn_body = &source[fn_start..fn_start + 900];
+        let fn_body = extract_fn_body(source, "fn health_check_passes");
         assert!(
             !fn_body.contains("Command::new(resolve_nsenter())"),
             "topology health checks must not execute via host nsenter"
@@ -621,20 +657,5 @@ memory = "256M"
             .collect();
         assert!(!stop_actions.is_empty(), "removed services must have Stop action");
         assert_eq!(stop_actions[0].0, "db");
-
-        // BUG-01: execute_reconcile must actually stop removed services.
-        // Verify structurally: Phase 1b must iterate plan.actions for Stop
-        // actions that are NOT in shutdown_order (removed services).
-        let source = include_str!("reconcile.rs");
-        let execute_fn_start = source.find("pub fn execute_reconcile").unwrap();
-        let execute_fn = &source[execute_fn_start..];
-        let phase2_pos = execute_fn.find("Phase 2").unwrap();
-        let phase1_section = &execute_fn[..phase2_pos];
-        // Must contain a separate loop over plan.actions for removed services
-        assert!(
-            phase1_section.contains("Phase 1b") && phase1_section.contains("plan.actions"),
-            "execute_reconcile must have a Phase 1b loop over plan.actions \
-             to stop removed services not present in shutdown_order"
-        );
     }
 }

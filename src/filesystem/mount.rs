@@ -526,7 +526,7 @@ pub fn mask_proc_paths(proc_path: &Path, production: bool) -> Result<()> {
         ) {
             Ok(_) => debug!("Masked /proc/{}", name),
             Err(e) => {
-                if production && CRITICAL_PROC_PATHS.contains(&name) {
+                if production && CRITICAL_PROC_PATHS.contains(name) {
                     return Err(NucleusError::FilesystemError(format!(
                         "Failed to mask critical /proc/{} in production mode: {}",
                         name, e

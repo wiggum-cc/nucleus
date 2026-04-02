@@ -37,12 +37,12 @@ fn test_namespace_property_isolation_integrity() {
     let state = NamespaceState::Entered;
 
     // Valid transitions
-    assert!(state.can_transition_to(NamespaceState::Entered));
-    assert!(state.can_transition_to(NamespaceState::Cleaned));
+    assert!(state.can_transition_to(&NamespaceState::Entered));
+    assert!(state.can_transition_to(&NamespaceState::Cleaned));
 
     // Invalid transitions
-    assert!(!state.can_transition_to(NamespaceState::Uninitialized));
-    assert!(!state.can_transition_to(NamespaceState::Unshared));
+    assert!(!state.can_transition_to(&NamespaceState::Uninitialized));
+    assert!(!state.can_transition_to(&NamespaceState::Unshared));
 }
 
 #[test]
@@ -54,12 +54,12 @@ fn test_namespace_property_terminal_stable() {
     assert!(state.is_terminal());
 
     // Cannot transition to any other state
-    assert!(!state.can_transition_to(NamespaceState::Uninitialized));
-    assert!(!state.can_transition_to(NamespaceState::Unshared));
-    assert!(!state.can_transition_to(NamespaceState::Entered));
+    assert!(!state.can_transition_to(&NamespaceState::Uninitialized));
+    assert!(!state.can_transition_to(&NamespaceState::Unshared));
+    assert!(!state.can_transition_to(&NamespaceState::Entered));
 
     // Can stay in same state (stuttering)
-    assert!(state.can_transition_to(NamespaceState::Cleaned));
+    assert!(state.can_transition_to(&NamespaceState::Cleaned));
 }
 
 #[test]
@@ -108,16 +108,16 @@ fn test_namespace_property_liveness() {
 fn test_namespace_no_state_skipping() {
     // Cannot skip intermediate states
 
-    assert!(!NamespaceState::Uninitialized.can_transition_to(NamespaceState::Entered));
-    assert!(!NamespaceState::Uninitialized.can_transition_to(NamespaceState::Cleaned));
-    assert!(!NamespaceState::Unshared.can_transition_to(NamespaceState::Cleaned));
+    assert!(!NamespaceState::Uninitialized.can_transition_to(&NamespaceState::Entered));
+    assert!(!NamespaceState::Uninitialized.can_transition_to(&NamespaceState::Cleaned));
+    assert!(!NamespaceState::Unshared.can_transition_to(&NamespaceState::Cleaned));
 }
 
 #[test]
 fn test_namespace_no_backwards_transitions() {
     // Cannot move backwards in the state machine
 
-    assert!(!NamespaceState::Unshared.can_transition_to(NamespaceState::Uninitialized));
-    assert!(!NamespaceState::Entered.can_transition_to(NamespaceState::Unshared));
-    assert!(!NamespaceState::Cleaned.can_transition_to(NamespaceState::Entered));
+    assert!(!NamespaceState::Unshared.can_transition_to(&NamespaceState::Uninitialized));
+    assert!(!NamespaceState::Entered.can_transition_to(&NamespaceState::Unshared));
+    assert!(!NamespaceState::Cleaned.can_transition_to(&NamespaceState::Entered));
 }

@@ -1,7 +1,7 @@
 use crate::audit::{audit, audit_error, AuditEventType};
 use crate::container::{
-    ContainerConfig, ContainerState, ContainerStateManager, KernelLockdownMode, ServiceMode,
-    TrustLevel,
+    ContainerConfig, ContainerState, ContainerStateManager, KernelLockdownMode, OciStatus,
+    ServiceMode, TrustLevel,
 };
 use crate::error::{NucleusError, Result};
 use crate::filesystem::{
@@ -15,14 +15,17 @@ use crate::network::{BridgeNetwork, NetworkMode};
 use crate::resources::Cgroup;
 use crate::security::{
     seccomp_trace::SeccompTraceReader, CapabilityManager, GVisorNetworkMode, GVisorRuntime,
-    LandlockManager, OciBundle, OciConfig, OciMount, SeccompManager, SecurityState,
+    LandlockManager, OciBundle, OciConfig, OciContainerState, OciHooks, OciMount, SeccompManager,
+    SecurityState,
 };
 use nix::sys::signal::{kill, Signal};
 use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
+use nix::sys::stat::Mode;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, pipe, read, write, ForkResult, Pid};
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::path::PathBuf;
 use tempfile::Builder;
 use tracing::{debug, error, info, info_span, warn};
 
@@ -41,6 +44,21 @@ pub struct Container {
     runsc_path: Option<String>,
 }
 
+/// Handle returned by `Container::create()` representing a container whose
+/// child process has been forked and is blocked on the exec FIFO, waiting for
+/// `start()` to release it.
+pub struct CreatedContainer {
+    config: ContainerConfig,
+    state_mgr: ContainerStateManager,
+    state: ContainerState,
+    child: Pid,
+    cgroup_opt: Option<Cgroup>,
+    bridge_net: Option<BridgeNetwork>,
+    trace_reader: Option<SeccompTraceReader>,
+    exec_fifo_path: PathBuf,
+    _lifecycle_span: tracing::Span,
+}
+
 impl Container {
     pub fn new(config: ContainerConfig) -> Self {
         Self {
@@ -49,10 +67,15 @@ impl Container {
         }
     }
 
-    /// Run the container
-    ///
-    /// This orchestrates all components according to the formal specifications
+    /// Run the container (convenience wrapper: create + start)
     pub fn run(&self) -> Result<i32> {
+        self.create()?.start()
+    }
+
+    /// Create phase: fork the child, set up cgroup/bridge, leave child blocked
+    /// on the exec FIFO. Returns a `CreatedContainer` whose `start()` method
+    /// releases the child process.
+    pub fn create(&self) -> Result<CreatedContainer> {
         let lifecycle_span = info_span!(
             "container.lifecycle",
             container.id = %self.config.id,
@@ -62,7 +85,7 @@ impl Container {
         let _enter = lifecycle_span.enter();
 
         info!(
-            "Starting container: {} (ID: {})",
+            "Creating container: {} (ID: {})",
             self.config.name, self.config.id
         );
         audit(
@@ -89,6 +112,14 @@ impl Container {
             info!("Not running as root, automatically enabling rootless mode");
             config.namespaces.user = true;
             config.user_ns_config = Some(crate::isolation::UserNamespaceConfig::rootless());
+        }
+
+        // Log console-socket acceptance (OCI interface; PTY forwarding is a future enhancement)
+        if let Some(ref socket_path) = config.console_socket {
+            warn!(
+                "Console socket {} accepted but terminal forwarding is not yet implemented",
+                socket_path.display()
+            );
         }
 
         // Validate production mode invariants before anything else.
@@ -120,11 +151,18 @@ impl Container {
             if all_states.iter().any(|s| s.name == config.name) {
                 return Err(NucleusError::ConfigError(format!(
                     "A container named '{}' already exists; use a different --name, \
-                     or remove the stale state with 'nucleus rm'",
+                     or remove the stale state with 'nucleus delete'",
                     config.name
                 )));
             }
         }
+
+        // Create exec FIFO for two-phase create/start synchronization.
+        // The child will block on open-for-write until start() opens for read.
+        let exec_fifo = state_mgr.exec_fifo_path(&config.id)?;
+        nix::unistd::mkfifo(&exec_fifo, Mode::S_IRUSR | Mode::S_IWUSR).map_err(|e| {
+            NucleusError::ExecError(format!("Failed to create exec FIFO {:?}: {}", exec_fifo, e))
+        })?;
 
         // Try to create cgroup (optional for rootless mode)
         let cgroup_name = format!("nucleus-{}", config.id);
@@ -146,7 +184,6 @@ impl Container {
                             )));
                         }
                         warn!("Failed to set cgroup limits: {}", e);
-                        // Cleanup the cgroup we created
                         let _ = cgroup.cleanup();
                         None
                     }
@@ -185,8 +222,6 @@ impl Container {
         };
 
         // Resolve runsc path before fork, while still unprivileged.
-        // After user-namespace unshare the child appears as UID 0, which blocks
-        // PATH-based lookup as a security measure.
         let runsc_path = if config.use_gvisor {
             Some(GVisorRuntime::resolve_path().map_err(|e| {
                 NucleusError::GVisorError(format!("Failed to resolve runsc path: {}", e))
@@ -227,171 +262,78 @@ impl Container {
                     cgroup_path,
                 );
                 state.config_hash = config.config_hash;
+                state.bundle_path = config.rootfs_path.as_ref().map(|p| p.display().to_string());
 
                 let mut bridge_net: Option<BridgeNetwork> = None;
-                let mut child_waited = false;
-                let mut trace_reader = Self::maybe_start_seccomp_trace_reader(&config, target_pid)?;
-                let run_result: Result<i32> = (|| {
-                    state_mgr.save_state(&state)?;
+                let trace_reader = Self::maybe_start_seccomp_trace_reader(&config, target_pid)?;
 
-                    if let Some(ref mut cgroup) = cgroup_opt {
-                        cgroup.attach_process(target_pid)?;
-                    }
+                // Transition: Creating -> Created
+                state.status = OciStatus::Created;
+                state_mgr.save_state(&state)?;
 
-                    if let NetworkMode::Bridge(ref bridge_config) = config.network {
-                        match BridgeNetwork::setup_with_id(target_pid, bridge_config, &config.id) {
-                            Ok(net) => {
-                                // Apply egress policy if configured
-                                if let Some(ref egress) = config.egress_policy {
-                                    if let Err(e) = net.apply_egress_policy(target_pid, egress) {
-                                        if config.service_mode == ServiceMode::Production {
-                                            return Err(NucleusError::NetworkError(format!(
-                                                "Failed to apply egress policy: {}",
-                                                e
-                                            )));
-                                        }
-                                        warn!("Failed to apply egress policy: {}", e);
+                // Write PID file (OCI --pid-file)
+                if let Some(ref pid_path) = config.pid_file {
+                    std::fs::write(pid_path, target_pid.to_string()).map_err(|e| {
+                        NucleusError::ConfigError(format!(
+                            "Failed to write pid-file '{}': {}",
+                            pid_path.display(),
+                            e
+                        ))
+                    })?;
+                    info!("Wrote PID {} to {}", target_pid, pid_path.display());
+                }
+
+                if let Some(ref mut cgroup) = cgroup_opt {
+                    cgroup.attach_process(target_pid)?;
+                }
+
+                if let NetworkMode::Bridge(ref bridge_config) = config.network {
+                    match BridgeNetwork::setup_with_id(target_pid, bridge_config, &config.id) {
+                        Ok(net) => {
+                            if let Some(ref egress) = config.egress_policy {
+                                if let Err(e) = net.apply_egress_policy(target_pid, egress) {
+                                    if config.service_mode == ServiceMode::Production {
+                                        return Err(NucleusError::NetworkError(format!(
+                                            "Failed to apply egress policy: {}",
+                                            e
+                                        )));
                                     }
+                                    warn!("Failed to apply egress policy: {}", e);
                                 }
-                                bridge_net = Some(net);
                             }
-                            Err(e) => {
-                                if config.service_mode == ServiceMode::Production {
-                                    return Err(e);
-                                }
-                                warn!("Failed to set up bridge networking: {}", e);
+                            bridge_net = Some(net);
+                        }
+                        Err(e) => {
+                            if config.service_mode == ServiceMode::Production {
+                                return Err(e);
                             }
+                            warn!("Failed to set up bridge networking: {}", e);
                         }
                     }
-
-                    self.setup_signal_forwarding(Pid::from_raw(target_pid as i32))?;
-
-                    // Run readiness probe before declaring service ready
-                    if let Some(ref probe) = config.readiness_probe {
-                        let notify_socket = if config.sd_notify {
-                            std::env::var("NOTIFY_SOCKET").ok()
-                        } else {
-                            None
-                        };
-                        Self::run_readiness_probe(
-                            target_pid,
-                            &config.name,
-                            probe,
-                            config.user_ns_config.is_some(),
-                            config.use_gvisor,
-                            notify_socket.as_deref(),
-                        )?;
-                    }
-
-                    // Start health check thread if configured
-                    // BUG-18: Use an AtomicBool cancellation flag so the health
-                    // check thread exits promptly when the container stops.
-                    let cancel_flag = std::sync::Arc::new(
-                        std::sync::atomic::AtomicBool::new(false),
-                    );
-                    let health_handle = if let Some(ref hc) = config.health_check {
-                        if !hc.command.is_empty() {
-                            let hc = hc.clone();
-                            let pid = target_pid;
-                            let container_name = config.name.clone();
-                            let rootless = config.user_ns_config.is_some();
-                            let using_gvisor = config.use_gvisor;
-                            let cancel = cancel_flag.clone();
-                            Some(std::thread::spawn(move || {
-                                Self::health_check_loop(
-                                    pid,
-                                    &container_name,
-                                    rootless,
-                                    using_gvisor,
-                                    &hc,
-                                    &cancel,
-                                );
-                            }))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    let exit_code = self.wait_for_child(child)?;
-
-                    // Signal the health check thread to stop and wait for it
-                    cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                    if let Some(handle) = health_handle {
-                        let _ = handle.join();
-                    }
-                    child_waited = true;
-                    Ok(exit_code)
-                })();
-
-                if let Some(net) = bridge_net {
-                    if let Err(e) = net.cleanup() {
-                        warn!("Failed to cleanup bridge networking: {}", e);
-                    }
                 }
 
-                if !child_waited {
-                    let _ = kill(child, Signal::SIGKILL);
-                    let _ = waitpid(child, None);
-                }
+                info!(
+                    "Container {} created (child pid {}), waiting for start",
+                    config.id, target_pid
+                );
 
-                if let Some(reader) = trace_reader.take() {
-                    reader.stop_and_flush();
-                }
-
-                if let Some(cgroup) = cgroup_opt {
-                    if let Err(e) = cgroup.cleanup() {
-                        warn!("Failed to cleanup cgroup: {}", e);
-                    }
-                }
-
-                if config.use_gvisor {
-                    if let Err(e) = Self::cleanup_gvisor_artifacts(&config.id) {
-                        warn!(
-                            "Failed to cleanup gVisor artifacts for {}: {}",
-                            config.id, e
-                        );
-                    }
-                }
-
-                if let Err(e) = state_mgr.delete_state(&config.id) {
-                    warn!("Failed to delete state for {}: {}", config.id, e);
-                }
-
-                match run_result {
-                    Ok(exit_code) => {
-                        audit(
-                            &config.id,
-                            &config.name,
-                            AuditEventType::ContainerStop,
-                            format!("exit_code={}", exit_code),
-                        );
-                        info!(
-                            "Container {} ({}) exited with code {}",
-                            config.name, config.id, exit_code
-                        );
-                        Ok(exit_code)
-                    }
-                    Err(e) => {
-                        audit_error(
-                            &config.id,
-                            &config.name,
-                            AuditEventType::ContainerStop,
-                            format!("error={}", e),
-                        );
-                        Err(e)
-                    }
-                }
+                Ok(CreatedContainer {
+                    config,
+                    state_mgr,
+                    state,
+                    child,
+                    cgroup_opt,
+                    bridge_net,
+                    trace_reader,
+                    exec_fifo_path: exec_fifo,
+                    _lifecycle_span: lifecycle_span.clone(),
+                })
             }
             ForkResult::Child => {
                 drop(ready_read);
-                // Child process - set up container environment
                 let temp_container = Container { config, runsc_path };
-                match temp_container.setup_and_exec(Some(ready_write)) {
-                    Ok(_) => {
-                        unreachable!()
-                    }
+                match temp_container.setup_and_exec(Some(ready_write), Some(exec_fifo)) {
+                    Ok(_) => unreachable!(),
                     Err(e) => {
                         error!("Container setup failed: {}", e);
                         std::process::exit(1);
@@ -401,11 +343,43 @@ impl Container {
         }
     }
 
+    /// Trigger a previously-created container to start by opening its exec FIFO.
+    /// Used by the CLI `start` command.
+    pub fn trigger_start(container_id: &str) -> Result<()> {
+        let state_mgr = ContainerStateManager::new()?;
+        let fifo_path = state_mgr.exec_fifo_path(container_id)?;
+        if !fifo_path.exists() {
+            return Err(NucleusError::ConfigError(format!(
+                "No exec FIFO found for container {}; is it in 'created' state?",
+                container_id
+            )));
+        }
+
+        // Opening the FIFO for reading unblocks the child's open-for-write.
+        let file = std::fs::File::open(&fifo_path).map_err(|e| {
+            NucleusError::ExecError(format!("Failed to open exec FIFO: {}", e))
+        })?;
+        let mut buf = [0u8; 1];
+        std::io::Read::read(&mut &file, &mut buf).map_err(|e| {
+            NucleusError::ExecError(format!("Failed to read exec FIFO: {}", e))
+        })?;
+        drop(file);
+
+        let _ = std::fs::remove_file(&fifo_path);
+
+        // Update state to Running
+        let mut state = state_mgr.resolve_container(container_id)?;
+        state.status = OciStatus::Running;
+        state_mgr.save_state(&state)?;
+
+        Ok(())
+    }
+
     /// Set up container environment and exec target process
     ///
     /// This runs in the child process after fork.
     /// Tracks FilesystemState and SecurityState machines to enforce correct ordering.
-    fn setup_and_exec(&self, ready_pipe: Option<OwnedFd>) -> Result<()> {
+    fn setup_and_exec(&self, ready_pipe: Option<OwnedFd>, exec_fifo: Option<PathBuf>) -> Result<()> {
         let is_rootless = self.config.user_ns_config.is_some();
         let allow_degraded_security = Self::allow_degraded_security(&self.config);
         let context_manifest = if self.config.verify_context_integrity {
@@ -546,6 +520,20 @@ impl Container {
         // SEC-06: In production mode, failures to mask critical paths are fatal.
         mask_proc_paths(&proc_path, self.config.service_mode == ServiceMode::Production)?;
 
+        // 9c. Run createRuntime hooks (after namespaces created, before pivot_root)
+        if let Some(ref hooks) = self.config.hooks {
+            if !hooks.create_runtime.is_empty() {
+                let hook_state = OciContainerState {
+                    oci_version: "1.0.2".to_string(),
+                    id: self.config.id.clone(),
+                    status: "creating".to_string(),
+                    pid: std::process::id(),
+                    bundle: String::new(),
+                };
+                OciHooks::run_hooks(&hooks.create_runtime, &hook_state, "createRuntime")?;
+            }
+        }
+
         // 10. Switch root filesystem
         // Filesystem: Populated -> Pivoted
         switch_root(&container_root, self.config.allow_chroot_fallback)?;
@@ -560,6 +548,20 @@ impl Container {
             AuditEventType::MountAuditPassed,
             "all mount flags verified",
         );
+
+        // 10c. Run createContainer hooks (after pivot_root, before start)
+        if let Some(ref hooks) = self.config.hooks {
+            if !hooks.create_container.is_empty() {
+                let hook_state = OciContainerState {
+                    oci_version: "1.0.2".to_string(),
+                    id: self.config.id.clone(),
+                    status: "created".to_string(),
+                    pid: std::process::id(),
+                    bundle: String::new(),
+                };
+                OciHooks::run_hooks(&hooks.create_container, &hook_state, "createContainer")?;
+            }
+        }
 
         // 11. Drop capabilities (from policy file or default drop-all)
         // Security: Privileged -> CapabilitiesDropped
@@ -740,6 +742,41 @@ impl Container {
         }
         debug!("Security state: {:?}", sec_state);
 
+        // 14c. Block on exec FIFO until start() opens it for reading.
+        // This implements the OCI two-phase create/start: all container setup
+        // is complete, but the user process doesn't exec until explicitly started.
+        if let Some(ref fifo_path) = exec_fifo {
+            debug!("Waiting on exec FIFO {:?} for start signal", fifo_path);
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(fifo_path)
+                .map_err(|e| {
+                    NucleusError::ExecError(format!(
+                        "Failed to open exec FIFO for writing: {}",
+                        e
+                    ))
+                })?;
+            std::io::Write::write_all(&mut &file, &[0u8]).map_err(|e| {
+                NucleusError::ExecError(format!("Failed to write exec FIFO sync byte: {}", e))
+            })?;
+            drop(file);
+            debug!("Exec FIFO released, proceeding to exec");
+        }
+
+        // 14d. Run startContainer hooks (after start signal, before user process exec)
+        if let Some(ref hooks) = self.config.hooks {
+            if !hooks.start_container.is_empty() {
+                let hook_state = OciContainerState {
+                    oci_version: "1.0.2".to_string(),
+                    id: self.config.id.clone(),
+                    status: "running".to_string(),
+                    pid: std::process::id(),
+                    bundle: String::new(),
+                };
+                OciHooks::run_hooks(&hooks.start_container, &hook_state, "startContainer")?;
+            }
+        }
+
         // 15. In production mode with PID namespace, run as a mini-init (PID 1)
         // that reaps zombies and forwards signals, rather than exec-ing directly.
         if self.config.service_mode == ServiceMode::Production && self.config.namespaces.pid {
@@ -832,6 +869,11 @@ impl Container {
             oci_config = oci_config.with_rootless_user_namespace(user_ns_config);
         }
 
+        // Pass OCI hooks into the gVisor config.json so gVisor executes them
+        if let Some(ref hooks) = self.config.hooks {
+            oci_config = oci_config.with_hooks(hooks.clone());
+        }
+
         let artifact_dir = Self::gvisor_artifact_dir(&self.config.id);
         std::fs::create_dir_all(&artifact_dir).map_err(|e| {
             NucleusError::FilesystemError(format!(
@@ -839,7 +881,12 @@ impl Container {
                 artifact_dir, e
             ))
         })?;
-        let bundle_path = Self::gvisor_bundle_path(&self.config.id);
+        // Use --bundle path if provided, otherwise default
+        let bundle_path = self
+            .config
+            .bundle_dir
+            .clone()
+            .unwrap_or_else(|| Self::gvisor_bundle_path(&self.config.id));
         let oci_mounts = oci_config.mounts.clone();
         let bundle = OciBundle::new(bundle_path, oci_config);
         bundle.create()?;
@@ -1275,7 +1322,7 @@ impl Container {
     }
 
     /// Forward selected signals to child process using sigwait (no async signal handlers).
-    fn setup_signal_forwarding(&self, child: Pid) -> Result<()> {
+    fn setup_signal_forwarding_static(child: Pid) -> Result<()> {
         let mut set = SigSet::empty();
         for signal in [
             Signal::SIGTERM,
@@ -1303,7 +1350,7 @@ impl Container {
     }
 
     /// Wait for child process to exit
-    fn wait_for_child(&self, child: Pid) -> Result<i32> {
+    fn wait_for_child_static(child: Pid) -> Result<i32> {
         loop {
             match waitpid(child, None) {
                 Ok(WaitStatus::Exited(_, code)) => {
@@ -1659,6 +1706,189 @@ impl Container {
         let mut reader = SeccompTraceReader::new(target_pid, log_path);
         reader.start_recording()?;
         Ok(Some(reader))
+    }
+}
+
+impl CreatedContainer {
+    /// Start phase: release the child via the exec FIFO, transition to Running,
+    /// then wait for the child to exit with full lifecycle management.
+    pub fn start(mut self) -> Result<i32> {
+        let config = &self.config;
+        let _enter = self._lifecycle_span.enter();
+
+        // Open the exec FIFO for reading — this unblocks the child's
+        // blocking open-for-write, allowing it to proceed to exec.
+        {
+            let file = std::fs::File::open(&self.exec_fifo_path).map_err(|e| {
+                NucleusError::ExecError(format!("Failed to open exec FIFO for reading: {}", e))
+            })?;
+            let mut buf = [0u8; 1];
+            std::io::Read::read(&mut &file, &mut buf).map_err(|e| {
+                NucleusError::ExecError(format!("Failed to read exec FIFO sync byte: {}", e))
+            })?;
+        }
+        let _ = std::fs::remove_file(&self.exec_fifo_path);
+
+        // Transition: Created -> Running
+        self.state.status = OciStatus::Running;
+        self.state_mgr.save_state(&self.state)?;
+
+        let target_pid = self.state.pid;
+        let child = self.child;
+
+        Container::setup_signal_forwarding_static(Pid::from_raw(target_pid as i32))?;
+
+        // Run readiness probe before declaring service ready
+        if let Some(ref probe) = config.readiness_probe {
+            let notify_socket = if config.sd_notify {
+                std::env::var("NOTIFY_SOCKET").ok()
+            } else {
+                None
+            };
+            Container::run_readiness_probe(
+                target_pid,
+                &config.name,
+                probe,
+                config.user_ns_config.is_some(),
+                config.use_gvisor,
+                notify_socket.as_deref(),
+            )?;
+        }
+
+        // Start health check thread if configured
+        let cancel_flag =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let health_handle = if let Some(ref hc) = config.health_check {
+            if !hc.command.is_empty() {
+                let hc = hc.clone();
+                let pid = target_pid;
+                let container_name = config.name.clone();
+                let rootless = config.user_ns_config.is_some();
+                let using_gvisor = config.use_gvisor;
+                let cancel = cancel_flag.clone();
+                Some(std::thread::spawn(move || {
+                    Container::health_check_loop(
+                        pid,
+                        &container_name,
+                        rootless,
+                        using_gvisor,
+                        &hc,
+                        &cancel,
+                    );
+                }))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Run poststart hooks (after user process started, in parent)
+        if let Some(ref hooks) = config.hooks {
+            if !hooks.poststart.is_empty() {
+                let hook_state = OciContainerState {
+                    oci_version: "1.0.2".to_string(),
+                    id: config.id.clone(),
+                    status: "running".to_string(),
+                    pid: target_pid,
+                    bundle: String::new(),
+                };
+                OciHooks::run_hooks(&hooks.poststart, &hook_state, "poststart")?;
+            }
+        }
+
+        let mut child_waited = false;
+        let run_result: Result<i32> = (|| {
+            let exit_code = Container::wait_for_child_static(child)?;
+
+            // Transition: Running -> Stopped
+            self.state.status = OciStatus::Stopped;
+            let _ = self.state_mgr.save_state(&self.state);
+
+            cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(handle) = health_handle {
+                let _ = handle.join();
+            }
+            child_waited = true;
+            Ok(exit_code)
+        })();
+
+        // Run poststop hooks (best-effort)
+        if let Some(ref hooks) = config.hooks {
+            if !hooks.poststop.is_empty() {
+                let hook_state = OciContainerState {
+                    oci_version: "1.0.2".to_string(),
+                    id: config.id.clone(),
+                    status: "stopped".to_string(),
+                    pid: 0,
+                    bundle: String::new(),
+                };
+                OciHooks::run_hooks_best_effort(
+                    &hooks.poststop,
+                    &hook_state,
+                    "poststop",
+                );
+            }
+        }
+
+        if let Some(net) = self.bridge_net.take() {
+            if let Err(e) = net.cleanup() {
+                warn!("Failed to cleanup bridge networking: {}", e);
+            }
+        }
+
+        if !child_waited {
+            let _ = kill(child, Signal::SIGKILL);
+            let _ = waitpid(child, None);
+        }
+
+        if let Some(reader) = self.trace_reader.take() {
+            reader.stop_and_flush();
+        }
+
+        if let Some(cgroup) = self.cgroup_opt.take() {
+            if let Err(e) = cgroup.cleanup() {
+                warn!("Failed to cleanup cgroup: {}", e);
+            }
+        }
+
+        if config.use_gvisor {
+            if let Err(e) = Container::cleanup_gvisor_artifacts(&config.id) {
+                warn!(
+                    "Failed to cleanup gVisor artifacts for {}: {}",
+                    config.id, e
+                );
+            }
+        }
+
+        if let Err(e) = self.state_mgr.delete_state(&config.id) {
+            warn!("Failed to delete state for {}: {}", config.id, e);
+        }
+
+        match run_result {
+            Ok(exit_code) => {
+                audit(
+                    &config.id,
+                    &config.name,
+                    AuditEventType::ContainerStop,
+                    format!("exit_code={}", exit_code),
+                );
+                info!(
+                    "Container {} ({}) exited with code {}",
+                    config.name, config.id, exit_code
+                );
+                Ok(exit_code)
+            }
+            Err(e) => {
+                audit_error(
+                    &config.id,
+                    &config.name,
+                    AuditEventType::ContainerStop,
+                    format!("error={}", e),
+                );
+                Err(e)
+            }
+        }
     }
 }
 

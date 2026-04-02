@@ -9,4 +9,4 @@ pub mod resources;
 pub mod security;
 pub mod topology;
 
-pub use error::{NucleusError, Result};
+pub use error::{NucleusError, Result, StateTransition};

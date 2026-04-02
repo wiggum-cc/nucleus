@@ -145,7 +145,8 @@ impl SeccompManager {
             libc::SYS_getcpu,
             libc::SYS_rseq,
             libc::SYS_close_range,
-            libc::SYS_memfd_create,
+            // NOTE: memfd_create intentionally excluded — combined with execveat
+            // it enables fileless code execution bypassing all FS controls (SEC-02).
             // Landlock bootstrap (runtime applies seccomp before Landlock)
             libc::SYS_landlock_create_ruleset,
             libc::SYS_landlock_add_rule,
@@ -599,14 +600,14 @@ impl SeccompManager {
         let builtin_rules = Self::minimal_filter(true)?;
         for syscall_name in Self::ARG_FILTERED_SYSCALLS {
             if let Some(nr) = syscall_name_to_number(syscall_name) {
-                if rules.contains_key(&nr) {
+                if let std::collections::btree_map::Entry::Occupied(mut entry) = rules.entry(nr) {
                     if let Some(builtin) = builtin_rules.get(&nr) {
                         if !builtin.is_empty() {
                             info!(
                                 "Merging built-in argument filters for '{}' into custom profile",
                                 syscall_name
                             );
-                            rules.insert(nr, builtin.clone());
+                            entry.insert(builtin.clone());
                         }
                     }
                 }
@@ -1056,10 +1057,10 @@ mod tests {
         // +5 accounts for conditional rules inserted in minimal_filter():
         // socket/ioctl/prctl/mprotect/clone.
         // clone3 is blocked (not in rules map), so it does not count.
-        assert_eq!(base.len(), 134);
+        assert_eq!(base.len(), 133);
         assert_eq!(net.len(), 11);
-        assert_eq!(base.len() + 5, 139);
-        assert_eq!(base.len() + net.len() + 5, 150);
+        assert_eq!(base.len() + 5, 138);
+        assert_eq!(base.len() + net.len() + 5, 149);
     }
 
     #[test]
@@ -1126,47 +1127,70 @@ mod tests {
     #[test]
     fn test_custom_profile_preserves_clone_arg_filters() {
         // SEC-01: Custom seccomp profiles that allow "clone" must still get
-        // argument-level filtering to block namespace-creating flags
-        let source = include_str!("seccomp.rs");
-        let profile_fn = source.find("pub fn apply_profile_from_file").unwrap();
-        let profile_body = &source[profile_fn..profile_fn + 2000];
-        // After building rules from custom profile, the code must merge
-        // built-in argument filters for security-critical syscalls
-        assert!(
-            profile_body.contains("merge") || profile_body.contains("arg_filter")
-                || profile_body.contains("clone_condition") || profile_body.contains("DENIED_CLONE"),
-            "apply_profile_from_file must merge built-in argument filters for clone/ioctl/prctl/socket"
-        );
+        // argument-level filtering to block namespace-creating flags.
+        // Verify by inspecting the built-in filter rules that serve as the
+        // merge source for apply_profile_from_file.
+        let rules = SeccompManager::minimal_filter(true).unwrap();
+
+        // Every ARG_FILTERED_SYSCALLS entry (except clone3, which is denied
+        // entirely) must have non-empty argument-level rules in the built-in
+        // filter so that apply_profile_from_file can merge them.
+        for name in SeccompManager::ARG_FILTERED_SYSCALLS {
+            if *name == "clone3" {
+                // clone3 is blocked entirely (cannot be arg-filtered)
+                continue;
+            }
+            if let Some(nr) = syscall_name_to_number(name) {
+                let entry = rules.get(&nr);
+                assert!(
+                    entry.is_some() && !entry.unwrap().is_empty(),
+                    "built-in filter must have argument-level rules for '{}' \
+                     so apply_profile_from_file can merge them into custom profiles",
+                    name
+                );
+            }
+        }
     }
 
     #[test]
     fn test_memfd_create_not_in_default_allowlist() {
-        // SEC-02: memfd_create enables fileless code execution when combined with execveat
-        let source = include_str!("seccomp.rs");
-        let base_fn = source.find("fn base_allowed_syscalls").unwrap();
-        let base_body = &source[base_fn..base_fn + 2000];
+        // SEC-02: memfd_create enables fileless code execution when combined with execveat.
+        let base = SeccompManager::base_allowed_syscalls();
         assert!(
-            !base_body.contains("memfd_create"),
+            !base.contains(&libc::SYS_memfd_create),
             "memfd_create must not be in the default seccomp allowlist (fileless exec risk)"
+        );
+        // Also verify it's not sneaked into the compiled filter rules
+        let rules = SeccompManager::minimal_filter(true).unwrap();
+        assert!(
+            !rules.contains_key(&libc::SYS_memfd_create),
+            "memfd_create must not be in the compiled seccomp filter rules"
         );
     }
 
     #[test]
     fn test_mprotect_has_arg_filtering() {
-        // SEC-03: mprotect must filter PROT_WRITE|PROT_EXEC combinations
-        let source = include_str!("seccomp.rs");
-        let filter_fn = source.find("fn minimal_filter").unwrap();
-        let filter_body = &source[filter_fn..];
+        // SEC-03: mprotect must have argument-level filtering to prevent W^X
+        // (PROT_WRITE|PROT_EXEC) violations. Verify via runtime data structures.
+
+        // mprotect must NOT be in the unconditional base allowlist
+        let base = SeccompManager::base_allowed_syscalls();
         assert!(
-            filter_body.contains("mprotect") && (filter_body.contains("PROT_EXEC") || filter_body.contains("condition")),
-            "mprotect must have argument-level filtering to prevent W^X violations"
-        );
-        // mprotect must NOT be in the unconditional allowlist
-        let base_fn = source.find("fn base_allowed_syscalls").unwrap();
-        let base_body = &source[base_fn..base_fn + 2000];
-        assert!(
-            !base_body.contains("SYS_mprotect"),
+            !base.contains(&libc::SYS_mprotect),
             "SYS_mprotect must not be unconditionally allowed - needs arg filtering"
+        );
+
+        // mprotect must be present in the compiled filter with non-empty
+        // argument conditions (the conditions enforce W^X)
+        let rules = SeccompManager::minimal_filter(true).unwrap();
+        let mprotect_rules = rules.get(&libc::SYS_mprotect);
+        assert!(
+            mprotect_rules.is_some(),
+            "mprotect must be present in the seccomp filter rules"
+        );
+        assert!(
+            !mprotect_rules.unwrap().is_empty(),
+            "mprotect must have argument-level conditions to prevent W^X violations"
         );
     }
 

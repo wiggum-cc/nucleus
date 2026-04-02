@@ -26,19 +26,7 @@ impl ContextPopulator {
             self.source, self.dest
         );
 
-        if !self.source.exists() {
-            return Err(NucleusError::ContextError(format!(
-                "Source directory does not exist: {:?}",
-                self.source
-            )));
-        }
-
-        if !self.source.is_dir() {
-            return Err(NucleusError::ContextError(format!(
-                "Source is not a directory: {:?}",
-                self.source
-            )));
-        }
+        Self::validate_source(&self.source)?;
 
         // Create destination if it doesn't exist
         if !self.dest.exists() {
@@ -63,54 +51,65 @@ impl ContextPopulator {
     /// Used by bind-mount mode so the host tree gets the same preflight checks
     /// as copy mode.
     pub fn validate_source_tree(&self) -> Result<()> {
-        if !self.source.exists() {
+        Self::validate_source(&self.source)?;
+        self.validate_recursive(&self.source, 0)
+    }
+
+    /// Validate that a source path exists and is a directory.
+    fn validate_source(source: &Path) -> Result<()> {
+        if !source.exists() {
             return Err(NucleusError::ContextError(format!(
                 "Source directory does not exist: {:?}",
-                self.source
+                source
             )));
         }
 
-        if !self.source.is_dir() {
+        if !source.is_dir() {
             return Err(NucleusError::ContextError(format!(
                 "Source is not a directory: {:?}",
-                self.source
+                source
             )));
         }
 
-        self.validate_recursive(&self.source, 0)
+        Ok(())
     }
 
     /// Maximum directory recursion depth to prevent stack overflow
     const MAX_RECURSION_DEPTH: u32 = 128;
 
-    /// Recursively copy directory contents
-    fn copy_recursive(&self, src: &Path, dst: &Path, depth: u32) -> Result<()> {
+    /// Read directory entries, filtering out excluded names.
+    ///
+    /// Shared between `copy_recursive` and `validate_recursive` to avoid
+    /// duplicating depth checks, read_dir error handling, and exclusion logic.
+    fn filtered_entries(
+        dir: &Path,
+        depth: u32,
+    ) -> Result<Vec<(PathBuf, std::ffi::OsString, fs::Metadata)>> {
         if depth > Self::MAX_RECURSION_DEPTH {
             return Err(NucleusError::ContextError(format!(
                 "Maximum directory depth ({}) exceeded at {:?}",
                 Self::MAX_RECURSION_DEPTH,
-                src
+                dir
             )));
         }
-        let entries = fs::read_dir(src).map_err(|e| {
-            NucleusError::ContextError(format!("Failed to read directory {:?}: {}", src, e))
+
+        let entries = fs::read_dir(dir).map_err(|e| {
+            NucleusError::ContextError(format!("Failed to read directory {:?}: {}", dir, e))
         })?;
 
+        let mut result = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| {
-                NucleusError::ContextError(format!("Failed to read entry in {:?}: {}", src, e))
+                NucleusError::ContextError(format!("Failed to read entry in {:?}: {}", dir, e))
             })?;
 
-            let src_path = entry.path();
             let file_name = entry.file_name();
-            let dst_path = dst.join(&file_name);
-
-            // Skip excluded patterns
             if Self::should_exclude_name(&file_name) {
                 debug!("Skipping excluded file: {:?}", file_name);
                 continue;
             }
 
+            let src_path = entry.path();
             let metadata = fs::symlink_metadata(&src_path).map_err(|e| {
                 NucleusError::ContextError(format!(
                     "Failed to get metadata for {:?}: {}",
@@ -118,8 +117,18 @@ impl ContextPopulator {
                 ))
             })?;
 
+            result.push((src_path, file_name, metadata));
+        }
+
+        Ok(result)
+    }
+
+    /// Recursively copy directory contents
+    fn copy_recursive(&self, src: &Path, dst: &Path, depth: u32) -> Result<()> {
+        for (src_path, file_name, metadata) in Self::filtered_entries(src, depth)? {
+            let dst_path = dst.join(&file_name);
+
             if metadata.is_dir() {
-                // Create directory and recurse
                 fs::create_dir_all(&dst_path).map_err(|e| {
                     NucleusError::ContextError(format!(
                         "Failed to create directory {:?}: {}",
@@ -128,7 +137,6 @@ impl ContextPopulator {
                 })?;
                 self.copy_recursive(&src_path, &dst_path, depth + 1)?;
             } else if metadata.is_file() {
-                // Copy file
                 fs::copy(&src_path, &dst_path).map_err(|e| {
                     NucleusError::ContextError(format!(
                         "Failed to copy {:?} to {:?}: {}",
@@ -145,35 +153,7 @@ impl ContextPopulator {
     }
 
     fn validate_recursive(&self, src: &Path, depth: u32) -> Result<()> {
-        if depth > Self::MAX_RECURSION_DEPTH {
-            return Err(NucleusError::ContextError(format!(
-                "Maximum directory depth ({}) exceeded at {:?}",
-                Self::MAX_RECURSION_DEPTH,
-                src
-            )));
-        }
-
-        for entry in fs::read_dir(src).map_err(|e| {
-            NucleusError::ContextError(format!("Failed to read directory {:?}: {}", src, e))
-        })? {
-            let entry = entry.map_err(|e| {
-                NucleusError::ContextError(format!("Failed to read entry in {:?}: {}", src, e))
-            })?;
-
-            let src_path = entry.path();
-            let file_name = entry.file_name();
-
-            if Self::should_exclude_name(&file_name) {
-                continue;
-            }
-
-            let metadata = fs::symlink_metadata(&src_path).map_err(|e| {
-                NucleusError::ContextError(format!(
-                    "Failed to get metadata for {:?}: {}",
-                    src_path, e
-                ))
-            })?;
-
+        for (src_path, _file_name, metadata) in Self::filtered_entries(src, depth)? {
             if metadata.is_symlink() {
                 return Err(NucleusError::ContextError(format!(
                     "Bind-mounted contexts may not contain symlinks: {:?}",

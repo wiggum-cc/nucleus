@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 use tracing::{info, warn};
 
-/// Container lifecycle operations (stop, kill, remove)
+/// Container lifecycle operations (stop, kill, delete)
 pub struct ContainerLifecycle;
 
 impl ContainerLifecycle {
@@ -155,36 +155,20 @@ pub fn parse_signal(s: &str) -> Result<Signal> {
             .map_err(|_| NucleusError::ConfigError(format!("Invalid signal number: {}", num)));
     }
 
-    // Try name (with or without SIG prefix)
+    // Normalize: uppercase and strip optional "SIG" prefix
     let upper = s.to_uppercase();
-    let name = if upper.starts_with("SIG") {
-        upper.as_str()
-    } else {
-        // We need to own the string for the match
-        return match upper.as_str() {
-            "TERM" => Ok(Signal::SIGTERM),
-            "KILL" => Ok(Signal::SIGKILL),
-            "INT" => Ok(Signal::SIGINT),
-            "HUP" => Ok(Signal::SIGHUP),
-            "QUIT" => Ok(Signal::SIGQUIT),
-            "USR1" => Ok(Signal::SIGUSR1),
-            "USR2" => Ok(Signal::SIGUSR2),
-            "STOP" => Ok(Signal::SIGSTOP),
-            "CONT" => Ok(Signal::SIGCONT),
-            _ => Err(NucleusError::ConfigError(format!("Unknown signal: {}", s))),
-        };
-    };
+    let normalized = upper.strip_prefix("SIG").unwrap_or(&upper);
 
-    match name {
-        "SIGTERM" => Ok(Signal::SIGTERM),
-        "SIGKILL" => Ok(Signal::SIGKILL),
-        "SIGINT" => Ok(Signal::SIGINT),
-        "SIGHUP" => Ok(Signal::SIGHUP),
-        "SIGQUIT" => Ok(Signal::SIGQUIT),
-        "SIGUSR1" => Ok(Signal::SIGUSR1),
-        "SIGUSR2" => Ok(Signal::SIGUSR2),
-        "SIGSTOP" => Ok(Signal::SIGSTOP),
-        "SIGCONT" => Ok(Signal::SIGCONT),
+    match normalized {
+        "TERM" => Ok(Signal::SIGTERM),
+        "KILL" => Ok(Signal::SIGKILL),
+        "INT" => Ok(Signal::SIGINT),
+        "HUP" => Ok(Signal::SIGHUP),
+        "QUIT" => Ok(Signal::SIGQUIT),
+        "USR1" => Ok(Signal::SIGUSR1),
+        "USR2" => Ok(Signal::SIGUSR2),
+        "STOP" => Ok(Signal::SIGSTOP),
+        "CONT" => Ok(Signal::SIGCONT),
         _ => Err(NucleusError::ConfigError(format!("Unknown signal: {}", s))),
     }
 }

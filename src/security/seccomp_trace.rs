@@ -200,28 +200,53 @@ mod tests {
         assert_eq!(extract_syscall_nr("no syscall here"), None);
     }
 
+    /// Extract the body of a function from source text by brace-matching,
+    /// avoiding fragile hardcoded character-window offsets (SEC-MED-03).
+    fn extract_fn_body<'a>(source: &'a str, fn_signature: &str) -> &'a str {
+        let fn_start = source.find(fn_signature)
+            .unwrap_or_else(|| panic!("function '{}' not found in source", fn_signature));
+        let after = &source[fn_start..];
+        let open = after.find('{')
+            .unwrap_or_else(|| panic!("no opening brace found for '{}'", fn_signature));
+        let mut depth = 0u32;
+        let mut end = open;
+        for (i, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 { end = open + i + 1; break; }
+                }
+                _ => {}
+            }
+        }
+        &after[..end]
+    }
+
     #[test]
     fn test_reader_uses_nonblocking_io() {
         // Verify record_loop uses O_NONBLOCK + poll, not socket-only APIs.
         // /dev/kmsg is a character device; socket APIs like SO_RCVTIMEO silently fail.
+        // NOTE: Uses brace-matched function body extraction (SEC-MED-03).
         let source = include_str!("seccomp_trace.rs");
+        let fn_body = extract_fn_body(source, "fn record_loop");
         assert!(
-            source.contains("O_NONBLOCK"),
-            "Must use O_NONBLOCK for non-blocking reads on /dev/kmsg"
+            fn_body.contains("O_NONBLOCK"),
+            "record_loop must use O_NONBLOCK for non-blocking reads on /dev/kmsg"
         );
         assert!(
-            source.contains("libc::poll"),
-            "Must use poll() for timed waits on /dev/kmsg"
+            fn_body.contains("libc::poll"),
+            "record_loop must use poll() for timed waits on /dev/kmsg"
         );
-        // Count occurrences of SO_RCVTIMEO — should only appear in comments/tests,
-        // never as part of an actual unsafe block calling setsockopt
-        let unsafe_setsockopt_count = source
+        // setsockopt must not appear in the function (socket API doesn't work on char devices)
+        let setsockopt_lines: Vec<&str> = fn_body
             .lines()
-            .filter(|l| l.trim().starts_with("libc::") && l.contains("setsockopt"))
-            .count();
-        assert_eq!(
-            unsafe_setsockopt_count, 0,
-            "Must not call setsockopt on /dev/kmsg"
+            .filter(|l| !l.trim().starts_with("//"))
+            .filter(|l| l.contains("setsockopt"))
+            .collect();
+        assert!(
+            setsockopt_lines.is_empty(),
+            "record_loop must not call setsockopt on /dev/kmsg"
         );
     }
 

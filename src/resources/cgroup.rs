@@ -197,11 +197,25 @@ mod tests {
     #[test]
     fn test_cleanup_sets_removed_only_after_success() {
         // BUG-06: cleanup must not mark state as Removed before the directory
-        // is actually removed. Verify structurally.
+        // is actually removed. Verify structurally by brace-matching the
+        // function body instead of using a fragile char-window offset.
         let source = include_str!("cgroup.rs");
-        let cleanup_start = source.find("pub fn cleanup").unwrap();
-        let cleanup_end = source[cleanup_start..].find("\n    }").unwrap();
-        let cleanup_body = &source[cleanup_start..cleanup_start + cleanup_end];
+        let fn_start = source.find("pub fn cleanup").unwrap();
+        let after = &source[fn_start..];
+        let open = after.find('{').unwrap();
+        let mut depth = 0u32;
+        let mut fn_end = open;
+        for (i, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 { fn_end = open + i + 1; break; }
+                }
+                _ => {}
+            }
+        }
+        let cleanup_body = &after[..fn_end];
         let removed_pos = cleanup_body.find("Removed").expect("must reference Removed state");
         let remove_dir_pos = cleanup_body.find("remove_dir").expect("must call remove_dir");
         assert!(

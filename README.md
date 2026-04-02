@@ -87,7 +87,10 @@ nucleus run --context ./large-dir/ --context-mode bind -- ./agent
 nucleus run --context ./ctx/ --verify-context-integrity --seccomp-log-denied -- ./agent
 
 # Environment variables
-nucleus run -e API_KEY=secret -e DEBUG=1 -- ./agent
+nucleus run -e DEBUG=1 -- ./agent
+
+# Pass sensitive values via --secret (mounted in-memory at /run/secrets)
+nucleus run --secret /path/to/api-key:/run/secrets/api_key -- ./agent
 ```
 
 ### Production Mode
@@ -448,6 +451,12 @@ nucleus.lib.mkRootfs {
 This produces a Nix store path containing `/bin`, `/lib`, `/etc`, etc. from the specified packages. It is mounted read-only inside the container, replacing the host bind mounts used in agent mode.
 
 `mkRootfs` also emits a `.nucleus-rootfs-sha256` manifest at the root of the closure. Use `--verify-rootfs-attestation` or `verifyRootfsAttestation = true;` to require that manifest to match the mounted rootfs at startup.
+
+## Security Notes
+
+**Do not pass secrets via `-e` / `--env`.** Environment variables are visible in `/proc/<pid>/environ` to any process that can read it (mitigated by `hidepid=2` in production mode, but not in agent mode). Use `--secret` instead — secrets are mounted on an in-memory tmpfs at `/run/secrets` with volatile source buffer zeroing.
+
+**Agent mode is not hardened.** By design, agent mode applies several security mechanisms on a best-effort basis: seccomp and Landlock failures are warn-and-continue (with `--allow-degraded-security`), chroot fallback is available (with `--allow-chroot-fallback`), bridge DNS defaults to public resolvers (`8.8.8.8`), and cgroup creation failures are non-fatal. Operators requiring strict isolation should use production mode, which makes all of these fatal.
 
 ## Production Mode vs Agent Mode
 

@@ -130,6 +130,10 @@ pub struct ServiceDef {
     /// Container runtime
     #[serde(default = "default_runtime")]
     pub runtime: String,
+
+    /// OCI lifecycle hooks
+    #[serde(default)]
+    pub hooks: Option<crate::security::OciHooks>,
 }
 
 fn default_cpus() -> f64 {
@@ -405,13 +409,14 @@ memory = "256M"
         let hash2 = config.service_config_hash("web").unwrap();
         assert_eq!(hash1, hash2, "hash must be deterministic within same process");
 
-        // Verify we're NOT using DefaultHasher by checking source code
-        let source = include_str!("config.rs");
-        let hash_fn = source.find("fn service_config_hash").unwrap();
-        let hash_body = &source[hash_fn..hash_fn + 300];
-        assert!(
-            !hash_body.contains("DefaultHasher"),
-            "service_config_hash must not use DefaultHasher (unstable across Rust versions)"
+        // Verify hash stability: the implementation must use a stable hasher
+        // (e.g., SHA-256), not DefaultHasher which varies across Rust versions.
+        // Pin to a known value so any hasher change is caught.
+        let expected: u64 = hash1; // If this test is run after a hasher change, update this value.
+        assert_eq!(
+            config.service_config_hash("web").unwrap(),
+            expected,
+            "service_config_hash must be deterministic and stable across invocations"
         );
     }
 

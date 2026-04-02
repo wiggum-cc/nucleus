@@ -73,6 +73,35 @@ pub enum NucleusError {
 
     #[error("Invalid state transition: from {from} to {to}")]
     InvalidStateTransition { from: String, to: String },
+
+    #[error("OCI hook failed: {0}")]
+    HookError(String),
 }
 
 pub type Result<T> = std::result::Result<T, NucleusError>;
+
+/// Common trait for all state machine enums.
+///
+/// Each subsystem (filesystem, security, resources, isolation, network, checkpoint)
+/// defines its own state enum with domain-specific transition rules. This trait
+/// provides the shared `transition()` method so each enum only needs to implement
+/// `can_transition_to()`.
+pub trait StateTransition: std::fmt::Debug + Sized {
+    /// Return `true` if moving from `self` to `next` is a valid transition.
+    fn can_transition_to(&self, next: &Self) -> bool;
+
+    /// Return `true` if this state is terminal (no forward transitions).
+    fn is_terminal(&self) -> bool;
+
+    /// Attempt to transition, returning `Err(InvalidStateTransition)` on failure.
+    fn transition(self, next: Self) -> Result<Self> {
+        if self.can_transition_to(&next) {
+            Ok(next)
+        } else {
+            Err(NucleusError::InvalidStateTransition {
+                from: format!("{:?}", self),
+                to: format!("{:?}", next),
+            })
+        }
+    }
+}

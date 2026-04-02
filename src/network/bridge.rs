@@ -888,7 +888,7 @@ mod tests {
         // and that values >= 253 are rejected (no modulo bias).
         for byte in 0u8..253 {
             let offset = byte as u32 + 2;
-            assert!(offset >= 2 && offset <= 254, "offset {} out of range", offset);
+            assert!((2..=254).contains(&offset), "offset {} out of range", offset);
         }
         // Values 253, 254, 255 must be rejected
         for byte in [253u8, 254, 255] {

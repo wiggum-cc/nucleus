@@ -1,9 +1,8 @@
-use crate::container::ContainerState;
+use crate::container::{ContainerState, ContainerStateManager};
 use crate::error::{NucleusError, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Read;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -124,19 +123,8 @@ impl CheckpointMetadata {
     /// Load metadata from checkpoint directory
     pub fn load(dir: &Path) -> Result<Self> {
         let path = dir.join("metadata.json");
-        let mut file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|e| {
-                NucleusError::CheckpointError(format!(
-                    "Failed to read metadata {:?}: {}",
-                    path, e
-                ))
-            })?;
-        let mut json = String::new();
-        file.read_to_string(&mut json).map_err(|e| {
-            NucleusError::CheckpointError(format!("Failed to read metadata: {}", e))
+        let json = ContainerStateManager::read_file_nofollow(&path).map_err(|e| {
+            NucleusError::CheckpointError(format!("Failed to read metadata {:?}: {}", path, e))
         })?;
         let metadata: Self = serde_json::from_str(&json).map_err(|e| {
             NucleusError::CheckpointError(format!("Failed to parse metadata: {}", e))
@@ -147,15 +135,37 @@ impl CheckpointMetadata {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::os::unix::fs as unix_fs;
+
     #[test]
-    fn test_save_uses_o_nofollow() {
-        // BUG-11: CheckpointMetadata::save must use O_NOFOLLOW like ContainerStateManager
-        let source = include_str!("metadata.rs");
-        let save_fn = source.find("pub fn save").unwrap();
-        let save_body = &source[save_fn..];
+    fn test_save_rejects_symlink_target() {
+        // BUG-11: CheckpointMetadata::save must use O_NOFOLLOW to prevent
+        // symlink attacks. Verify by creating a symlink at the temp file path
+        // and confirming save() refuses to follow it.
+        let dir = tempfile::tempdir().unwrap();
+        let attacker_target = dir.path().join("attacker-owned-file");
+        std::fs::write(&attacker_target, "").unwrap();
+
+        // Pre-create the symlink where save() will write its temp file
+        let symlink_path = dir.path().join("metadata.json.tmp");
+        unix_fs::symlink(&attacker_target, &symlink_path).unwrap();
+
+        let metadata = CheckpointMetadata {
+            container_id: "test-id".to_string(),
+            container_name: "test".to_string(),
+            original_pid: 1,
+            command: vec!["/bin/sh".to_string()],
+            checkpoint_at: 0,
+            version: "0.0.0".to_string(),
+            using_gvisor: false,
+            rootless: false,
+        };
+
+        let result = metadata.save(dir.path());
         assert!(
-            save_body.contains("O_NOFOLLOW") || save_body.contains("NOFOLLOW"),
-            "CheckpointMetadata::save must use O_NOFOLLOW to prevent symlink attacks"
+            result.is_err(),
+            "save() must reject symlink at temp file path (O_NOFOLLOW / symlink check)"
         );
     }
 }

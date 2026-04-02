@@ -1,3 +1,5 @@
+use crate::error::StateTransition;
+
 /// Namespace lifecycle state machine matching Nucleus_Isolation_NamespaceLifecycle.tla
 ///
 /// State transitions:
@@ -18,9 +20,8 @@ pub enum NamespaceState {
     Cleaned,
 }
 
-impl NamespaceState {
-    /// Check if transition is valid according to TLA+ spec
-    pub fn can_transition_to(&self, next: NamespaceState) -> bool {
+impl StateTransition for NamespaceState {
+    fn can_transition_to(&self, next: &NamespaceState) -> bool {
         use NamespaceState::*;
 
         matches!(
@@ -35,8 +36,7 @@ impl NamespaceState {
         )
     }
 
-    /// Check if this is a terminal state
-    pub fn is_terminal(&self) -> bool {
+    fn is_terminal(&self) -> bool {
         matches!(self, NamespaceState::Cleaned)
     }
 }
@@ -47,21 +47,21 @@ mod tests {
 
     #[test]
     fn test_valid_transitions() {
-        assert!(NamespaceState::Uninitialized.can_transition_to(NamespaceState::Unshared));
-        assert!(NamespaceState::Unshared.can_transition_to(NamespaceState::Entered));
-        assert!(NamespaceState::Entered.can_transition_to(NamespaceState::Cleaned));
+        assert!(NamespaceState::Uninitialized.can_transition_to(&NamespaceState::Unshared));
+        assert!(NamespaceState::Unshared.can_transition_to(&NamespaceState::Entered));
+        assert!(NamespaceState::Entered.can_transition_to(&NamespaceState::Cleaned));
     }
 
     #[test]
     fn test_invalid_transitions() {
         // Cannot skip states
-        assert!(!NamespaceState::Uninitialized.can_transition_to(NamespaceState::Entered));
-        assert!(!NamespaceState::Uninitialized.can_transition_to(NamespaceState::Cleaned));
-        assert!(!NamespaceState::Unshared.can_transition_to(NamespaceState::Cleaned));
+        assert!(!NamespaceState::Uninitialized.can_transition_to(&NamespaceState::Entered));
+        assert!(!NamespaceState::Uninitialized.can_transition_to(&NamespaceState::Cleaned));
+        assert!(!NamespaceState::Unshared.can_transition_to(&NamespaceState::Cleaned));
 
         // Cannot go backwards
-        assert!(!NamespaceState::Entered.can_transition_to(NamespaceState::Unshared));
-        assert!(!NamespaceState::Cleaned.can_transition_to(NamespaceState::Entered));
+        assert!(!NamespaceState::Entered.can_transition_to(&NamespaceState::Unshared));
+        assert!(!NamespaceState::Cleaned.can_transition_to(&NamespaceState::Entered));
     }
 
     #[test]
