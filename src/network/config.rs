@@ -50,6 +50,77 @@ impl BridgeConfig {
         self.dns = servers;
         self
     }
+
+    /// Validate all fields to prevent argument injection into ip/iptables commands.
+    pub fn validate(&self) -> Result<(), String> {
+        // Bridge name: alphanumeric, dash, underscore; max 15 chars (Linux IFNAMSIZ)
+        if self.bridge_name.is_empty() || self.bridge_name.len() > 15 {
+            return Err(format!(
+                "Bridge name must be 1-15 characters, got '{}'",
+                self.bridge_name
+            ));
+        }
+        if !self
+            .bridge_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(format!(
+                "Bridge name contains invalid characters (allowed: a-zA-Z0-9_-): '{}'",
+                self.bridge_name
+            ));
+        }
+
+        // Subnet: must be valid IPv4 CIDR
+        validate_ipv4_cidr(&self.subnet)?;
+
+        // Container IP (if specified)
+        if let Some(ref ip) = self.container_ip {
+            validate_ipv4_addr(ip)?;
+        }
+
+        // DNS servers
+        for dns in &self.dns {
+            validate_ipv4_addr(dns)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Validate that a string is a valid IPv4 address (no leading dashes, proper octets).
+fn validate_ipv4_addr(s: &str) -> Result<(), String> {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 4 {
+        return Err(format!("Invalid IPv4 address: '{}'", s));
+    }
+    for part in &parts {
+        match part.parse::<u8>() {
+            Ok(_) => {}
+            Err(_) => return Err(format!("Invalid IPv4 address: '{}'", s)),
+        }
+    }
+    Ok(())
+}
+
+/// Validate that a string is a valid IPv4 CIDR (e.g., "10.0.42.0/24").
+fn validate_ipv4_cidr(s: &str) -> Result<(), String> {
+    let (addr, prefix) = s
+        .split_once('/')
+        .ok_or_else(|| format!("Invalid CIDR (missing /prefix): '{}'", s))?;
+    validate_ipv4_addr(addr)?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| format!("Invalid CIDR prefix: '{}'", s))?;
+    if prefix > 32 {
+        return Err(format!("CIDR prefix must be 0-32, got {}", prefix));
+    }
+    Ok(())
+}
+
+/// Validate that a string is a valid IPv4 CIDR for egress rules.
+pub fn validate_egress_cidr(s: &str) -> Result<(), String> {
+    validate_ipv4_cidr(s)
 }
 
 /// Egress policy for audited outbound network access.

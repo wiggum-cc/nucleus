@@ -173,9 +173,16 @@ impl ContainerStateManager {
         if nix::unistd::Uid::effective().is_root() {
             PathBuf::from("/var/run/nucleus")
         } else {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join("nucleus")
+            // Prefer XDG_RUNTIME_DIR (per-user, tmpfs, mode 0700) over /tmp
+            dirs::runtime_dir()
+                .map(|d| d.join("nucleus"))
+                .or_else(|| dirs::data_local_dir().map(|d| d.join("nucleus")))
+                .unwrap_or_else(|| {
+                    // Last resort: ~/.nucleus (never /tmp — symlink attack vector)
+                    dirs::home_dir()
+                        .map(|h| h.join(".nucleus"))
+                        .unwrap_or_else(|| PathBuf::from("/var/run/nucleus"))
+                })
         }
     }
 

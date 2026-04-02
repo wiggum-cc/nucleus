@@ -59,6 +59,12 @@ pub enum NucleusError {
     #[error("Attach error: {0}")]
     AttachError(String),
 
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+
+    #[error("Container not running: {0}")]
+    ContainerNotRunning(String),
+
     #[error("Syscall error: {0}")]
     SyscallError(#[from] nix::Error),
 

@@ -17,8 +17,8 @@ impl ContainerLifecycle {
             return Ok(());
         }
 
-        Err(NucleusError::ExecError(format!(
-            "Permission denied: container {} owned by UID {}, caller is UID {}",
+        Err(NucleusError::PermissionDenied(format!(
+            "container {} owned by UID {}, caller is UID {}",
             state.id, state.creator_uid, current_uid
         )))
     }
@@ -87,7 +87,7 @@ impl ContainerLifecycle {
         Self::ensure_container_access(state)?;
 
         if !state.is_running() {
-            return Err(NucleusError::ContainerNotFound(format!(
+            return Err(NucleusError::ContainerNotRunning(format!(
                 "Container {} is not running",
                 state.id
             )));
@@ -123,6 +123,18 @@ impl ContainerLifecycle {
                     "Container {} is still running. Stop it first or use --force",
                     state.id
                 )));
+            }
+        }
+
+        // Clean up cgroup directory if present
+        if let Some(ref cgroup_path) = state.cgroup_path {
+            let cgroup = std::path::Path::new(cgroup_path);
+            if cgroup.exists() {
+                if let Err(e) = std::fs::remove_dir(cgroup) {
+                    warn!("Failed to remove cgroup {}: {} (may still have processes)", cgroup_path, e);
+                } else {
+                    info!("Removed cgroup {}", cgroup_path);
+                }
             }
         }
 

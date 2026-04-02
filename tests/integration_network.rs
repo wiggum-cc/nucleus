@@ -1,0 +1,286 @@
+/// Integration tests for network configuration and validation
+///
+/// Tests the network module's configuration validation, bridge config,
+/// egress policies, and port forwarding without requiring root privileges.
+#[cfg(test)]
+mod tests {
+    use nucleus::container::{ContainerConfig, TrustLevel};
+    use nucleus::error::NucleusError;
+    use nucleus::isolation::NamespaceConfig;
+    use nucleus::network::{BridgeConfig, EgressPolicy, NetworkMode, PortForward};
+
+    // --- BridgeConfig validation ---
+
+    #[test]
+    fn test_bridge_config_default_valid() {
+        let config = BridgeConfig::default();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.bridge_name, "nucleus0");
+        assert_eq!(config.subnet, "10.0.42.0/24");
+        assert!(config.container_ip.is_none());
+        assert!(config.dns.is_empty());
+    }
+
+    #[test]
+    fn test_bridge_config_with_public_dns() {
+        let config = BridgeConfig::default().with_public_dns();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.dns, vec!["8.8.8.8", "8.8.4.4"]);
+    }
+
+    #[test]
+    fn test_bridge_config_with_custom_dns() {
+        let config =
+            BridgeConfig::default().with_dns(vec!["1.1.1.1".to_string(), "9.9.9.9".to_string()]);
+        assert!(config.validate().is_ok());
+        assert_eq!(config.dns.len(), 2);
+    }
+
+    #[test]
+    fn test_bridge_config_empty_name_rejected() {
+        let mut config = BridgeConfig::default();
+        config.bridge_name = String::new();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_bridge_config_long_name_rejected() {
+        let mut config = BridgeConfig::default();
+        config.bridge_name = "a".repeat(16); // 16 chars, max is 15
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_bridge_config_name_at_limit() {
+        let mut config = BridgeConfig::default();
+        config.bridge_name = "a".repeat(15); // exactly 15 chars
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_bridge_config_special_chars_in_name_rejected() {
+        for bad_name in &["my bridge", "br;rm", "br$(cmd)", "br/0", "br\nnet"] {
+            let mut config = BridgeConfig::default();
+            config.bridge_name = bad_name.to_string();
+            assert!(
+                config.validate().is_err(),
+                "Bridge name '{}' should be rejected",
+                bad_name
+            );
+        }
+    }
+
+    #[test]
+    fn test_bridge_config_valid_name_chars() {
+        for good_name in &["br0", "my-bridge", "net_1", "ABC123"] {
+            let mut config = BridgeConfig::default();
+            config.bridge_name = good_name.to_string();
+            assert!(
+                config.validate().is_ok(),
+                "Bridge name '{}' should be valid",
+                good_name
+            );
+        }
+    }
+
+    #[test]
+    fn test_bridge_config_invalid_subnet_rejected() {
+        let cases = vec![
+            "not-a-cidr",
+            "10.0.0.0",       // missing prefix
+            "10.0.0.0/33",    // prefix too large
+            "999.0.0.0/24",   // invalid octet
+            "10.0.0.0/abc",   // non-numeric prefix
+            "-1.0.0.0/24",    // negative octet
+            "10.0.0/24",      // only 3 octets
+        ];
+        for subnet in cases {
+            let mut config = BridgeConfig::default();
+            config.subnet = subnet.to_string();
+            assert!(
+                config.validate().is_err(),
+                "Subnet '{}' should be rejected",
+                subnet
+            );
+        }
+    }
+
+    #[test]
+    fn test_bridge_config_valid_subnets() {
+        for subnet in &["10.0.0.0/8", "192.168.1.0/24", "172.16.0.0/12", "0.0.0.0/0"] {
+            let mut config = BridgeConfig::default();
+            config.subnet = subnet.to_string();
+            assert!(
+                config.validate().is_ok(),
+                "Subnet '{}' should be valid",
+                subnet
+            );
+        }
+    }
+
+    #[test]
+    fn test_bridge_config_invalid_container_ip() {
+        let mut config = BridgeConfig::default();
+        config.container_ip = Some("not-an-ip".to_string());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_bridge_config_invalid_dns_rejected() {
+        let mut config = BridgeConfig::default();
+        config.dns = vec!["8.8.8.8".to_string(), "badip".to_string()];
+        assert!(config.validate().is_err());
+    }
+
+    // --- PortForward ---
+
+    #[test]
+    fn test_port_forward_tcp_default() {
+        let pf = PortForward::parse("8080:80").unwrap();
+        assert_eq!(pf.host_port, 8080);
+        assert_eq!(pf.container_port, 80);
+        assert_eq!(pf.protocol, "tcp");
+    }
+
+    #[test]
+    fn test_port_forward_explicit_tcp() {
+        let pf = PortForward::parse("3000:3000/tcp").unwrap();
+        assert_eq!(pf.host_port, 3000);
+        assert_eq!(pf.container_port, 3000);
+        assert_eq!(pf.protocol, "tcp");
+    }
+
+    #[test]
+    fn test_port_forward_udp() {
+        let pf = PortForward::parse("5353:53/udp").unwrap();
+        assert_eq!(pf.host_port, 5353);
+        assert_eq!(pf.container_port, 53);
+        assert_eq!(pf.protocol, "udp");
+    }
+
+    #[test]
+    fn test_port_forward_invalid_protocol() {
+        assert!(PortForward::parse("8080:80/sctp").is_err());
+    }
+
+    #[test]
+    fn test_port_forward_missing_container_port() {
+        assert!(PortForward::parse("8080").is_err());
+    }
+
+    #[test]
+    fn test_port_forward_non_numeric() {
+        assert!(PortForward::parse("http:80").is_err());
+        assert!(PortForward::parse("8080:http").is_err());
+    }
+
+    #[test]
+    fn test_port_forward_overflow() {
+        assert!(PortForward::parse("99999:80").is_err());
+    }
+
+    // --- EgressPolicy ---
+
+    #[test]
+    fn test_egress_deny_all_defaults() {
+        let policy = EgressPolicy::deny_all();
+        assert!(policy.allowed_cidrs.is_empty());
+        assert!(policy.allowed_tcp_ports.is_empty());
+        assert!(policy.allowed_udp_ports.is_empty());
+        assert!(policy.log_denied);
+        assert!(policy.allow_dns);
+    }
+
+    #[test]
+    fn test_egress_policy_builder() {
+        let policy = EgressPolicy::deny_all()
+            .with_allowed_cidrs(vec!["10.0.0.0/8".to_string()])
+            .with_allowed_tcp_ports(vec![443, 80])
+            .with_allowed_udp_ports(vec![53]);
+
+        assert_eq!(policy.allowed_cidrs, vec!["10.0.0.0/8"]);
+        assert_eq!(policy.allowed_tcp_ports, vec![443, 80]);
+        assert_eq!(policy.allowed_udp_ports, vec![53]);
+    }
+
+    // --- CIDR validation ---
+
+    #[test]
+    fn test_validate_egress_cidr_valid() {
+        assert!(nucleus::network::validate_egress_cidr("10.0.0.0/8").is_ok());
+        assert!(nucleus::network::validate_egress_cidr("192.168.0.0/16").is_ok());
+    }
+
+    #[test]
+    fn test_validate_egress_cidr_invalid() {
+        assert!(nucleus::network::validate_egress_cidr("not-cidr").is_err());
+        assert!(nucleus::network::validate_egress_cidr("10.0.0.0").is_err());
+    }
+
+    // --- NetworkMode with ContainerConfig ---
+
+    #[test]
+    fn test_container_default_network_is_none() {
+        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
+        assert!(matches!(config.network, NetworkMode::None));
+    }
+
+    #[test]
+    fn test_container_with_bridge_network() {
+        let bridge = BridgeConfig::default().with_public_dns();
+        let config = ContainerConfig::new(
+            Some("test-bridge".to_string()),
+            vec!["/bin/sh".to_string()],
+        )
+        .with_network(NetworkMode::Bridge(bridge));
+
+        assert!(matches!(config.network, NetworkMode::Bridge(_)));
+    }
+
+    #[test]
+    fn test_container_with_egress_policy() {
+        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_egress_policy(
+                EgressPolicy::deny_all()
+                    .with_allowed_tcp_ports(vec![443]),
+            );
+
+        assert!(config.egress_policy.is_some());
+        let policy = config.egress_policy.unwrap();
+        assert_eq!(policy.allowed_tcp_ports, vec![443]);
+    }
+
+    #[test]
+    fn test_host_network_requires_opt_in() {
+        // Host network without allow_host_network should fail for untrusted
+        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_trust_level(TrustLevel::Untrusted)
+            .with_network(NetworkMode::Host)
+            .with_allow_host_network(true)
+            .with_namespaces(NamespaceConfig::minimal());
+
+        let container = nucleus::container::Container::new(config);
+        let result = container.run();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, NucleusError::ConfigError(_)));
+    }
+
+    #[test]
+    fn test_production_mode_rejects_host_network() {
+        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_service_mode(nucleus::container::ServiceMode::Production)
+            .with_network(NetworkMode::Host)
+            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake"))
+            .with_limits(
+                nucleus::resources::ResourceLimits::unlimited()
+                    .with_memory("512M")
+                    .unwrap()
+                    .with_cpu_cores(1.0)
+                    .unwrap(),
+            );
+
+        let err = config.validate_production_mode().unwrap_err();
+        assert!(err.to_string().contains("host network"));
+    }
+}

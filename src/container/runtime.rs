@@ -420,6 +420,34 @@ impl Container {
         cap_mgr.drop_all()?;
         sec_state = sec_state.transition(SecurityState::CapabilitiesDropped)?;
 
+        // 12b. RLIMIT backstop: defense-in-depth against fork bombs and fd exhaustion.
+        // Must be applied BEFORE seccomp, since SYS_setrlimit is not in the allowlist.
+        {
+            let nproc_limit = self.config.limits.pids_max.unwrap_or(512);
+            let rlim_nproc = libc::rlimit {
+                rlim_cur: nproc_limit,
+                rlim_max: nproc_limit,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc) } != 0 {
+                warn!(
+                    "Failed to set RLIMIT_NPROC to {}: {}",
+                    nproc_limit,
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            let rlim_nofile = libc::rlimit {
+                rlim_cur: 1024,
+                rlim_max: 1024,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim_nofile) } != 0 {
+                warn!(
+                    "Failed to set RLIMIT_NOFILE to 1024: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+
         // 13. Apply seccomp filter
         // Security: CapabilitiesDropped -> SeccompApplied
         let mut seccomp_mgr = SeccompManager::new();
@@ -451,33 +479,6 @@ impl Container {
             warn!("Security state not locked; one or more hardening controls are inactive");
         }
         debug!("Security state: {:?}", sec_state);
-
-        // 14b. RLIMIT backstop: defense-in-depth against fork bombs and fd exhaustion
-        {
-            let nproc_limit = self.config.limits.pids_max.unwrap_or(512);
-            let rlim_nproc = libc::rlimit {
-                rlim_cur: nproc_limit,
-                rlim_max: nproc_limit,
-            };
-            if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc) } != 0 {
-                warn!(
-                    "Failed to set RLIMIT_NPROC to {}: {}",
-                    nproc_limit,
-                    std::io::Error::last_os_error()
-                );
-            }
-
-            let rlim_nofile = libc::rlimit {
-                rlim_cur: 1024,
-                rlim_max: 1024,
-            };
-            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim_nofile) } != 0 {
-                warn!(
-                    "Failed to set RLIMIT_NOFILE to 1024: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
 
         // 15. Exec target process
         self.exec_command()?;
@@ -691,19 +692,22 @@ impl Container {
 
     fn wait_for_namespace_ready(ready_read: &OwnedFd, child: Pid) -> Result<u32> {
         let mut pid_buf = [0u8; 4];
-        match read(ready_read.as_raw_fd(), &mut pid_buf) {
-            Ok(4) => Ok(u32::from_ne_bytes(pid_buf)),
-            Ok(0) => Err(NucleusError::ExecError(format!(
-                "Child {} exited before namespace initialization",
-                child
-            ))),
-            Ok(_) => Err(NucleusError::ExecError(
-                "Invalid namespace sync payload from child".to_string(),
-            )),
-            Err(e) => Err(NucleusError::ExecError(format!(
-                "Failed waiting for child namespace setup: {}",
-                e
-            ))),
+        loop {
+            match read(ready_read.as_raw_fd(), &mut pid_buf) {
+                Err(nix::errno::Errno::EINTR) => continue,
+                Ok(4) => return Ok(u32::from_ne_bytes(pid_buf)),
+                Ok(0) => return Err(NucleusError::ExecError(format!(
+                    "Child {} exited before namespace initialization",
+                    child
+                ))),
+                Ok(_) => return Err(NucleusError::ExecError(
+                    "Invalid namespace sync payload from child".to_string(),
+                )),
+                Err(e) => return Err(NucleusError::ExecError(format!(
+                    "Failed waiting for child namespace setup: {}",
+                    e
+                ))),
+            }
         }
     }
 

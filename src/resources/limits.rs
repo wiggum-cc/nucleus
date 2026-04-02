@@ -184,9 +184,9 @@ impl ResourceLimits {
 
     /// Set CPU limit in cores (e.g., 2.5 cores)
     pub fn with_cpu_cores(mut self, cores: f64) -> Result<Self> {
-        if cores <= 0.0 {
+        if cores <= 0.0 || cores.is_nan() || cores.is_infinite() {
             return Err(NucleusError::InvalidResourceLimit(
-                "CPU cores must be positive".to_string(),
+                "CPU cores must be a finite positive number".to_string(),
             ));
         }
         // Convert cores to quota: cores * period

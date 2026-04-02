@@ -50,16 +50,25 @@ impl ContextPopulator {
             })?;
         }
 
-        // Walk source tree and copy
-        self.copy_recursive(&self.source, &self.dest)?;
+        // Walk source tree and copy (depth-limited to prevent stack overflow)
+        self.copy_recursive(&self.source, &self.dest, 0)?;
 
         info!("Successfully populated context");
 
         Ok(())
     }
 
+    /// Maximum directory recursion depth to prevent stack overflow
+    const MAX_RECURSION_DEPTH: u32 = 128;
+
     /// Recursively copy directory contents
-    fn copy_recursive(&self, src: &Path, dst: &Path) -> Result<()> {
+    fn copy_recursive(&self, src: &Path, dst: &Path, depth: u32) -> Result<()> {
+        if depth > Self::MAX_RECURSION_DEPTH {
+            return Err(NucleusError::ContextError(format!(
+                "Maximum directory depth ({}) exceeded at {:?}",
+                Self::MAX_RECURSION_DEPTH, src
+            )));
+        }
         let entries = fs::read_dir(src).map_err(|e| {
             NucleusError::ContextError(format!("Failed to read directory {:?}: {}", src, e))
         })?;
@@ -94,7 +103,7 @@ impl ContextPopulator {
                         dst_path, e
                     ))
                 })?;
-                self.copy_recursive(&src_path, &dst_path)?;
+                self.copy_recursive(&src_path, &dst_path, depth + 1)?;
             } else if metadata.is_file() {
                 // Copy file
                 fs::copy(&src_path, &dst_path).map_err(|e| {

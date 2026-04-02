@@ -47,7 +47,7 @@ pub fn create_dev_nodes(dev_path: &Path, include_tty: bool) -> Result<()> {
 
     for (name, dev_type, major, minor) in devices {
         let path = dev_path.join(name);
-        let mode = Mode::from_bits(0o666).unwrap();
+        let mode = Mode::from_bits_truncate(0o666);
         let dev = makedev(major, minor);
 
         match mknod(&path, dev_type, mode, dev) {
@@ -301,8 +301,16 @@ pub fn mount_procfs(proc_path: &Path, best_effort: bool, read_only: bool) -> Res
 pub fn mask_proc_paths(proc_path: &Path) -> Result<()> {
     info!("Masking sensitive /proc paths");
 
-    // Paths to mask with /dev/null (files)
-    let null_masked = ["kallsyms", "kcore", "sched_debug", "timer_list"];
+    // Paths to mask with /dev/null (files) — matches OCI runtime spec masked paths
+    let null_masked = [
+        "kallsyms",
+        "kcore",
+        "sched_debug",
+        "timer_list",
+        "keys",
+        "latency_stats",
+        "config.gz",
+    ];
 
     // Paths to mask with empty tmpfs (directories)
     let tmpfs_masked = ["acpi", "bus", "irq", "scsi", "sys"];

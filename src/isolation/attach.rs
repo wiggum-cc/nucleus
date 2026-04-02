@@ -106,7 +106,7 @@ impl ContainerAttach {
         // Phase 1: user namespace (must be first)
         for (ns_name, fd) in ns_fds {
             if ns_name == "user" {
-                let ret = unsafe { libc::setns(fd.as_raw_fd(), 0) };
+                let ret = unsafe { libc::setns(fd.as_raw_fd(), libc::CLONE_NEWUSER) };
                 if ret != 0 {
                     let err = std::io::Error::last_os_error();
                     return Err(NucleusError::AttachError(format!(
@@ -128,8 +128,9 @@ impl ContainerAttach {
                 continue; // already joined above
             }
 
+            let nstype = Self::ns_name_to_clone_flag(ns_name);
             let raw_fd = fd.as_raw_fd();
-            let ret = unsafe { libc::setns(raw_fd, 0) };
+            let ret = unsafe { libc::setns(raw_fd, nstype) };
             if ret != 0 {
                 let err = std::io::Error::last_os_error();
                 return Err(NucleusError::AttachError(format!(
@@ -141,7 +142,7 @@ impl ContainerAttach {
         }
 
         if let Some(fd) = pid_ns_fd {
-            let ret = unsafe { libc::setns(fd.as_raw_fd(), 0) };
+            let ret = unsafe { libc::setns(fd.as_raw_fd(), libc::CLONE_NEWPID) };
             if ret != 0 {
                 let err = std::io::Error::last_os_error();
                 return Err(NucleusError::AttachError(format!(
@@ -166,7 +167,23 @@ impl ContainerAttach {
         }
 
         // Change to root directory of the namespace
-        let _ = nix::unistd::chdir("/");
+        nix::unistd::chdir("/").map_err(|e| {
+            NucleusError::AttachError(format!("chdir(\"/\") failed: {}", e))
+        })?;
+
+        // Apply security hardening before exec: no_new_privs + capability drop
+        let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        if ret != 0 {
+            return Err(NucleusError::AttachError(format!(
+                "Failed to set PR_SET_NO_NEW_PRIVS: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        let mut cap_mgr = crate::security::CapabilityManager::new();
+        cap_mgr.drop_all().map_err(|e| {
+            NucleusError::AttachError(format!("Failed to drop capabilities: {}", e))
+        })?;
 
         // Exec the command
         let program = CString::new(command[0].as_str())
@@ -183,6 +200,20 @@ impl ContainerAttach {
             .map_err(|e| NucleusError::AttachError(format!("execve failed: {}", e)))?;
 
         Ok(())
+    }
+
+    fn ns_name_to_clone_flag(name: &str) -> libc::c_int {
+        match name {
+            "user" => libc::CLONE_NEWUSER,
+            "pid" => libc::CLONE_NEWPID,
+            "mnt" => libc::CLONE_NEWNS,
+            "net" => libc::CLONE_NEWNET,
+            "uts" => libc::CLONE_NEWUTS,
+            "ipc" => libc::CLONE_NEWIPC,
+            "cgroup" => libc::CLONE_NEWCGROUP,
+            // Unknown namespace type: use 0 (kernel infers from FD)
+            _ => 0,
+        }
     }
 
     fn wait_for_child(child: Pid) -> Result<i32> {

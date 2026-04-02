@@ -31,6 +31,11 @@ impl BridgeNetwork {
     }
 
     fn setup_for(pid: u32, config: &BridgeConfig, container_id: &str) -> Result<Self> {
+        // Validate all network parameters before using them in shell commands
+        config.validate().map_err(|e| {
+            NucleusError::NetworkError(format!("Invalid bridge configuration: {}", e))
+        })?;
+
         let mut net_state = NetworkState::Unconfigured;
         net_state = net_state.transition(NetworkState::Configuring)?;
 
@@ -190,6 +195,13 @@ impl BridgeNetwork {
     /// Uses iptables OUTPUT chain to restrict outbound connections.
     /// Must be called after bridge setup while the container netns is reachable.
     pub fn apply_egress_policy(&self, pid: u32, policy: &EgressPolicy) -> Result<()> {
+        // Validate egress CIDRs before passing to iptables
+        for cidr in &policy.allowed_cidrs {
+            crate::network::config::validate_egress_cidr(cidr).map_err(|e| {
+                NucleusError::NetworkError(format!("Invalid egress CIDR: {}", e))
+            })?;
+        }
+
         let pid_str = pid.to_string();
 
         // Default policy: drop all OUTPUT (except established/related and loopback)
@@ -469,6 +481,29 @@ impl BridgeNetwork {
             return Ok("10.0.42.2".to_string());
         }
 
+        // Acquire advisory lock to prevent concurrent IP allocation races
+        let alloc_dir = Self::ip_alloc_dir();
+        std::fs::create_dir_all(&alloc_dir).map_err(|e| {
+            NucleusError::NetworkError(format!("Failed to create IP alloc dir: {}", e))
+        })?;
+        let lock_path = alloc_dir.join(".lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| {
+                NucleusError::NetworkError(format!("Failed to open IP alloc lock: {}", e))
+            })?;
+        use std::os::unix::io::AsRawFd;
+        let lock_ret = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+        if lock_ret != 0 {
+            return Err(NucleusError::NetworkError(format!(
+                "Failed to acquire IP alloc lock: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
         // Collect IPs already assigned to other Nucleus containers from state dir
         let reserved = Self::collect_reserved_ips();
 
@@ -482,6 +517,7 @@ impl BridgeNetwork {
                 continue;
             }
             if !Self::is_ip_in_use(&candidate)? {
+                // Lock is released when lock_file is dropped
                 return Ok(candidate);
             }
         }
@@ -536,9 +572,14 @@ impl BridgeNetwork {
         if nix::unistd::Uid::effective().is_root() {
             std::path::PathBuf::from("/var/run/nucleus/ip-alloc")
         } else {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                .join("nucleus/ip-alloc")
+            dirs::runtime_dir()
+                .map(|d| d.join("nucleus/ip-alloc"))
+                .or_else(|| dirs::data_local_dir().map(|d| d.join("nucleus/ip-alloc")))
+                .unwrap_or_else(|| {
+                    dirs::home_dir()
+                        .map(|h| h.join(".nucleus/ip-alloc"))
+                        .unwrap_or_else(|| std::path::PathBuf::from("/var/run/nucleus/ip-alloc"))
+                })
         }
     }
 

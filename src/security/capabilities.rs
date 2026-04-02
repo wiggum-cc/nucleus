@@ -41,8 +41,16 @@ impl CapabilityManager {
             NucleusError::CapabilityError(format!("Failed to clear ambient caps: {}", e))
         })?;
 
+        // Clear bounding set: prevents regaining capabilities through exec of setuid binaries
+        for cap in caps::all() {
+            if let Err(e) = caps::drop(None, CapSet::Bounding, cap) {
+                // Some capabilities may not be in the bounding set; log and continue
+                debug!("Failed to drop bounding cap {:?}: {} (may not be present)", cap, e);
+            }
+        }
+
         self.dropped = true;
-        info!("Successfully dropped all capabilities");
+        info!("Successfully dropped all capabilities (including bounding set)");
 
         Ok(())
     }

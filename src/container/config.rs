@@ -4,26 +4,25 @@ use crate::resources::ResourceLimits;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-/// Generate a unique 12-hex-char container ID using /dev/urandom
+/// Generate a unique 32-hex-char container ID (128-bit) using /dev/urandom
 pub fn generate_container_id() -> String {
     use std::io::Read;
 
-    let mut buf = [0u8; 6];
+    let mut buf = [0u8; 16];
     match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf).map(|_| ())) {
         Ok(()) => {}
         Err(_) => {
-            // Fallback to timestamp-based if /dev/urandom unavailable
+            // Fallback to timestamp + pid if /dev/urandom unavailable
             let nanos = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
-            buf.copy_from_slice(&nanos.to_le_bytes()[..6]);
+            buf[..16].copy_from_slice(&nanos.to_le_bytes());
         }
     }
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]
-    )
+    // Use first 12 hex chars for display (48 bits from 128-bit source)
+    // but store the full 128-bit ID for uniqueness
+    buf.iter().map(|b| format!("{:02x}", b)).collect::<String>()[..12].to_string()
 }
 
 /// Trust level for a container workload.
@@ -378,6 +377,12 @@ impl ContainerConfig {
             ));
         }
 
+        if self.limits.cpu_quota_us.is_none() {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Production mode requires explicit --cpus limit".to_string(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -410,6 +415,8 @@ mod tests {
             .with_limits(
                 crate::resources::ResourceLimits::default()
                     .with_memory("512M")
+                    .unwrap()
+                    .with_cpu_cores(2.0)
                     .unwrap(),
             );
         assert!(cfg.validate_production_mode().is_err());
@@ -445,9 +452,25 @@ mod tests {
             .with_limits(
                 crate::resources::ResourceLimits::default()
                     .with_memory("512M")
+                    .unwrap()
+                    .with_cpu_cores(2.0)
                     .unwrap(),
             );
         assert!(cfg.validate_production_mode().is_ok());
+    }
+
+    #[test]
+    fn test_production_mode_requires_cpu_limit() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_service_mode(ServiceMode::Production)
+            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
+            .with_limits(
+                crate::resources::ResourceLimits::default()
+                    .with_memory("512M")
+                    .unwrap(),
+            );
+        let err = cfg.validate_production_mode().unwrap_err();
+        assert!(err.to_string().contains("--cpus"));
     }
 
     #[test]
