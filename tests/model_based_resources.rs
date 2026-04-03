@@ -8,6 +8,7 @@
 /// - cleanup_guaranteed: Eventually reaches removed state
 /// - no_resource_leak: Removed state is terminal and stable
 use nucleus::resources::CgroupState;
+use nucleus::StateTransition;
 
 #[test]
 fn test_cgroup_state_machine_happy_path() {
@@ -23,7 +24,7 @@ fn test_cgroup_state_machine_happy_path() {
 
     for i in 0..states.len() - 1 {
         assert!(
-            states[i].can_transition_to(states[i + 1]),
+            states[i].can_transition_to(&states[i + 1]),
             "Invalid transition from {:?} to {:?}",
             states[i],
             states[i + 1]

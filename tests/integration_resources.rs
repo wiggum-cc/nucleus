@@ -5,6 +5,7 @@
 #[cfg(test)]
 mod tests {
     use nucleus::resources::{CgroupState, IoDeviceLimit, ResourceLimits, ResourceStats};
+    use nucleus::StateTransition;
     use tempfile::TempDir;
 
     // --- ResourceLimits: memory parsing ---

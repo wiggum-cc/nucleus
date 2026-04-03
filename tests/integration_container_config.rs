@@ -13,6 +13,7 @@ mod tests {
     use nucleus::isolation::NamespaceConfig;
     use nucleus::network::NetworkMode;
     use nucleus::resources::ResourceLimits;
+    use nucleus::StateTransition;
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -232,9 +233,11 @@ mod tests {
 
     #[test]
     fn test_production_mode_valid_config() {
+        let temp_dir = std::env::temp_dir().join("nucleus-test-nix-store-fake-rootfs");
+        std::fs::create_dir_all(&temp_dir).unwrap();
         let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
             .with_service_mode(ServiceMode::Production)
-            .with_rootfs_path(PathBuf::from("/nix/store/fake-rootfs"))
+            .with_rootfs_path(temp_dir)
             .with_verify_rootfs_attestation(true)
             .with_limits(
                 ResourceLimits::unlimited()

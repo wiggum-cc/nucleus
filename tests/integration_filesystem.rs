@@ -5,6 +5,7 @@
 #[cfg(test)]
 mod tests {
     use nucleus::filesystem::{ContextMode, ContextPopulator, FilesystemState, TmpfsMount};
+    use nucleus::StateTransition;
     use std::path::Path;
     use tempfile::TempDir;
 

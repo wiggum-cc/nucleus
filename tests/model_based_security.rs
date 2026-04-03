@@ -8,6 +8,7 @@
 /// - no_privilege_escalation: Cannot return to privileged state after dropping capabilities
 /// - Terminal state stability: Locked state is terminal
 use nucleus::security::SecurityState;
+use nucleus::StateTransition;
 
 #[test]
 fn test_security_state_machine_valid_path() {
@@ -22,7 +23,7 @@ fn test_security_state_machine_valid_path() {
 
     for i in 0..states.len() - 1 {
         assert!(
-            states[i].can_transition_to(states[i + 1]),
+            states[i].can_transition_to(&states[i + 1]),
             "Invalid transition from {:?} to {:?}",
             states[i],
             states[i + 1]
@@ -38,21 +39,21 @@ fn test_security_property_irreversible_lockdown() {
     let state = SecurityState::SeccompApplied;
 
     // Valid transitions
-    assert!(state.can_transition_to(SecurityState::SeccompApplied));
-    assert!(state.can_transition_to(SecurityState::LandlockApplied));
+    assert!(state.can_transition_to(&SecurityState::SeccompApplied));
+    assert!(state.can_transition_to(&SecurityState::LandlockApplied));
 
     // Invalid transitions (cannot skip to locked, cannot go backwards)
-    assert!(!state.can_transition_to(SecurityState::Locked));
-    assert!(!state.can_transition_to(SecurityState::Privileged));
-    assert!(!state.can_transition_to(SecurityState::CapabilitiesDropped));
+    assert!(!state.can_transition_to(&SecurityState::Locked));
+    assert!(!state.can_transition_to(&SecurityState::Privileged));
+    assert!(!state.can_transition_to(&SecurityState::CapabilitiesDropped));
 
     // Landlock also has irreversible lockdown property
     let ll_state = SecurityState::LandlockApplied;
-    assert!(ll_state.can_transition_to(SecurityState::LandlockApplied));
-    assert!(ll_state.can_transition_to(SecurityState::Locked));
-    assert!(!ll_state.can_transition_to(SecurityState::Privileged));
-    assert!(!ll_state.can_transition_to(SecurityState::CapabilitiesDropped));
-    assert!(!ll_state.can_transition_to(SecurityState::SeccompApplied));
+    assert!(ll_state.can_transition_to(&SecurityState::LandlockApplied));
+    assert!(ll_state.can_transition_to(&SecurityState::Locked));
+    assert!(!ll_state.can_transition_to(&SecurityState::Privileged));
+    assert!(!ll_state.can_transition_to(&SecurityState::CapabilitiesDropped));
+    assert!(!ll_state.can_transition_to(&SecurityState::SeccompApplied));
 }
 
 #[test]
@@ -63,10 +64,10 @@ fn test_security_property_no_privilege_escalation() {
     let state = SecurityState::CapabilitiesDropped;
 
     // Cannot go back to privileged
-    assert!(!state.can_transition_to(SecurityState::Privileged));
+    assert!(!state.can_transition_to(&SecurityState::Privileged));
 
     // Valid forward transitions
-    assert!(state.can_transition_to(SecurityState::SeccompApplied));
+    assert!(state.can_transition_to(&SecurityState::SeccompApplied));
 }
 
 #[test]
@@ -79,13 +80,13 @@ fn test_security_property_terminal_stable() {
     assert!(state.is_terminal());
 
     // Cannot transition to any other state
-    assert!(!state.can_transition_to(SecurityState::Privileged));
-    assert!(!state.can_transition_to(SecurityState::CapabilitiesDropped));
-    assert!(!state.can_transition_to(SecurityState::SeccompApplied));
-    assert!(!state.can_transition_to(SecurityState::LandlockApplied));
+    assert!(!state.can_transition_to(&SecurityState::Privileged));
+    assert!(!state.can_transition_to(&SecurityState::CapabilitiesDropped));
+    assert!(!state.can_transition_to(&SecurityState::SeccompApplied));
+    assert!(!state.can_transition_to(&SecurityState::LandlockApplied));
 
     // Can stay in same state (stuttering)
-    assert!(state.can_transition_to(SecurityState::Locked));
+    assert!(state.can_transition_to(&SecurityState::Locked));
 }
 
 #[test]
@@ -183,7 +184,7 @@ fn test_security_all_transitions() {
     for from in &all_states {
         for to in &all_states {
             let should_be_valid = valid_transitions.contains(&(*from, *to));
-            let is_valid = from.can_transition_to(*to);
+            let is_valid = from.can_transition_to(to);
 
             assert_eq!(
                 is_valid, should_be_valid,

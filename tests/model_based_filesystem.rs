@@ -8,6 +8,7 @@
 /// - ephemeral_guarantee: unmounted_final is terminal and stable
 /// - mount_ordering: populated can continue to pivot_root or abort cleanup
 use nucleus::filesystem::FilesystemState;
+use nucleus::StateTransition;
 
 #[test]
 fn test_filesystem_state_machine_happy_path() {
@@ -22,7 +23,7 @@ fn test_filesystem_state_machine_happy_path() {
 
     for i in 0..states.len() - 1 {
         assert!(
-            states[i].can_transition_to(states[i + 1]),
+            states[i].can_transition_to(&states[i + 1]),
             "Invalid transition from {:?} to {:?}",
             states[i],
             states[i + 1]
@@ -38,13 +39,13 @@ fn test_filesystem_property_context_isolation() {
     let state = FilesystemState::Pivoted;
 
     // Valid transitions
-    assert!(state.can_transition_to(FilesystemState::Pivoted)); // stuttering
-    assert!(state.can_transition_to(FilesystemState::UnmountedFinal));
+    assert!(state.can_transition_to(&FilesystemState::Pivoted)); // stuttering
+    assert!(state.can_transition_to(&FilesystemState::UnmountedFinal));
 
     // Invalid transitions
-    assert!(!state.can_transition_to(FilesystemState::Unmounted));
-    assert!(!state.can_transition_to(FilesystemState::Mounted));
-    assert!(!state.can_transition_to(FilesystemState::Populated));
+    assert!(!state.can_transition_to(&FilesystemState::Unmounted));
+    assert!(!state.can_transition_to(&FilesystemState::Mounted));
+    assert!(!state.can_transition_to(&FilesystemState::Populated));
 }
 
 #[test]
@@ -57,13 +58,13 @@ fn test_filesystem_property_ephemeral_guarantee() {
     assert!(state.is_terminal());
 
     // Cannot transition to any other state
-    assert!(!state.can_transition_to(FilesystemState::Unmounted));
-    assert!(!state.can_transition_to(FilesystemState::Mounted));
-    assert!(!state.can_transition_to(FilesystemState::Populated));
-    assert!(!state.can_transition_to(FilesystemState::Pivoted));
+    assert!(!state.can_transition_to(&FilesystemState::Unmounted));
+    assert!(!state.can_transition_to(&FilesystemState::Mounted));
+    assert!(!state.can_transition_to(&FilesystemState::Populated));
+    assert!(!state.can_transition_to(&FilesystemState::Pivoted));
 
     // Can stay in same state
-    assert!(state.can_transition_to(FilesystemState::UnmountedFinal));
+    assert!(state.can_transition_to(&FilesystemState::UnmountedFinal));
 }
 
 #[test]
@@ -74,33 +75,33 @@ fn test_filesystem_property_mount_ordering() {
     let state = FilesystemState::Populated;
 
     // Valid transitions
-    assert!(state.can_transition_to(FilesystemState::Populated)); // stuttering
-    assert!(state.can_transition_to(FilesystemState::Pivoted));
-    assert!(state.can_transition_to(FilesystemState::Unmounted));
+    assert!(state.can_transition_to(&FilesystemState::Populated)); // stuttering
+    assert!(state.can_transition_to(&FilesystemState::Pivoted));
+    assert!(state.can_transition_to(&FilesystemState::Unmounted));
 
     // Invalid transitions - cannot move to mounted or skip directly to final
-    assert!(!state.can_transition_to(FilesystemState::Mounted));
-    assert!(!state.can_transition_to(FilesystemState::UnmountedFinal));
+    assert!(!state.can_transition_to(&FilesystemState::Mounted));
+    assert!(!state.can_transition_to(&FilesystemState::UnmountedFinal));
 }
 
 #[test]
 fn test_filesystem_no_state_skipping() {
     // Cannot skip intermediate states
 
-    assert!(!FilesystemState::Unmounted.can_transition_to(FilesystemState::Populated));
-    assert!(!FilesystemState::Unmounted.can_transition_to(FilesystemState::Pivoted));
-    assert!(!FilesystemState::Mounted.can_transition_to(FilesystemState::Pivoted));
-    assert!(!FilesystemState::Mounted.can_transition_to(FilesystemState::UnmountedFinal));
+    assert!(!FilesystemState::Unmounted.can_transition_to(&FilesystemState::Populated));
+    assert!(!FilesystemState::Unmounted.can_transition_to(&FilesystemState::Pivoted));
+    assert!(!FilesystemState::Mounted.can_transition_to(&FilesystemState::Pivoted));
+    assert!(!FilesystemState::Mounted.can_transition_to(&FilesystemState::UnmountedFinal));
 }
 
 #[test]
 fn test_filesystem_no_backwards_transitions() {
     // Cannot move backwards once the root has been pivoted or finalized.
 
-    assert!(FilesystemState::Mounted.can_transition_to(FilesystemState::Unmounted));
-    assert!(!FilesystemState::Populated.can_transition_to(FilesystemState::Mounted));
-    assert!(!FilesystemState::Pivoted.can_transition_to(FilesystemState::Populated));
-    assert!(!FilesystemState::UnmountedFinal.can_transition_to(FilesystemState::Pivoted));
+    assert!(FilesystemState::Mounted.can_transition_to(&FilesystemState::Unmounted));
+    assert!(!FilesystemState::Populated.can_transition_to(&FilesystemState::Mounted));
+    assert!(!FilesystemState::Pivoted.can_transition_to(&FilesystemState::Populated));
+    assert!(!FilesystemState::UnmountedFinal.can_transition_to(&FilesystemState::Pivoted));
 }
 
 #[test]

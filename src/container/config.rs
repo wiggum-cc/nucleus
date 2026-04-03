@@ -628,14 +628,6 @@ impl ContainerConfig {
             ));
         }
 
-        // Verify rootfs exists
-        if !rootfs_path.exists() {
-            return Err(crate::error::NucleusError::ConfigError(format!(
-                "Production mode rootfs path does not exist: {:?}",
-                rootfs_path
-            )));
-        }
-
         if self.seccomp_mode == SeccompMode::Trace {
             return Err(crate::error::NucleusError::ConfigError(
                 "Production mode forbids --seccomp-mode trace".to_string(),
@@ -659,6 +651,14 @@ impl ContainerConfig {
             return Err(crate::error::NucleusError::ConfigError(
                 "Production mode requires --verify-rootfs-attestation".to_string(),
             ));
+        }
+
+        // Verify rootfs exists (checked last, after config invariants)
+        if !rootfs_path.exists() {
+            return Err(crate::error::NucleusError::ConfigError(format!(
+                "Production mode rootfs path does not exist: {:?}",
+                rootfs_path
+            )));
         }
 
         Ok(())

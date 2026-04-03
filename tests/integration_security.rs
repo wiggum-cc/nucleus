@@ -6,6 +6,7 @@
 mod tests {
     use nucleus::resources::ResourceLimits;
     use nucleus::security::{GVisorRuntime, OciBundle, OciConfig, SecurityState};
+    use nucleus::StateTransition;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
@@ -236,7 +237,10 @@ mod tests {
             .with_inmemory_secret_mounts(stage_dir.path(), &staged)
             .unwrap();
 
-        assert!(config.mounts.iter().any(|m| m.destination == "/run/secrets"));
+        assert!(config
+            .mounts
+            .iter()
+            .any(|m| m.destination == "/run/secrets"));
         assert!(config.mounts.iter().any(|m| {
             m.destination == "/etc/tls/cert.pem" && m.source.ends_with("etc/tls/cert.pem")
         }));

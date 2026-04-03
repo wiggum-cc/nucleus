@@ -8,6 +8,7 @@
 /// - cleanup_happens: If entered, eventually cleaned
 /// - Terminal state stability: Cleaned state is terminal
 use nucleus::isolation::NamespaceState;
+use nucleus::StateTransition;
 
 #[test]
 fn test_namespace_state_machine_valid_path() {
@@ -21,7 +22,7 @@ fn test_namespace_state_machine_valid_path() {
 
     for i in 0..states.len() - 1 {
         assert!(
-            states[i].can_transition_to(states[i + 1]),
+            states[i].can_transition_to(&states[i + 1]),
             "Invalid transition from {:?} to {:?}",
             states[i],
             states[i + 1]
