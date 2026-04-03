@@ -19,7 +19,8 @@ const DENIED_CLONE_NAMESPACE_FLAGS: u64 = (libc::CLONE_NEWUSER
     | libc::CLONE_NEWIPC
     | libc::CLONE_NEWUTS
     | libc::CLONE_NEWPID
-    | libc::CLONE_NEWCGROUP) as u64;
+    | libc::CLONE_NEWCGROUP
+    | libc::CLONE_NEWTIME) as u64;
 
 impl SeccompManager {
     pub fn new() -> Self {
@@ -315,24 +316,15 @@ impl SeccompManager {
 
         // mprotect: permit RW or RX transitions, but reject PROT_WRITE|PROT_EXEC.
         let mut mprotect_rules = Vec::new();
-        for allowed in [
-            0,
-            libc::PROT_WRITE as u64,
-            libc::PROT_EXEC as u64,
-        ] {
+        for allowed in [0, libc::PROT_WRITE as u64, libc::PROT_EXEC as u64] {
             let condition = SeccompCondition::new(
                 2, // arg2 is prot for mprotect(addr, len, prot)
                 seccompiler::SeccompCmpArgLen::Dword,
-                seccompiler::SeccompCmpOp::MaskedEq(
-                    (libc::PROT_WRITE | libc::PROT_EXEC) as u64,
-                ),
+                seccompiler::SeccompCmpOp::MaskedEq((libc::PROT_WRITE | libc::PROT_EXEC) as u64),
                 allowed,
             )
             .map_err(|e| {
-                NucleusError::SeccompError(format!(
-                    "Failed to create mprotect condition: {}",
-                    e
-                ))
+                NucleusError::SeccompError(format!("Failed to create mprotect condition: {}", e))
             })?;
             let rule = SeccompRule::new(vec![condition]).map_err(|e| {
                 NucleusError::SeccompError(format!("Failed to create mprotect rule: {}", e))
@@ -981,6 +973,15 @@ mod tests {
         assert_ne!(
             DENIED_CLONE_NAMESPACE_FLAGS & libc::CLONE_NEWCGROUP as u64,
             0
+        );
+    }
+
+    #[test]
+    fn test_clone_denied_flags_include_newtime() {
+        assert_ne!(
+            DENIED_CLONE_NAMESPACE_FLAGS & libc::CLONE_NEWTIME as u64,
+            0,
+            "CLONE_NEWTIME must be in denied clone namespace flags"
         );
     }
 

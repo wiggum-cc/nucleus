@@ -1,4 +1,4 @@
-use crate::error::{NucleusError, Result};
+use crate::error::{NucleusError, Result, StateTransition};
 use crate::resources::{CgroupState, ResourceLimits};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -210,14 +210,21 @@ mod tests {
                 '{' => depth += 1,
                 '}' => {
                     depth -= 1;
-                    if depth == 0 { fn_end = open + i + 1; break; }
+                    if depth == 0 {
+                        fn_end = open + i + 1;
+                        break;
+                    }
                 }
                 _ => {}
             }
         }
         let cleanup_body = &after[..fn_end];
-        let removed_pos = cleanup_body.find("Removed").expect("must reference Removed state");
-        let remove_dir_pos = cleanup_body.find("remove_dir").expect("must call remove_dir");
+        let removed_pos = cleanup_body
+            .find("Removed")
+            .expect("must reference Removed state");
+        let remove_dir_pos = cleanup_body
+            .find("remove_dir")
+            .expect("must call remove_dir");
         assert!(
             removed_pos > remove_dir_pos,
             "CgroupState::Removed must be set AFTER remove_dir succeeds, not before"

@@ -1,4 +1,4 @@
-use crate::error::{NucleusError, Result};
+use crate::error::{NucleusError, Result, StateTransition};
 use crate::network::config::{BridgeConfig, EgressPolicy, PortForward};
 use crate::network::NetworkState;
 use std::process::Command;
@@ -415,7 +415,16 @@ impl BridgeNetwork {
                 // Try to remove it; if it fails, it may be actively used
                 let _ = Self::run_cmd(
                     "iptables",
-                    &["-t", "nat", "-D", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE"],
+                    &[
+                        "-t",
+                        "nat",
+                        "-D",
+                        "POSTROUTING",
+                        "-s",
+                        subnet,
+                        "-j",
+                        "MASQUERADE",
+                    ],
                 );
                 orphaned_count += 1;
             }
@@ -501,7 +510,9 @@ impl BridgeNetwork {
         let mut rand_buf = [0u8; 32];
         std::fs::File::open("/dev/urandom")
             .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut rand_buf))
-            .map_err(|e| NucleusError::NetworkError(format!("Failed to read /dev/urandom: {}", e)))?;
+            .map_err(|e| {
+                NucleusError::NetworkError(format!("Failed to read /dev/urandom: {}", e))
+            })?;
         for &byte in &rand_buf {
             // Rejection sampling: discard values that would cause modulo bias
             if byte >= 253 {
@@ -765,9 +776,69 @@ impl BridgeNetwork {
 
     /// Bind-mount a resolv.conf over a read-only /etc (for production rootfs mode).
     ///
-    /// Writes the resolver config to a tmpfile then bind-mounts it over
+    /// Creates a memfd-backed resolv.conf and bind-mounts it over
     /// /etc/resolv.conf so it works even when the rootfs /etc is read-only.
+    /// The memfd is cleaned up when the container exits.
     pub fn bind_mount_resolv_conf(root: &std::path::Path, dns: &[String]) -> Result<()> {
+        use nix::mount::{mount, MsFlags};
+
+        let content: String = dns
+            .iter()
+            .map(|server| format!("nameserver {}\n", server))
+            .collect();
+
+        // Create a memfd-backed file to avoid leaving staging files on disk
+        let memfd_name = std::ffi::CString::new("nucleus-resolv").map_err(|e| {
+            NucleusError::NetworkError(format!("Failed to create memfd name: {}", e))
+        })?;
+        let memfd_fd = unsafe { libc::memfd_create(memfd_name.as_ptr(), 0) };
+        if memfd_fd < 0 {
+            // Fallback to staging file if memfd_create is unavailable
+            return Self::bind_mount_resolv_conf_staging(root, dns);
+        }
+
+        // Write content to memfd
+        let write_result = unsafe {
+            libc::write(
+                memfd_fd,
+                content.as_ptr() as *const libc::c_void,
+                content.len(),
+            )
+        };
+        if write_result < 0 {
+            unsafe { libc::close(memfd_fd) };
+            return Self::bind_mount_resolv_conf_staging(root, dns);
+        }
+
+        // Ensure the mount target exists
+        let target = root.join("etc/resolv.conf");
+        if !target.exists() {
+            let _ = std::fs::write(&target, "");
+        }
+
+        // Bind mount the memfd over the read-only resolv.conf
+        let memfd_path = format!("/proc/self/fd/{}", memfd_fd);
+        mount(
+            Some(memfd_path.as_str()),
+            &target,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            unsafe { libc::close(memfd_fd) };
+            NucleusError::NetworkError(format!("Failed to bind mount resolv.conf: {}", e))
+        })?;
+
+        // Close the fd — the mount keeps the file alive
+        unsafe { libc::close(memfd_fd) };
+
+        info!("Bind-mounted resolv.conf for bridge networking (rootfs mode, memfd)");
+        Ok(())
+    }
+
+    /// Fallback: bind-mount a staging resolv.conf file.
+    fn bind_mount_resolv_conf_staging(root: &std::path::Path, dns: &[String]) -> Result<()> {
         use nix::mount::{mount, MsFlags};
 
         let content: String = dns
@@ -777,12 +848,19 @@ impl BridgeNetwork {
 
         // Write to a staging file outside /etc
         let staging = root.join("tmp/.resolv.conf.nucleus");
+        if let Some(parent) = staging.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                NucleusError::NetworkError(format!(
+                    "Failed to create resolv.conf staging parent: {}",
+                    e
+                ))
+            })?;
+        }
         std::fs::write(&staging, content).map_err(|e| {
             NucleusError::NetworkError(format!("Failed to write staging resolv.conf: {}", e))
         })?;
 
-        // Ensure the mount target exists (rootfs should provide /etc/resolv.conf,
-        // but create an empty file if not)
+        // Ensure the mount target exists
         let target = root.join("etc/resolv.conf");
         if !target.exists() {
             let _ = std::fs::write(&target, "");
@@ -800,7 +878,7 @@ impl BridgeNetwork {
             NucleusError::NetworkError(format!("Failed to bind mount resolv.conf: {}", e))
         })?;
 
-        info!("Bind-mounted resolv.conf for bridge networking (rootfs mode)");
+        info!("Bind-mounted resolv.conf for bridge networking (rootfs mode, staging)");
         Ok(())
     }
 }
@@ -848,12 +926,17 @@ impl Drop for SetupRollback {
         for (container_ip, pf) in self.port_forwards.iter().rev() {
             for chain in ["OUTPUT", "PREROUTING"] {
                 let args = BridgeNetwork::port_forward_rule_args("-D", chain, container_ip, pf);
-                let _ = BridgeNetwork::run_cmd_owned("iptables", &args);
+                if let Err(e) = BridgeNetwork::run_cmd_owned("iptables", &args) {
+                    warn!(
+                        "Rollback: failed to remove iptables {} rule for {}: {}",
+                        chain, container_ip, e
+                    );
+                }
             }
         }
 
         if self.nat_added {
-            let _ = BridgeNetwork::run_cmd(
+            if let Err(e) = BridgeNetwork::run_cmd(
                 "iptables",
                 &[
                     "-t",
@@ -865,11 +948,15 @@ impl Drop for SetupRollback {
                     "-j",
                     "MASQUERADE",
                 ],
-            );
+            ) {
+                warn!("Rollback: failed to remove NAT rule: {}", e);
+            }
         }
 
         if self.veth_created {
-            let _ = BridgeNetwork::run_cmd("ip", &["link", "del", &self.veth_host]);
+            if let Err(e) = BridgeNetwork::run_cmd("ip", &["link", "del", &self.veth_host]) {
+                warn!("Rollback: failed to delete veth {}: {}", self.veth_host, e);
+            }
         }
 
         if let Some((alloc_dir, container_id)) = &self.reserved_ip {
@@ -888,7 +975,11 @@ mod tests {
         // and that values >= 253 are rejected (no modulo bias).
         for byte in 0u8..253 {
             let offset = byte as u32 + 2;
-            assert!((2..=254).contains(&offset), "offset {} out of range", offset);
+            assert!(
+                (2..=254).contains(&offset),
+                "offset {} out of range",
+                offset
+            );
         }
         // Values 253, 254, 255 must be rejected
         for byte in [253u8, 254, 255] {
@@ -901,13 +992,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         BridgeNetwork::record_allocated_ip_in_dir(temp.path(), "one", "10.0.42.2").unwrap();
 
-        let err = BridgeNetwork::reserve_ip_in_dir(
-            temp.path(),
-            "two",
-            "10.0.42.0/24",
-            Some("10.0.42.2"),
-        )
-        .unwrap_err();
+        let err =
+            BridgeNetwork::reserve_ip_in_dir(temp.path(), "two", "10.0.42.0/24", Some("10.0.42.2"))
+                .unwrap_err();
         assert!(
             err.to_string().contains("already in use"),
             "second reservation of the same IP must fail"
@@ -946,13 +1033,16 @@ mod tests {
             protocol: "tcp".to_string(),
         };
 
-        let prerouting = BridgeNetwork::port_forward_rule_args("-A", "PREROUTING", "10.0.42.2", &pf);
+        let prerouting =
+            BridgeNetwork::port_forward_rule_args("-A", "PREROUTING", "10.0.42.2", &pf);
         let output = BridgeNetwork::port_forward_rule_args("-A", "OUTPUT", "10.0.42.2", &pf);
 
         assert!(prerouting.iter().any(|arg| arg == "PREROUTING"));
         assert!(output.iter().any(|arg| arg == "OUTPUT"));
         assert!(
-            output.windows(2).any(|pair| pair[0] == "--dst-type" && pair[1] == "LOCAL"),
+            output
+                .windows(2)
+                .any(|pair| pair[0] == "--dst-type" && pair[1] == "LOCAL"),
             "OUTPUT rule must target local-destination traffic"
         );
     }

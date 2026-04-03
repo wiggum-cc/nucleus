@@ -12,6 +12,7 @@ use crate::isolation::{NamespaceCommandRunner, NamespaceProbe};
 use crate::topology::config::{ServiceDef, TopologyConfig};
 use crate::topology::dag::DependencyGraph;
 use std::collections::BTreeMap;
+use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -181,7 +182,7 @@ pub fn execute_reconcile(
                         service_name
                     ))
                 })?;
-                let args = build_service_run_args(svc, &container_name, desired_hash);
+                let args = build_service_run_args(svc, &container_name, desired_hash)?;
 
                 // Spawn the container as a background process
                 // Fail hard if current_exe() fails instead of falling back to
@@ -229,7 +230,7 @@ fn build_service_run_args(
     svc: &ServiceDef,
     container_name: &str,
     desired_hash: u64,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
     let mut args = vec![
         "nucleus".to_string(),
         "create".to_string(),
@@ -276,9 +277,12 @@ fn build_service_run_args(
         args.push(pf.clone());
     }
 
-    for secret in &svc.secrets {
-        args.push("--secret".to_string());
-        args.push(secret.clone());
+    // C-2: Write secrets to a secure temp file instead of passing via CLI args.
+    // Secrets on the command line are visible in /proc/<pid>/cmdline to any user.
+    if !svc.secrets.is_empty() {
+        let secrets_file = write_secrets_file(container_name, &svc.secrets)?;
+        args.push("--secrets-file".to_string());
+        args.push(secrets_file);
     }
 
     for (key, value) in &svc.environment {
@@ -302,8 +306,8 @@ fn build_service_run_args(
     if let Some(ref hooks) = svc.hooks {
         if !hooks.is_empty() {
             if let Ok(hooks_json) = serde_json::to_string(hooks) {
-                let hooks_path = std::env::temp_dir()
-                    .join(format!("nucleus-hooks-{}.json", container_name));
+                let hooks_path =
+                    std::env::temp_dir().join(format!("nucleus-hooks-{}.json", container_name));
                 if std::fs::write(&hooks_path, hooks_json).is_ok() {
                     args.push("--hooks".to_string());
                     args.push(hooks_path.to_string_lossy().to_string());
@@ -315,7 +319,48 @@ fn build_service_run_args(
     args.push("--sd-notify".to_string());
     args.push("--".to_string());
     args.extend(svc.command.clone());
-    args
+    Ok(args)
+}
+
+/// Write secrets to a secure temp file (mode 0o600) and return the path.
+///
+/// The child process reads secrets from this file instead of receiving them
+/// via CLI arguments, which would be visible in /proc/<pid>/cmdline.
+fn write_secrets_file(container_name: &str, secrets: &[String]) -> Result<String> {
+    let secrets_path = std::env::temp_dir().join(format!("nucleus-secrets-{}.txt", container_name));
+
+    // Open with restrictive permissions (owner read/write only)
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&secrets_path)
+        .map_err(|e| {
+            NucleusError::ConfigError(format!(
+                "Failed to create secrets file for {}: {}",
+                container_name, e
+            ))
+        })?;
+
+    use std::io::Write;
+    let mut writer = std::io::BufWriter::new(file);
+    for secret in secrets {
+        writeln!(writer, "{}", secret).map_err(|e| {
+            NucleusError::ConfigError(format!(
+                "Failed to write secrets file for {}: {}",
+                container_name, e
+            ))
+        })?;
+    }
+    writer.flush().map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Failed to flush secrets file for {}: {}",
+            container_name, e
+        ))
+    })?;
+
+    Ok(secrets_path.to_string_lossy().to_string())
 }
 
 fn post_start_wait(graph: &DependencyGraph, service_name: &str) -> PostStartWait {
@@ -404,25 +449,30 @@ fn wait_for_healthy(
     }
 }
 
-/// Characters that are unsafe in shell commands passed to `sh -c`.
-/// Reject these to prevent command injection via topology config.
-const UNSAFE_HEALTH_CHECK_CHARS: &[char] = &[
-    ';', '&', '|', '$', '`', '(', ')', '{', '}', '<', '>', '!', '\\', '\n', '\r', '\0',
+/// Characters that are safe in shell commands passed to `sh -c`.
+/// Only allow these characters — everything else is rejected.
+const SAFE_HEALTH_CHECK_CHARS: &[char] = &[
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's',
+    't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L',
+    'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '0', '1', '2', '3', '4',
+    '5', '6', '7', '8', '9', ' ', '-', '_', '.', '/', ':', '@', '=', '?',
 ];
 
-/// Validate that a health check command does not contain shell metacharacters
-/// that could enable command injection.
+/// Validate that a health check command contains only safe characters.
+/// Uses an allowlist approach — only alphanumeric, spaces, and a few
+/// safe punctuation marks are permitted.
 fn validate_health_check_command(command: &str) -> Result<()> {
     if command.is_empty() {
         return Err(NucleusError::ConfigError(
             "Health check command must not be empty".to_string(),
         ));
     }
-    for ch in UNSAFE_HEALTH_CHECK_CHARS {
-        if command.contains(*ch) {
+    for ch in command.chars() {
+        if !SAFE_HEALTH_CHECK_CHARS.contains(&ch) {
             return Err(NucleusError::ConfigError(format!(
-                "Health check command contains unsafe character '{}': {}",
+                "Health check command contains unsafe character '{}' (code point U+{:04X}): {}",
                 ch.escape_default(),
+                ch as u32,
                 command
             )));
         }
@@ -430,7 +480,12 @@ fn validate_health_check_command(command: &str) -> Result<()> {
     Ok(())
 }
 
-fn health_check_passes(pid: u32, rootless: bool, using_gvisor: bool, command: &str) -> Result<bool> {
+fn health_check_passes(
+    pid: u32,
+    rootless: bool,
+    using_gvisor: bool,
+    command: &str,
+) -> Result<bool> {
     validate_health_check_command(command)?;
 
     NamespaceCommandRunner::run(
@@ -559,7 +614,7 @@ memory = "256M"
 "#;
         let config = TopologyConfig::from_toml(toml).unwrap();
         let svc = config.services.get("web").unwrap();
-        let args = build_service_run_args(svc, "test-web", 42);
+        let args = build_service_run_args(svc, "test-web", 42).unwrap();
 
         assert!(args
             .windows(2)
@@ -569,31 +624,37 @@ memory = "256M"
 
     #[test]
     fn test_health_check_rejects_shell_metacharacters() {
-        // H-4: health check commands must not contain shell injection chars
+        // H-4: health check commands must only contain allowlisted characters
         assert!(validate_health_check_command("pg_isready").is_ok());
         assert!(validate_health_check_command("curl -f http://localhost:8080/health").is_ok());
 
-        // Semicolon injection
+        // Semicolon injection — not in allowlist
         assert!(validate_health_check_command("pg_isready; rm -rf /").is_err());
-        // Pipe injection
+        // Pipe — not in allowlist
         assert!(validate_health_check_command("echo test | sh").is_err());
-        // Command substitution
+        // Command substitution — not in allowlist
         assert!(validate_health_check_command("$(cat /etc/shadow)").is_err());
-        // Backtick substitution
+        // Backtick — not in allowlist
         assert!(validate_health_check_command("`cat /etc/shadow`").is_err());
-        // Background
+        // Dollar sign — not in allowlist
+        assert!(validate_health_check_command("$HOME").is_err());
+        // Background ampersand — not in allowlist
         assert!(validate_health_check_command("malware &").is_err());
         // Empty
         assert!(validate_health_check_command("").is_err());
+        // Newline — not in allowlist
+        assert!(validate_health_check_command("test\ngood").is_err());
     }
 
     /// Extract the body of a function from source text by brace-matching,
     /// avoiding fragile hardcoded character-window offsets (SEC-MED-03).
     fn extract_fn_body<'a>(source: &'a str, fn_signature: &str) -> &'a str {
-        let fn_start = source.find(fn_signature)
+        let fn_start = source
+            .find(fn_signature)
             .unwrap_or_else(|| panic!("function '{}' not found in source", fn_signature));
         let after = &source[fn_start..];
-        let open = after.find('{')
+        let open = after
+            .find('{')
             .unwrap_or_else(|| panic!("no opening brace found for '{}'", fn_signature));
         let mut depth = 0u32;
         let mut end = open;
@@ -602,7 +663,10 @@ memory = "256M"
                 '{' => depth += 1,
                 '}' => {
                     depth -= 1;
-                    if depth == 0 { end = open + i + 1; break; }
+                    if depth == 0 {
+                        end = open + i + 1;
+                        break;
+                    }
                 }
                 _ => {}
             }
@@ -652,10 +716,15 @@ memory = "256M"
         let plan = plan_reconcile(&config, &state_mgr).unwrap();
 
         // The plan must include a Stop action for "db"
-        let stop_actions: Vec<_> = plan.actions.iter()
+        let stop_actions: Vec<_> = plan
+            .actions
+            .iter()
             .filter(|(_, a)| *a == ReconcileAction::Stop)
             .collect();
-        assert!(!stop_actions.is_empty(), "removed services must have Stop action");
+        assert!(
+            !stop_actions.is_empty(),
+            "removed services must have Stop action"
+        );
         assert_eq!(stop_actions[0].0, "db");
     }
 }

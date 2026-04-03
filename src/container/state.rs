@@ -261,15 +261,13 @@ impl ContainerStateManager {
     pub fn with_state_dir(state_dir: PathBuf) -> Result<Self> {
         Self::reject_symlink_path(&state_dir)?;
 
-        // Create state directory if it doesn't exist
-        if !state_dir.exists() {
-            fs::create_dir_all(&state_dir).map_err(|e| {
-                NucleusError::ConfigError(format!(
-                    "Failed to create state directory {:?}: {}",
-                    state_dir, e
-                ))
-            })?;
-        }
+        // Create state directory if it doesn't exist (idempotent)
+        fs::create_dir_all(&state_dir).map_err(|e| {
+            NucleusError::ConfigError(format!(
+                "Failed to create state directory {:?}: {}",
+                state_dir, e
+            ))
+        })?;
         Self::reject_symlink_path(&state_dir)?;
         Self::ensure_secure_state_dir_permissions(&state_dir)?;
         Self::ensure_state_dir_writable(&state_dir)?;
@@ -517,7 +515,9 @@ impl ContainerStateManager {
     }
 
     /// Read a file with O_NOFOLLOW to prevent symlink attacks.
-    pub fn read_file_nofollow(path: &std::path::Path) -> std::result::Result<String, std::io::Error> {
+    pub fn read_file_nofollow(
+        path: &std::path::Path,
+    ) -> std::result::Result<String, std::io::Error> {
         use std::io::Read;
         let file = OpenOptions::new()
             .read(true)
@@ -549,11 +549,20 @@ impl ContainerStateManager {
     pub fn delete_state(&self, container_id: &str) -> Result<()> {
         let path = self.state_file_path(container_id)?;
 
-        if path.exists() {
-            fs::remove_file(&path).map_err(|e| {
-                NucleusError::ConfigError(format!("Failed to delete state file {:?}: {}", path, e))
-            })?;
-            debug!("Deleted container state: {}", container_id);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                debug!("Deleted container state: {}", container_id);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Already deleted — idempotent (handles TOCTOU race)
+                debug!("Container state already deleted: {}", container_id);
+            }
+            Err(e) => {
+                return Err(NucleusError::ConfigError(format!(
+                    "Failed to delete state file {:?}: {}",
+                    path, e
+                )));
+            }
         }
 
         Ok(())
@@ -855,7 +864,10 @@ mod tests {
 
         // save_state should fail because O_NOFOLLOW rejects the symlink
         let result = mgr.save_state(&state);
-        assert!(result.is_err(), "save_state must reject symlinks at tmp path");
+        assert!(
+            result.is_err(),
+            "save_state must reject symlinks at tmp path"
+        );
     }
 
     #[test]
@@ -896,7 +908,10 @@ mod tests {
         );
         // Non-existent PID should gracefully return 0 (after retries)
         let bogus_ticks = ContainerState::read_start_ticks(u32::MAX);
-        assert_eq!(bogus_ticks, 0, "read_start_ticks must return 0 for non-existent PID");
+        assert_eq!(
+            bogus_ticks, 0,
+            "read_start_ticks must return 0 for non-existent PID"
+        );
     }
 
     #[test]
@@ -905,6 +920,9 @@ mod tests {
         let (mgr, _temp_dir) = temp_state_manager();
         // Delete a state that doesn't exist — should succeed (idempotent)
         let result = mgr.delete_state("nonexistent-id");
-        assert!(result.is_ok(), "delete_state must be idempotent for missing files");
+        assert!(
+            result.is_ok(),
+            "delete_state must be idempotent for missing files"
+        );
     }
 }

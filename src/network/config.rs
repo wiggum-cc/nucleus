@@ -95,6 +95,15 @@ fn validate_ipv4_addr(s: &str) -> Result<(), String> {
         return Err(format!("Invalid IPv4 address: '{}'", s));
     }
     for part in &parts {
+        if part.is_empty() {
+            return Err(format!("Invalid IPv4 address: '{}'", s));
+        }
+        if part.len() > 1 && part.starts_with('0') {
+            return Err(format!(
+                "Invalid IPv4 address: '{}' — octet '{}' has leading zero",
+                s, part
+            ));
+        }
         match part.parse::<u8>() {
             Ok(_) => {}
             Err(_) => return Err(format!("Invalid IPv4 address: '{}'", s)),
@@ -247,5 +256,27 @@ mod tests {
         assert!(PortForward::parse("8080").is_err());
         assert!(PortForward::parse("abc:80").is_err());
         assert!(PortForward::parse("8080:abc").is_err());
+    }
+
+    #[test]
+    fn test_validate_ipv4_addr_rejects_leading_zeros() {
+        assert!(validate_ipv4_addr("10.0.42.1").is_ok());
+        assert!(validate_ipv4_addr("0.0.0.0").is_ok());
+        assert!(
+            validate_ipv4_addr("010.0.0.1").is_err(),
+            "leading zero in first octet must be rejected"
+        );
+        assert!(
+            validate_ipv4_addr("10.01.0.1").is_err(),
+            "leading zero in second octet must be rejected"
+        );
+        assert!(
+            validate_ipv4_addr("10.0.01.1").is_err(),
+            "leading zero in third octet must be rejected"
+        );
+        assert!(
+            validate_ipv4_addr("10.0.0.01").is_err(),
+            "leading zero in fourth octet must be rejected"
+        );
     }
 }

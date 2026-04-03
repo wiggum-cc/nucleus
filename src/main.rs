@@ -429,7 +429,11 @@ enum ComposeCommands {
 
 /// Truncate a container ID to 12 chars for display.
 fn truncate_id(id: &str) -> &str {
-    if id.len() > 12 { &id[..12] } else { id }
+    if id.len() > 12 {
+        &id[..12]
+    } else {
+        id
+    }
 }
 
 fn main() -> Result<()> {
@@ -1060,8 +1064,8 @@ fn main() -> Result<()> {
                 let hooks_json = std::fs::read_to_string(&hooks_path).map_err(|e| {
                     anyhow::anyhow!("Failed to read hooks file '{}': {}", hooks_path, e)
                 })?;
-                let oci_hooks: nucleus::security::OciHooks =
-                    serde_json::from_str(&hooks_json).map_err(|e| {
+                let oci_hooks: nucleus::security::OciHooks = serde_json::from_str(&hooks_json)
+                    .map_err(|e| {
                         anyhow::anyhow!("Failed to parse hooks file '{}': {}", hooks_path, e)
                     })?;
                 config.hooks = Some(oci_hooks);
@@ -1281,13 +1285,19 @@ fn init_tracing() -> Result<()> {
     Ok(())
 }
 
-fn apply_runtime_selection(mut config: ContainerConfig, runtime: &str, oci: bool) -> Result<ContainerConfig> {
+fn apply_runtime_selection(
+    mut config: ContainerConfig,
+    runtime: &str,
+    oci: bool,
+) -> Result<ContainerConfig> {
     match runtime {
         "native" => {
             if oci {
                 anyhow::bail!("--bundle requires gVisor runtime; use --runtime gvisor");
             }
-            config = config.with_gvisor(false).with_trust_level(TrustLevel::Trusted);
+            config = config
+                .with_gvisor(false)
+                .with_trust_level(TrustLevel::Trusted);
         }
         "gvisor" => {
             config = config.with_gvisor(true);
@@ -1352,6 +1362,7 @@ mod tests {
 
     #[test]
     fn test_native_runtime_disables_gvisor() {
+        #[allow(deprecated)]
         let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
         let config = apply_runtime_selection(config, "native", false).unwrap();
         assert!(
@@ -1367,6 +1378,7 @@ mod tests {
 
     #[test]
     fn test_native_runtime_rejects_bundle_flag() {
+        #[allow(deprecated)]
         let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
         let err = apply_runtime_selection(config, "native", true).unwrap_err();
         assert!(

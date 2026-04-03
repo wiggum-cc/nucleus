@@ -7,6 +7,7 @@
 use crate::error::{NucleusError, Result};
 use crate::security::seccomp_trace::TraceRecord;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io::BufRead;
 use std::path::Path;
 use tracing::info;
@@ -84,7 +85,7 @@ pub fn generate_from_trace(trace_path: &Path) -> Result<SeccompProfile> {
     })?;
 
     let reader = std::io::BufReader::new(file);
-    let mut syscall_names: Vec<String> = Vec::new();
+    let mut syscall_set: HashSet<String> = HashSet::new();
 
     for line in reader.lines() {
         let line = line
@@ -107,10 +108,10 @@ pub fn generate_from_trace(trace_path: &Path) -> Result<SeccompProfile> {
                 .unwrap_or_else(|| format!("__NR_{}", record.syscall))
         });
 
-        if !syscall_names.contains(&name) {
-            syscall_names.push(name);
-        }
+        syscall_set.insert(name);
     }
+
+    let mut syscall_names: Vec<String> = syscall_set.into_iter().collect();
 
     syscall_names.sort();
 

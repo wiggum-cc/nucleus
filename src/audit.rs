@@ -47,7 +47,7 @@ pub enum AuditEventType {
 /// A structured audit event emitted as JSON for post-incident analysis.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditEvent {
-    /// ISO 8601 timestamp
+    /// Unix epoch timestamp with millisecond precision (e.g. "1712345678.123")
     pub timestamp: String,
     /// Container ID (correlation ID for all events in a lifecycle)
     pub container_id: String,
@@ -205,8 +205,7 @@ mod tests {
     #[test]
     fn test_audit_event_error_flag() {
         let event =
-            AuditEvent::new("abc123", "test", AuditEventType::SeccompApplied, "applied")
-                .as_error();
+            AuditEvent::new("abc123", "test", AuditEventType::SeccompApplied, "applied").as_error();
         assert!(event.is_error);
     }
 }

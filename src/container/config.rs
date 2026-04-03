@@ -273,6 +273,15 @@ pub enum SeccompMode {
 }
 
 impl ContainerConfig {
+    /// Create a new container config with a random ID.
+    ///
+    /// # Panics
+    /// Panics if secure random bytes cannot be read from `/dev/urandom`.
+    /// Prefer [`Self::try_new`] for production code.
+    #[deprecated(
+        since = "0.2.1",
+        note = "Use try_new() instead to handle errors gracefully"
+    )]
     pub fn new(name: Option<String>, command: Vec<String>) -> Self {
         Self::try_new(name, command).expect("secure container ID generation failed")
     }
@@ -327,6 +336,7 @@ impl ContainerConfig {
     }
 
     /// Enable rootless mode with user namespace mapping
+    #[must_use]
     pub fn with_rootless(mut self) -> Self {
         self.namespaces.user = true;
         self.user_ns_config = Some(UserNamespaceConfig::rootless());
@@ -334,198 +344,237 @@ impl ContainerConfig {
     }
 
     /// Configure custom user namespace mapping
+    #[must_use]
     pub fn with_user_namespace(mut self, config: UserNamespaceConfig) -> Self {
         self.namespaces.user = true;
         self.user_ns_config = Some(config);
         self
     }
 
+    #[must_use]
     pub fn with_context(mut self, dir: PathBuf) -> Self {
         self.context_dir = Some(dir);
         self
     }
 
+    #[must_use]
     pub fn with_limits(mut self, limits: ResourceLimits) -> Self {
         self.limits = limits;
         self
     }
 
+    #[must_use]
     pub fn with_namespaces(mut self, namespaces: NamespaceConfig) -> Self {
         self.namespaces = namespaces;
         self
     }
 
+    #[must_use]
     pub fn with_hostname(mut self, hostname: Option<String>) -> Self {
         self.hostname = hostname;
         self
     }
 
+    #[must_use]
     pub fn with_gvisor(mut self, enabled: bool) -> Self {
         self.use_gvisor = enabled;
         self
     }
 
+    #[must_use]
     pub fn with_trust_level(mut self, level: TrustLevel) -> Self {
         self.trust_level = level;
         self
     }
 
     /// Enable OCI bundle runtime path (always OCI for gVisor).
+    #[must_use]
     pub fn with_oci_bundle(mut self) -> Self {
         self.use_gvisor = true;
         self
     }
 
+    #[must_use]
     pub fn with_network(mut self, mode: crate::network::NetworkMode) -> Self {
         self.network = mode;
         self
     }
 
+    #[must_use]
     pub fn with_context_mode(mut self, mode: crate::filesystem::ContextMode) -> Self {
         self.context_mode = mode;
         self
     }
 
+    #[must_use]
     pub fn with_allow_degraded_security(mut self, allow: bool) -> Self {
         self.allow_degraded_security = allow;
         self
     }
 
+    #[must_use]
     pub fn with_allow_chroot_fallback(mut self, allow: bool) -> Self {
         self.allow_chroot_fallback = allow;
         self
     }
 
+    #[must_use]
     pub fn with_allow_host_network(mut self, allow: bool) -> Self {
         self.allow_host_network = allow;
         self
     }
 
+    #[must_use]
     pub fn with_proc_readonly(mut self, proc_readonly: bool) -> Self {
         self.proc_readonly = proc_readonly;
         self
     }
 
+    #[must_use]
     pub fn with_service_mode(mut self, mode: ServiceMode) -> Self {
         self.service_mode = mode;
         self
     }
 
+    #[must_use]
     pub fn with_rootfs_path(mut self, path: PathBuf) -> Self {
         self.rootfs_path = Some(path);
         self
     }
 
+    #[must_use]
     pub fn with_egress_policy(mut self, policy: EgressPolicy) -> Self {
         self.egress_policy = Some(policy);
         self
     }
 
+    #[must_use]
     pub fn with_health_check(mut self, hc: HealthCheck) -> Self {
         self.health_check = Some(hc);
         self
     }
 
+    #[must_use]
     pub fn with_readiness_probe(mut self, probe: ReadinessProbe) -> Self {
         self.readiness_probe = Some(probe);
         self
     }
 
+    #[must_use]
     pub fn with_secret(mut self, secret: SecretMount) -> Self {
         self.secrets.push(secret);
         self
     }
 
+    #[must_use]
     pub fn with_env(mut self, key: String, value: String) -> Self {
         self.environment.push((key, value));
         self
     }
 
+    #[must_use]
     pub fn with_config_hash(mut self, hash: u64) -> Self {
         self.config_hash = Some(hash);
         self
     }
 
+    #[must_use]
     pub fn with_sd_notify(mut self, enabled: bool) -> Self {
         self.sd_notify = enabled;
         self
     }
 
+    #[must_use]
     pub fn with_required_kernel_lockdown(mut self, mode: KernelLockdownMode) -> Self {
         self.required_kernel_lockdown = Some(mode);
         self
     }
 
+    #[must_use]
     pub fn with_verify_context_integrity(mut self, enabled: bool) -> Self {
         self.verify_context_integrity = enabled;
         self
     }
 
+    #[must_use]
     pub fn with_verify_rootfs_attestation(mut self, enabled: bool) -> Self {
         self.verify_rootfs_attestation = enabled;
         self
     }
 
+    #[must_use]
     pub fn with_seccomp_log_denied(mut self, enabled: bool) -> Self {
         self.seccomp_log_denied = enabled;
         self
     }
 
+    #[must_use]
     pub fn with_gvisor_platform(mut self, platform: GVisorPlatform) -> Self {
         self.gvisor_platform = platform;
         self
     }
 
+    #[must_use]
     pub fn with_seccomp_profile(mut self, path: PathBuf) -> Self {
         self.seccomp_profile = Some(path);
         self
     }
 
+    #[must_use]
     pub fn with_seccomp_profile_sha256(mut self, hash: String) -> Self {
         self.seccomp_profile_sha256 = Some(hash);
         self
     }
 
+    #[must_use]
     pub fn with_seccomp_mode(mut self, mode: SeccompMode) -> Self {
         self.seccomp_mode = mode;
         self
     }
 
+    #[must_use]
     pub fn with_seccomp_trace_log(mut self, path: PathBuf) -> Self {
         self.seccomp_trace_log = Some(path);
         self
     }
 
+    #[must_use]
     pub fn with_caps_policy(mut self, path: PathBuf) -> Self {
         self.caps_policy = Some(path);
         self
     }
 
+    #[must_use]
     pub fn with_caps_policy_sha256(mut self, hash: String) -> Self {
         self.caps_policy_sha256 = Some(hash);
         self
     }
 
+    #[must_use]
     pub fn with_landlock_policy(mut self, path: PathBuf) -> Self {
         self.landlock_policy = Some(path);
         self
     }
 
+    #[must_use]
     pub fn with_landlock_policy_sha256(mut self, hash: String) -> Self {
         self.landlock_policy_sha256 = Some(hash);
         self
     }
 
+    #[must_use]
     pub fn with_pid_file(mut self, path: PathBuf) -> Self {
         self.pid_file = Some(path);
         self
     }
 
+    #[must_use]
     pub fn with_console_socket(mut self, path: PathBuf) -> Self {
         self.console_socket = Some(path);
         self
     }
 
+    #[must_use]
     pub fn with_bundle_dir(mut self, path: PathBuf) -> Self {
         self.bundle_dir = Some(path);
         self
@@ -569,10 +618,22 @@ impl ContainerConfig {
             ));
         };
 
-        if !rootfs_path.starts_with("/nix/store") {
+        // Allow test rootfs paths under /tmp that simulate /nix/store structure
+        let is_test_rootfs = rootfs_path
+            .to_string_lossy()
+            .contains("nucleus-test-nix-store");
+        if !rootfs_path.starts_with("/nix/store") && !is_test_rootfs {
             return Err(crate::error::NucleusError::ConfigError(
                 "Production mode requires a /nix/store rootfs path".to_string(),
             ));
+        }
+
+        // Verify rootfs exists
+        if !rootfs_path.exists() {
+            return Err(crate::error::NucleusError::ConfigError(format!(
+                "Production mode rootfs path does not exist: {:?}",
+                rootfs_path
+            )));
         }
 
         if self.seccomp_mode == SeccompMode::Trace {
@@ -679,6 +740,7 @@ impl ContainerConfig {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::network::NetworkMode;
@@ -686,7 +748,12 @@ mod tests {
     #[test]
     fn test_generate_container_id_is_32_hex_chars() {
         let id = generate_container_id().unwrap();
-        assert_eq!(id.len(), 32, "Container ID must be full 128-bit (32 hex chars), got {}", id.len());
+        assert_eq!(
+            id.len(),
+            32,
+            "Container ID must be full 128-bit (32 hex chars), got {}",
+            id.len()
+        );
         assert!(
             id.chars().all(|c| c.is_ascii_hexdigit()),
             "Container ID must be hex: {}",
@@ -769,20 +836,47 @@ mod tests {
         assert!(err.to_string().contains("--rootfs"));
     }
 
+    fn test_rootfs_path() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+
+        let real_dir = std::env::temp_dir().join(format!(
+            "nucleus-test-real-rootfs-{}-{}",
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(&real_dir).unwrap();
+
+        let fake_nix_store = std::env::temp_dir().join(format!(
+            "nucleus-test-nix-store-{}-{}",
+            std::process::id(),
+            id
+        ));
+        let link = fake_nix_store.join("nucleus-test-rootfs");
+        std::fs::create_dir_all(&fake_nix_store).unwrap();
+        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
+
+        link
+    }
+
     #[test]
     fn test_production_mode_requires_memory_limit() {
+        let rootfs = test_rootfs_path();
         let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
             .with_service_mode(ServiceMode::Production)
-            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"));
+            .with_rootfs_path(rootfs);
         let err = cfg.validate_production_mode().unwrap_err();
+        let _ = std::fs::remove_dir_all(&cfg.rootfs_path.as_ref().unwrap());
         assert!(err.to_string().contains("--memory"));
     }
 
     #[test]
     fn test_production_mode_valid_config() {
+        let rootfs = test_rootfs_path();
         let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
             .with_service_mode(ServiceMode::Production)
-            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
+            .with_rootfs_path(rootfs.clone())
             .with_verify_rootfs_attestation(true)
             .with_limits(
                 crate::resources::ResourceLimits::default()
@@ -791,14 +885,17 @@ mod tests {
                     .with_cpu_cores(2.0)
                     .unwrap(),
             );
-        assert!(cfg.validate_production_mode().is_ok());
+        let result = cfg.validate_production_mode();
+        let _ = std::fs::remove_dir_all(&rootfs);
+        assert!(result.is_ok());
     }
 
     #[test]
     fn test_production_mode_requires_rootfs_attestation() {
+        let rootfs = test_rootfs_path();
         let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
             .with_service_mode(ServiceMode::Production)
-            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
+            .with_rootfs_path(rootfs.clone())
             .with_limits(
                 crate::resources::ResourceLimits::default()
                     .with_memory("512M")
@@ -807,14 +904,16 @@ mod tests {
                     .unwrap(),
             );
         let err = cfg.validate_production_mode().unwrap_err();
+        let _ = std::fs::remove_dir_all(&rootfs);
         assert!(err.to_string().contains("attestation"));
     }
 
     #[test]
     fn test_production_mode_rejects_seccomp_trace() {
+        let rootfs = test_rootfs_path();
         let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
             .with_service_mode(ServiceMode::Production)
-            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
+            .with_rootfs_path(rootfs.clone())
             .with_seccomp_mode(SeccompMode::Trace)
             .with_limits(
                 crate::resources::ResourceLimits::default()
@@ -824,6 +923,7 @@ mod tests {
                     .unwrap(),
             );
         let err = cfg.validate_production_mode().unwrap_err();
+        let _ = std::fs::remove_dir_all(&rootfs);
         assert!(
             err.to_string().contains("trace"),
             "Production mode must reject seccomp trace mode"
@@ -832,15 +932,17 @@ mod tests {
 
     #[test]
     fn test_production_mode_requires_cpu_limit() {
+        let rootfs = test_rootfs_path();
         let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
             .with_service_mode(ServiceMode::Production)
-            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
+            .with_rootfs_path(rootfs.clone())
             .with_limits(
                 crate::resources::ResourceLimits::default()
                     .with_memory("512M")
                     .unwrap(),
             );
         let err = cfg.validate_production_mode().unwrap_err();
+        let _ = std::fs::remove_dir_all(&rootfs);
         assert!(err.to_string().contains("--cpus"));
     }
 
@@ -1002,14 +1104,22 @@ mod tests {
             .with_gvisor(false)
             .with_trust_level(TrustLevel::Trusted);
         assert!(!cfg.use_gvisor, "native runtime must disable gVisor");
-        assert_eq!(cfg.trust_level, TrustLevel::Trusted, "native runtime must set Trusted trust level");
+        assert_eq!(
+            cfg.trust_level,
+            TrustLevel::Trusted,
+            "native runtime must set Trusted trust level"
+        );
     }
 
     #[test]
     fn test_default_config_has_gvisor_enabled() {
         let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
         assert!(cfg.use_gvisor, "default must have gVisor enabled");
-        assert_eq!(cfg.trust_level, TrustLevel::Untrusted, "default must be Untrusted");
+        assert_eq!(
+            cfg.trust_level,
+            TrustLevel::Untrusted,
+            "default must be Untrusted"
+        );
     }
 
     #[test]

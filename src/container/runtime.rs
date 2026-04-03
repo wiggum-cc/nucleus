@@ -3,12 +3,12 @@ use crate::container::{
     ContainerConfig, ContainerState, ContainerStateManager, KernelLockdownMode, OciStatus,
     ServiceMode, TrustLevel,
 };
-use crate::error::{NucleusError, Result};
+use crate::error::{NucleusError, Result, StateTransition};
 use crate::filesystem::{
     audit_mounts, bind_mount_host_paths, bind_mount_rootfs, create_dev_nodes, create_minimal_fs,
-    mask_proc_paths, mount_procfs, mount_secrets, mount_secrets_inmemory, snapshot_context_dir,
-    switch_root, verify_context_manifest, verify_rootfs_attestation, ContextPopulator,
-    FilesystemState, LazyContextPopulator, TmpfsMount, resolve_container_destination,
+    mask_proc_paths, mount_procfs, mount_secrets, mount_secrets_inmemory,
+    resolve_container_destination, snapshot_context_dir, switch_root, verify_context_manifest,
+    verify_rootfs_attestation, ContextPopulator, FilesystemState, LazyContextPopulator, TmpfsMount,
 };
 use crate::isolation::{NamespaceCommandRunner, NamespaceManager, NamespaceProbe};
 use crate::network::{BridgeNetwork, NetworkMode};
@@ -356,13 +356,11 @@ impl Container {
         }
 
         // Opening the FIFO for reading unblocks the child's open-for-write.
-        let file = std::fs::File::open(&fifo_path).map_err(|e| {
-            NucleusError::ExecError(format!("Failed to open exec FIFO: {}", e))
-        })?;
+        let file = std::fs::File::open(&fifo_path)
+            .map_err(|e| NucleusError::ExecError(format!("Failed to open exec FIFO: {}", e)))?;
         let mut buf = [0u8; 1];
-        std::io::Read::read(&mut &file, &mut buf).map_err(|e| {
-            NucleusError::ExecError(format!("Failed to read exec FIFO: {}", e))
-        })?;
+        std::io::Read::read(&mut &file, &mut buf)
+            .map_err(|e| NucleusError::ExecError(format!("Failed to read exec FIFO: {}", e)))?;
         drop(file);
 
         let _ = std::fs::remove_file(&fifo_path);
@@ -379,7 +377,11 @@ impl Container {
     ///
     /// This runs in the child process after fork.
     /// Tracks FilesystemState and SecurityState machines to enforce correct ordering.
-    fn setup_and_exec(&self, ready_pipe: Option<OwnedFd>, exec_fifo: Option<PathBuf>) -> Result<()> {
+    fn setup_and_exec(
+        &self,
+        ready_pipe: Option<OwnedFd>,
+        exec_fifo: Option<PathBuf>,
+    ) -> Result<()> {
         let is_rootless = self.config.user_ns_config.is_some();
         let allow_degraded_security = Self::allow_degraded_security(&self.config);
         let context_manifest = if self.config.verify_context_integrity {
@@ -518,7 +520,10 @@ impl Container {
 
         // 8b. Mask sensitive /proc paths to reduce kernel info leakage
         // SEC-06: In production mode, failures to mask critical paths are fatal.
-        mask_proc_paths(&proc_path, self.config.service_mode == ServiceMode::Production)?;
+        mask_proc_paths(
+            &proc_path,
+            self.config.service_mode == ServiceMode::Production,
+        )?;
 
         // 9c. Run createRuntime hooks (after namespaces created, before pivot_root)
         if let Some(ref hooks) = self.config.hooks {
@@ -751,10 +756,7 @@ impl Container {
                 .write(true)
                 .open(fifo_path)
                 .map_err(|e| {
-                    NucleusError::ExecError(format!(
-                        "Failed to open exec FIFO for writing: {}",
-                        e
-                    ))
+                    NucleusError::ExecError(format!("Failed to open exec FIFO for writing: {}", e))
                 })?;
             std::io::Write::write_all(&mut &file, &[0u8]).map_err(|e| {
                 NucleusError::ExecError(format!("Failed to write exec FIFO sync byte: {}", e))
@@ -1601,7 +1603,10 @@ impl Container {
                     }
                 }
                 Err(e) => {
-                    error!("Health check execution failed for {}: {}", container_name, e);
+                    error!(
+                        "Health check execution failed for {}: {}",
+                        container_name, e
+                    );
                     let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
                     return;
                 }
@@ -1756,8 +1761,7 @@ impl CreatedContainer {
         }
 
         // Start health check thread if configured
-        let cancel_flag =
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let health_handle = if let Some(ref hc) = config.health_check {
             if !hc.command.is_empty() {
                 let hc = hc.clone();
@@ -1805,13 +1809,17 @@ impl CreatedContainer {
             self.state.status = OciStatus::Stopped;
             let _ = self.state_mgr.save_state(&self.state);
 
-            cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            if let Some(handle) = health_handle {
-                let _ = handle.join();
-            }
             child_waited = true;
             Ok(exit_code)
         })();
+
+        // Cancel health check thread immediately regardless of run_result.
+        // This ensures the health thread stops even if readiness_probe or
+        // wait_for_child_static fails, preventing nsenter calls into a dead container.
+        cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = health_handle {
+            let _ = handle.join();
+        }
 
         // Run poststop hooks (best-effort)
         if let Some(ref hooks) = config.hooks {
@@ -1823,11 +1831,7 @@ impl CreatedContainer {
                     pid: 0,
                     bundle: String::new(),
                 };
-                OciHooks::run_hooks_best_effort(
-                    &hooks.poststop,
-                    &hook_state,
-                    "poststop",
-                );
+                OciHooks::run_hooks_best_effort(&hooks.poststop, &hook_state, "poststop");
             }
         }
 
@@ -2076,7 +2080,9 @@ mod tests {
         let fn_body = &source[fn_start..fn_start + 500];
         // Must check the return value of write() for partial writes
         assert!(
-            fn_body.contains("written") || fn_body.contains("4") || fn_body.contains("payload.len()"),
+            fn_body.contains("written")
+                || fn_body.contains("4")
+                || fn_body.contains("payload.len()"),
             "notify_namespace_ready must validate complete write of all 4 bytes"
         );
     }
@@ -2088,8 +2094,7 @@ mod tests {
         let rlimit_start = source.find("12b. RLIMIT backstop").unwrap();
         let rlimit_section = &source[rlimit_start..rlimit_start + 2000];
         assert!(
-            rlimit_section.contains("is_production")
-                && rlimit_section.contains("return Err"),
+            rlimit_section.contains("is_production") && rlimit_section.contains("return Err"),
             "RLIMIT failures must return Err in production mode"
         );
     }

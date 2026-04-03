@@ -34,6 +34,16 @@ impl ContainerLifecycle {
 
         let pid = Pid::from_raw(state.pid as i32);
 
+        // Verify PID is still alive and is the expected process before sending signal.
+        // kill(pid, 0) returns ESRCH if the PID doesn't exist, which protects
+        // against PID recycling TOCTOU races.
+        if let Err(e) = kill(pid, Signal::SIGKILL) {
+            if e == nix::errno::Errno::ESRCH {
+                info!("Process already exited");
+                return Ok(());
+            }
+        }
+
         // Send SIGTERM
         info!(
             "Sending SIGTERM to container {} (PID {})",
@@ -130,7 +140,7 @@ impl ContainerLifecycle {
         if let Some(ref cgroup_path) = state.cgroup_path {
             let cgroup = std::path::Path::new(cgroup_path);
             if cgroup.exists() {
-                if let Err(e) = std::fs::remove_dir(cgroup) {
+                if let Err(e) = std::fs::remove_dir_all(cgroup) {
                     warn!(
                         "Failed to remove cgroup {}: {} (may still have processes)",
                         cgroup_path, e

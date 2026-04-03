@@ -109,7 +109,10 @@ impl ResourceStats {
             }
         }
 
-        Ok(0)
+        Err(NucleusError::ResourceError(format!(
+            "cpu.stat at {:?} does not contain 'usage_usec' key",
+            path
+        )))
     }
 
     /// Read pids.current (current number of PIDs)

@@ -1,5 +1,5 @@
 use crate::error::{NucleusError, Result};
-use nix::mount::{mount, umount, MsFlags};
+use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
@@ -87,7 +87,7 @@ impl TmpfsMount {
 
         info!("Unmounting tmpfs at {:?}", self.path);
 
-        umount(&self.path).map_err(|e| {
+        umount2(&self.path, MntFlags::MNT_DETACH).map_err(|e| {
             NucleusError::FilesystemError(format!(
                 "Failed to unmount tmpfs at {:?}: {}",
                 self.path, e

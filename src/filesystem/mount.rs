@@ -754,7 +754,7 @@ pub fn mount_secrets(root: &Path, secrets: &[crate::container::SecretMount]) -> 
 /// Mount secrets onto a dedicated in-memory tmpfs instead of bind-mounting host paths.
 ///
 /// Creates a per-container tmpfs at `<root>/run/secrets` with MS_NOEXEC | MS_NOSUID | MS_NODEV,
-/// copies secret file contents into it, then zeros the read buffer. This ensures secrets
+/// copies secret contents into it, then zeros the read buffer. This ensures secrets
 /// never reference host-side files after setup and are never persisted to disk.
 pub fn mount_secrets_inmemory(
     root: &Path,
@@ -775,20 +775,40 @@ pub fn mount_secrets_inmemory(
     })?;
 
     // Mount a size-limited tmpfs for secrets (16 MiB max)
-    mount(
+    if let Err(e) = mount(
         Some("tmpfs"),
         &secrets_dir,
         Some("tmpfs"),
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
         Some("size=16m,mode=0700"),
-    )
-    .map_err(|e| {
-        NucleusError::FilesystemError(format!(
+    ) {
+        let _ = std::fs::remove_dir_all(&secrets_dir);
+        return Err(NucleusError::FilesystemError(format!(
             "Failed to mount secrets tmpfs at {:?}: {}",
             secrets_dir, e
-        ))
-    })?;
+        )));
+    }
 
+    // Rollback: unmount tmpfs and remove dir if any secret fails
+    let result = mount_secrets_inmemory_inner(&secrets_dir, root, secrets);
+    if let Err(ref e) = result {
+        let _ = nix::mount::umount2(&secrets_dir, nix::mount::MntFlags::MNT_DETACH);
+        let _ = std::fs::remove_dir_all(&secrets_dir);
+        return Err(NucleusError::FilesystemError(format!(
+            "Secret mount failed (rolled back): {}",
+            e
+        )));
+    }
+
+    info!("All secrets mounted on in-memory tmpfs");
+    Ok(())
+}
+
+fn mount_secrets_inmemory_inner(
+    secrets_dir: &Path,
+    root: &Path,
+    secrets: &[crate::container::SecretMount],
+) -> Result<()> {
     for secret in secrets {
         if !secret.source.exists() {
             return Err(NucleusError::FilesystemError(format!(
@@ -806,8 +826,7 @@ pub fn mount_secrets_inmemory(
         })?;
 
         // Determine destination path inside the secrets tmpfs
-        // Strip leading / from dest to make it relative to secrets_dir
-        let dest = resolve_container_destination(&secrets_dir, &secret.dest)?;
+        let dest = resolve_container_destination(secrets_dir, &secret.dest)?;
 
         // Create parent directories within the tmpfs
         if let Some(parent) = dest.parent() {
@@ -836,10 +855,7 @@ pub fn mount_secrets_inmemory(
             })?;
         }
 
-        // Zero the in-memory buffer to prevent secret leakage via memory reuse.
-        // zeroize handles both the current buffer and prevents the compiler from
-        // optimizing away the zeroing. Unlike manual write_volatile, zeroize also
-        // implements Drop so intermediate Vec reallocations are covered.
+        // Zero the in-memory buffer
         zeroize::Zeroize::zeroize(&mut content);
         drop(content);
 
@@ -855,7 +871,6 @@ pub fn mount_secrets_inmemory(
                 })?;
             }
 
-            // Create mount point file
             if secret.source.is_file() {
                 std::fs::write(&container_dest, "").map_err(|e| {
                     NucleusError::FilesystemError(format!(
@@ -865,7 +880,6 @@ pub fn mount_secrets_inmemory(
                 })?;
             }
 
-            // Bind mount from tmpfs location to expected container path
             mount(
                 Some(dest.as_path()),
                 &container_dest,
@@ -880,7 +894,6 @@ pub fn mount_secrets_inmemory(
                 ))
             })?;
 
-            // Remount read-only
             mount(
                 None::<&str>,
                 &container_dest,
@@ -907,7 +920,6 @@ pub fn mount_secrets_inmemory(
         );
     }
 
-    info!("All secrets mounted on in-memory tmpfs");
     Ok(())
 }
 

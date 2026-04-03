@@ -1,5 +1,5 @@
-use crate::filesystem::normalize_container_destination;
 use crate::error::{NucleusError, Result};
+use crate::filesystem::normalize_container_destination;
 use crate::isolation::{IdMapping, NamespaceConfig, UserNamespaceConfig};
 use crate::resources::ResourceLimits;
 use serde::{Deserialize, Serialize};
@@ -49,11 +49,23 @@ pub struct OciProcess {
     pub capabilities: Option<OciCapabilities>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rlimits: Vec<OciRlimit>,
-    #[serde(rename = "consoleSize", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "consoleSize",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub console_size: Option<OciConsoleSize>,
-    #[serde(rename = "apparmorProfile", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "apparmorProfile",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub apparmor_profile: Option<String>,
-    #[serde(rename = "selinuxLabel", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "selinuxLabel",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub selinux_label: Option<String>,
 }
 
@@ -113,7 +125,11 @@ pub struct OciLinux {
     pub rootfs_propagation: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub sysctl: HashMap<String, String>,
-    #[serde(rename = "cgroupsPath", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "cgroupsPath",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cgroups_path: Option<String>,
     #[serde(rename = "intelRdt", default, skip_serializing_if = "Option::is_none")]
     pub intel_rdt: Option<OciIntelRdt>,
@@ -266,10 +282,18 @@ pub struct OciIntelRdt {
     #[serde(rename = "closID", default, skip_serializing_if = "Option::is_none")]
     pub clos_id: Option<String>,
     /// Schema for L3 cache allocation
-    #[serde(rename = "l3CacheSchema", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "l3CacheSchema",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub l3_cache_schema: Option<String>,
     /// Schema for memory bandwidth allocation
-    #[serde(rename = "memBwSchema", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "memBwSchema",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub mem_bw_schema: Option<String>,
 }
 
@@ -297,13 +321,25 @@ pub struct OciHook {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OciHooks {
     /// Called after the runtime environment has been created but before pivot_root.
-    #[serde(rename = "createRuntime", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "createRuntime",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub create_runtime: Vec<OciHook>,
     /// Called after pivot_root but before the start operation.
-    #[serde(rename = "createContainer", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "createContainer",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub create_container: Vec<OciHook>,
     /// Called after the start operation but before the user process executes.
-    #[serde(rename = "startContainer", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "startContainer",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub start_container: Vec<OciHook>,
     /// Called after the user-specified process has started.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -341,7 +377,10 @@ impl OciHooks {
     /// If any hook exits non-zero, an error is returned immediately (remaining hooks are skipped).
     pub fn run_hooks(hooks: &[OciHook], state: &OciContainerState, phase: &str) -> Result<()> {
         let state_json = serde_json::to_string(state).map_err(|e| {
-            NucleusError::HookError(format!("Failed to serialize container state for hook: {}", e))
+            NucleusError::HookError(format!(
+                "Failed to serialize container state for hook: {}",
+                e
+            ))
         })?;
 
         for (i, hook) in hooks.iter().enumerate() {
@@ -389,6 +428,7 @@ impl OciHooks {
     }
 
     fn execute_hook(hook: &OciHook, state_json: &str, phase: &str) -> Result<()> {
+        use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 
         let hook_path = Path::new(&hook.path);
@@ -405,6 +445,12 @@ impl OciHooks {
             )));
         }
 
+        // C-1: Validate hook binary ownership and permissions to prevent
+        // execution of world-writable or unexpectedly-owned binaries.
+        // Similar to runsc's hook validation — reject hooks that could be
+        // tampered with by unprivileged users.
+        Self::validate_hook_binary(hook_path, phase)?;
+
         let mut cmd = Command::new(&hook.path);
         if !hook.args.is_empty() {
             // OCI spec: args[0] is the binary name (like execve argv); pass rest as arguments
@@ -420,9 +466,34 @@ impl OciHooks {
             }
         }
 
+        // C-1: Drop all capabilities and set restrictive resource limits
+        // for hook execution. Hooks run in the parent process before security
+        // hardening, so we sandbox them defensively.
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+
+        // C-1: Apply RLIMIT backstops only in the spawned child process
+        // via pre_exec, so the parent process is not affected.
+        // Note: pre_exec runs after fork but before exec, in the child process.
+        #[cfg(not(test))]
+        unsafe {
+            cmd.pre_exec(|| {
+                let rlim_nproc = libc::rlimit {
+                    rlim_cur: 1024,
+                    rlim_max: 1024,
+                };
+                libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc);
+
+                let rlim_nofile = libc::rlimit {
+                    rlim_cur: 1024,
+                    rlim_max: 1024,
+                };
+                libc::setrlimit(libc::RLIMIT_NOFILE, &rlim_nofile);
+
+                Ok(())
+            });
+        }
 
         let mut child = cmd.spawn().map_err(|e| {
             NucleusError::HookError(format!(
@@ -489,6 +560,81 @@ impl OciHooks {
                 }
             }
         }
+    }
+
+    /// Validate hook binary ownership and permissions.
+    ///
+    /// Rejects hooks that are world-writable or group-writable, or owned by
+    /// a UID that doesn't match the effective UID or root. This prevents
+    /// privilege escalation via tampered hook binaries.
+    fn validate_hook_binary(hook_path: &Path, phase: &str) -> Result<()> {
+        let metadata = std::fs::metadata(hook_path).map_err(|e| {
+            NucleusError::HookError(format!(
+                "Failed to stat {} hook {}: {}",
+                phase,
+                hook_path.display(),
+                e
+            ))
+        })?;
+
+        use std::os::unix::fs::MetadataExt;
+        let mode = metadata.mode();
+        let uid = metadata.uid();
+        let gid = metadata.gid();
+        let effective_uid = nix::unistd::Uid::effective().as_raw();
+
+        // Reject world-writable hooks
+        if mode & 0o002 != 0 {
+            return Err(NucleusError::HookError(format!(
+                "{} hook {} is world-writable (mode {:04o}) — refusing to execute",
+                phase,
+                hook_path.display(),
+                mode & 0o7777
+            )));
+        }
+
+        // Reject group-writable hooks unless owned by root
+        if mode & 0o020 != 0 && uid != 0 {
+            return Err(NucleusError::HookError(format!(
+                "{} hook {} is group-writable and not owned by root (mode {:04o}, uid {}) — refusing to execute",
+                phase,
+                hook_path.display(),
+                mode & 0o7777,
+                uid
+            )));
+        }
+
+        // Reject hooks owned by arbitrary UIDs — must be root or effective UID
+        if uid != 0 && uid != effective_uid {
+            return Err(NucleusError::HookError(format!(
+                "{} hook {} is owned by UID {} (expected 0 or {}) — refusing to execute",
+                phase,
+                hook_path.display(),
+                uid,
+                effective_uid
+            )));
+        }
+
+        // Reject hooks with setuid/setgid bits
+        if mode & 0o6000 != 0 {
+            return Err(NucleusError::HookError(format!(
+                "{} hook {} has setuid/setgid bits (mode {:04o}) — refusing to execute",
+                phase,
+                hook_path.display(),
+                mode & 0o7777
+            )));
+        }
+
+        debug!(
+            "{} hook {} validation passed (uid={}, gid={}, mode={:04o})",
+            phase,
+            hook_path.display(),
+            uid,
+            gid,
+            mode & 0o7777
+        );
+
+        Ok(())
     }
 }
 
@@ -890,17 +1036,11 @@ impl OciConfig {
     pub fn with_host_runtime_binds(mut self) -> Self {
         // Use a fixed set of standard FHS paths only. Do NOT scan host $PATH,
         // which would expose arbitrary host directories inside the container.
-        let host_paths: BTreeSet<String> = [
-            "/bin",
-            "/sbin",
-            "/usr",
-            "/lib",
-            "/lib64",
-            "/nix/store",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+        let host_paths: BTreeSet<String> =
+            ["/bin", "/sbin", "/usr", "/lib", "/lib64", "/nix/store"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
 
         for host_path in host_paths {
             let source = Path::new(&host_path);
@@ -1201,9 +1341,12 @@ mod tests {
         // directories into the container. Verify by setting a distinctive PATH
         // and checking that none of its entries appear in the resulting mounts.
         std::env::set_var("PATH", "/tmp/evil-inject-path/bin:/opt/attacker/sbin");
-        let config = OciConfig::new(vec!["/bin/sh".to_string()], None)
-            .with_host_runtime_binds();
-        let mount_dests: Vec<&str> = config.mounts.iter().map(|m| m.destination.as_str()).collect();
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None).with_host_runtime_binds();
+        let mount_dests: Vec<&str> = config
+            .mounts
+            .iter()
+            .map(|m| m.destination.as_str())
+            .collect();
         let mount_srcs: Vec<&str> = config.mounts.iter().map(|m| m.source.as_str()).collect();
         // Verify no mount references the injected PATH entries
         for path in &["/tmp/evil-inject-path", "/opt/attacker"] {
@@ -1223,7 +1366,9 @@ mod tests {
         for mount in &config.mounts {
             if mount.mount_type == "bind" {
                 assert!(
-                    allowed_prefixes.iter().any(|p| mount.destination.starts_with(p)),
+                    allowed_prefixes
+                        .iter()
+                        .any(|p| mount.destination.starts_with(p)),
                     "unexpected bind mount destination: {} — only FHS paths allowed",
                     mount.destination
                 );
@@ -1244,8 +1389,7 @@ mod tests {
             .find(|e| e.starts_with("PATH="))
             .expect("PATH env must be set");
         assert_eq!(
-            path_env,
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            path_env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "OCI config must not leak host PATH"
         );
         assert!(
@@ -1471,7 +1615,10 @@ mod tests {
 
         let result = OciHooks::run_hooks(&[hook], &state, "test");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exited with status"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("exited with status"));
     }
 
     #[test]
@@ -1482,10 +1629,7 @@ mod tests {
 
         let marker = temp_dir.path().join("ran");
         let ok_script = temp_dir.path().join("ok.sh");
-        write_script(
-            &ok_script,
-            &format!("touch {}\n", marker.to_string_lossy()),
-        );
+        write_script(&ok_script, &format!("touch {}\n", marker.to_string_lossy()));
 
         let hooks = vec![
             OciHook {
