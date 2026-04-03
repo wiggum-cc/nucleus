@@ -186,6 +186,7 @@ pub fn parse_signal(s: &str) -> Result<Signal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::container::ContainerStateParams;
 
     #[test]
     fn test_parse_signal_by_name() {
@@ -220,17 +221,17 @@ mod tests {
     #[test]
     fn test_access_check_owner_allowed() {
         let uid = Uid::effective().as_raw();
-        let state = ContainerState::new(
-            "testid".to_string(),
-            "testname".to_string(),
-            12345,
-            vec!["/bin/true".to_string()],
-            None,
-            None,
-            false,
-            true,
-            None,
-        );
+        let state = ContainerState::new(ContainerStateParams {
+            id: "testid".to_string(),
+            name: "testname".to_string(),
+            pid: 12345,
+            command: vec!["/bin/true".to_string()],
+            memory_limit: None,
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: true,
+            cgroup_path: None,
+        });
         // Override creator to match current caller for this test.
         let mut state = state;
         state.creator_uid = uid;

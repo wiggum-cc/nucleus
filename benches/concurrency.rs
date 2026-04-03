@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use nucleus::container::ContainerState;
+use nucleus::container::{ContainerState, ContainerStateParams};
 use nucleus::filesystem::ContextPopulator;
 use nucleus::resources::{ResourceLimits, ResourceStats};
 use nucleus::security::{OciConfig, SeccompManager};
@@ -230,21 +230,21 @@ fn concurrent_state_serde(c: &mut Criterion) {
                 let states: Arc<Vec<_>> = Arc::new(
                     (0..threads)
                         .map(|i| {
-                            ContainerState::new(
-                                format!("bench-{i}"),
-                                format!("bench-{i}"),
-                                (10000 + i) as u32,
-                                vec![
+                            ContainerState::new(ContainerStateParams {
+                                id: format!("bench-{i}"),
+                                name: format!("bench-{i}"),
+                                pid: (10000 + i) as u32,
+                                command: vec![
                                     "/bin/sh".to_string(),
                                     "-c".to_string(),
                                     "echo hello".to_string(),
                                 ],
-                                Some(512 * 1024 * 1024),
-                                Some(2000),
-                                false,
-                                true,
-                                Some(format!("/sys/fs/cgroup/nucleus-bench-{i}")),
-                            )
+                                memory_limit: Some(512 * 1024 * 1024),
+                                cpu_limit: Some(2000),
+                                using_gvisor: false,
+                                rootless: true,
+                                cgroup_path: Some(format!("/sys/fs/cgroup/nucleus-bench-{i}")),
+                            })
                         })
                         .collect(),
                 );
@@ -288,17 +288,17 @@ fn concurrent_state_file_io(c: &mut Criterion) {
                         let dir = TempDir::new().unwrap();
                         let states: Vec<_> = (0..threads)
                             .map(|i| {
-                                ContainerState::new(
-                                    format!("bench-{i}"),
-                                    format!("bench-{i}"),
-                                    (10000 + i) as u32,
-                                    vec!["/bin/sh".to_string()],
-                                    Some(512 * 1024 * 1024),
-                                    Some(2000),
-                                    false,
-                                    true,
-                                    None,
-                                )
+                                ContainerState::new(ContainerStateParams {
+                                    id: format!("bench-{i}"),
+                                    name: format!("bench-{i}"),
+                                    pid: (10000 + i) as u32,
+                                    command: vec!["/bin/sh".to_string()],
+                                    memory_limit: Some(512 * 1024 * 1024),
+                                    cpu_limit: Some(2000),
+                                    using_gvisor: false,
+                                    rootless: true,
+                                    cgroup_path: None,
+                                })
                             })
                             .collect();
                         (dir, states)

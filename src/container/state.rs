@@ -97,38 +97,40 @@ fn default_oci_status() -> OciStatus {
     OciStatus::Stopped
 }
 
+/// Parameters for creating a new `ContainerState`.
+pub struct ContainerStateParams {
+    pub id: String,
+    pub name: String,
+    pub pid: u32,
+    pub command: Vec<String>,
+    pub memory_limit: Option<u64>,
+    pub cpu_limit: Option<u64>,
+    pub using_gvisor: bool,
+    pub rootless: bool,
+    pub cgroup_path: Option<String>,
+}
+
 impl ContainerState {
-    /// Create a new container state
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        id: String,
-        name: String,
-        pid: u32,
-        command: Vec<String>,
-        memory_limit: Option<u64>,
-        cpu_limit: Option<u64>,
-        using_gvisor: bool,
-        rootless: bool,
-        cgroup_path: Option<String>,
-    ) -> Self {
+    /// Create a new container state from the given parameters.
+    pub fn new(params: ContainerStateParams) -> Self {
         let started_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let start_ticks = Self::read_start_ticks(pid);
+        let start_ticks = Self::read_start_ticks(params.pid);
 
         Self {
-            id,
-            name,
-            pid,
-            command,
+            id: params.id,
+            name: params.name,
+            pid: params.pid,
+            command: params.command,
             started_at,
-            memory_limit,
-            cpu_limit,
-            using_gvisor,
-            rootless,
-            cgroup_path,
+            memory_limit: params.memory_limit,
+            cpu_limit: params.cpu_limit,
+            using_gvisor: params.using_gvisor,
+            rootless: params.rootless,
+            cgroup_path: params.cgroup_path,
             config_hash: None,
             creator_uid: nix::unistd::Uid::effective().as_raw(),
             start_ticks,
@@ -233,6 +235,15 @@ pub struct ContainerStateManager {
 }
 
 impl ContainerStateManager {
+    /// Create a state manager rooted at an explicit directory, falling back to
+    /// default candidates if `root` is `None`.
+    pub fn new_with_root(root: Option<PathBuf>) -> Result<Self> {
+        if let Some(root) = root {
+            return Self::with_state_dir(root);
+        }
+        Self::new()
+    }
+
     /// Create a new state manager
     ///
     /// Creates the state directory if it doesn't exist
@@ -645,17 +656,17 @@ mod tests {
 
     #[test]
     fn test_container_state_new() {
-        let state = ContainerState::new(
-            "test".to_string(),
-            "test".to_string(),
-            1234,
-            vec!["/bin/sh".to_string()],
-            Some(512 * 1024 * 1024),
-            Some(2000),
-            false,
-            false,
-            Some("/sys/fs/cgroup/nucleus-test".to_string()),
-        );
+        let state = ContainerState::new(ContainerStateParams {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            pid: 1234,
+            command: vec!["/bin/sh".to_string()],
+            memory_limit: Some(512 * 1024 * 1024),
+            cpu_limit: Some(2000),
+            using_gvisor: false,
+            rootless: false,
+            cgroup_path: Some("/sys/fs/cgroup/nucleus-test".to_string()),
+        });
 
         assert_eq!(state.id, "test");
         assert_eq!(state.pid, 1234);
@@ -668,17 +679,17 @@ mod tests {
     fn test_save_and_load_state() {
         let (mgr, _temp_dir) = temp_state_manager();
 
-        let state = ContainerState::new(
-            "test".to_string(),
-            "test".to_string(),
-            1234,
-            vec!["/bin/sh".to_string()],
-            Some(512 * 1024 * 1024),
-            None,
-            false,
-            false,
-            None,
-        );
+        let state = ContainerState::new(ContainerStateParams {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            pid: 1234,
+            command: vec!["/bin/sh".to_string()],
+            memory_limit: Some(512 * 1024 * 1024),
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: false,
+            cgroup_path: None,
+        });
 
         mgr.save_state(&state).unwrap();
 
@@ -692,17 +703,17 @@ mod tests {
     fn test_delete_state() {
         let (mgr, _temp_dir) = temp_state_manager();
 
-        let state = ContainerState::new(
-            "test".to_string(),
-            "test".to_string(),
-            1234,
-            vec!["/bin/sh".to_string()],
-            None,
-            None,
-            false,
-            false,
-            None,
-        );
+        let state = ContainerState::new(ContainerStateParams {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            pid: 1234,
+            command: vec!["/bin/sh".to_string()],
+            memory_limit: None,
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: false,
+            cgroup_path: None,
+        });
 
         mgr.save_state(&state).unwrap();
         assert!(mgr.load_state("test").is_ok());
@@ -715,29 +726,29 @@ mod tests {
     fn test_list_states() {
         let (mgr, _temp_dir) = temp_state_manager();
 
-        let state1 = ContainerState::new(
-            "test1".to_string(),
-            "test1".to_string(),
-            1234,
-            vec!["/bin/sh".to_string()],
-            None,
-            None,
-            false,
-            false,
-            None,
-        );
+        let state1 = ContainerState::new(ContainerStateParams {
+            id: "test1".to_string(),
+            name: "test1".to_string(),
+            pid: 1234,
+            command: vec!["/bin/sh".to_string()],
+            memory_limit: None,
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: false,
+            cgroup_path: None,
+        });
 
-        let state2 = ContainerState::new(
-            "test2".to_string(),
-            "test2".to_string(),
-            5678,
-            vec!["/bin/bash".to_string()],
-            None,
-            None,
-            false,
-            false,
-            None,
-        );
+        let state2 = ContainerState::new(ContainerStateParams {
+            id: "test2".to_string(),
+            name: "test2".to_string(),
+            pid: 5678,
+            command: vec!["/bin/bash".to_string()],
+            memory_limit: None,
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: false,
+            cgroup_path: None,
+        });
 
         mgr.save_state(&state1).unwrap();
         mgr.save_state(&state2).unwrap();
@@ -750,17 +761,17 @@ mod tests {
     fn test_resolve_container_by_id() {
         let (mgr, _temp_dir) = temp_state_manager();
 
-        let state = ContainerState::new(
-            "abc123def456".to_string(),
-            "mycontainer".to_string(),
-            1234,
-            vec!["/bin/sh".to_string()],
-            None,
-            None,
-            false,
-            false,
-            None,
-        );
+        let state = ContainerState::new(ContainerStateParams {
+            id: "abc123def456".to_string(),
+            name: "mycontainer".to_string(),
+            pid: 1234,
+            command: vec!["/bin/sh".to_string()],
+            memory_limit: None,
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: false,
+            cgroup_path: None,
+        });
         mgr.save_state(&state).unwrap();
 
         // Exact ID
@@ -785,17 +796,17 @@ mod tests {
         let (mgr, temp_dir) = temp_state_manager();
 
         // Create a real state file
-        let state = ContainerState::new(
-            "real".to_string(),
-            "real".to_string(),
-            1234,
-            vec!["/bin/sh".to_string()],
-            None,
-            None,
-            false,
-            false,
-            None,
-        );
+        let state = ContainerState::new(ContainerStateParams {
+            id: "real".to_string(),
+            name: "real".to_string(),
+            pid: 1234,
+            command: vec!["/bin/sh".to_string()],
+            memory_limit: None,
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: false,
+            cgroup_path: None,
+        });
         mgr.save_state(&state).unwrap();
 
         // Create a symlink pointing to the real state file
@@ -815,17 +826,17 @@ mod tests {
         let (mgr, temp_dir) = temp_state_manager();
 
         // Create a real state file
-        let state = ContainerState::new(
-            "real123456789012345678".to_string(),
-            "real".to_string(),
-            1234,
-            vec!["/bin/sh".to_string()],
-            None,
-            None,
-            false,
-            false,
-            None,
-        );
+        let state = ContainerState::new(ContainerStateParams {
+            id: "real123456789012345678".to_string(),
+            name: "real".to_string(),
+            pid: 1234,
+            command: vec!["/bin/sh".to_string()],
+            memory_limit: None,
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: false,
+            cgroup_path: None,
+        });
         mgr.save_state(&state).unwrap();
 
         // Create a symlink masquerading as a state file
@@ -845,17 +856,17 @@ mod tests {
         // H-3: O_NOFOLLOW on save must prevent writing through a symlink
         let (mgr, temp_dir) = temp_state_manager();
 
-        let state = ContainerState::new(
-            "target".to_string(),
-            "target".to_string(),
-            1234,
-            vec!["/bin/sh".to_string()],
-            None,
-            None,
-            false,
-            false,
-            None,
-        );
+        let state = ContainerState::new(ContainerStateParams {
+            id: "target".to_string(),
+            name: "target".to_string(),
+            pid: 1234,
+            command: vec!["/bin/sh".to_string()],
+            memory_limit: None,
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: false,
+            cgroup_path: None,
+        });
 
         // Pre-create a symlink at the temp path to simulate an attack
         let tmp_path = temp_dir.path().join("target.json.tmp");
@@ -874,17 +885,17 @@ mod tests {
     fn test_is_running_returns_false_when_start_ticks_is_zero() {
         // BUG-04: When start_ticks=0 (failed to read), is_running() must return
         // false to avoid PID reuse false positives, not fall back to existence check
-        let mut state = ContainerState::new(
-            "test".to_string(),
-            "test".to_string(),
-            std::process::id(), // our PID exists in /proc
-            vec!["/bin/sh".to_string()],
-            None,
-            None,
-            false,
-            false,
-            None,
-        );
+        let mut state = ContainerState::new(ContainerStateParams {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            pid: std::process::id(), // our PID exists in /proc
+            command: vec!["/bin/sh".to_string()],
+            memory_limit: None,
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: false,
+            cgroup_path: None,
+        });
         // Force start_ticks to 0 to simulate failed read
         state.start_ticks = 0;
         // With BUG-04 present, this returns true (falls back to existence check)

@@ -4,11 +4,12 @@ use std::path::Path;
 use tracing::info;
 
 /// Context population mode
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, clap::ValueEnum)]
 pub enum ContextMode {
     /// Traditional copy (default, backward compatible)
     Copy,
     /// Bind mount for zero-copy, instant access
+    #[value(name = "bind")]
     BindMount,
 }
 

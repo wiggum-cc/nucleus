@@ -1,4 +1,4 @@
-pub mod attach;
+mod attach;
 mod namespaces;
 mod state;
 mod usermap;

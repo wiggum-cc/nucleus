@@ -1,5 +1,5 @@
 use crate::error::{NucleusError, Result};
-use crate::security::OciBundle;
+use crate::oci::OciBundle;
 use nix::unistd::Uid;
 use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;
@@ -20,7 +20,7 @@ pub enum GVisorNetworkMode {
 }
 
 /// Platform backend for gVisor's Sentry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum GVisorPlatform {
     /// systrap backend, the current default and most broadly compatible option.
     #[default]

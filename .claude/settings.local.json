@@ -4,7 +4,8 @@
       "Bash(git add:*)",
       "Bash(cargo build:*)",
       "Bash(cargo test:*)",
-      "Bash(apalache-mc check:*)"
+      "Bash(apalache-mc check:*)",
+      "Bash(cargo check:*)"
     ]
   }
 }

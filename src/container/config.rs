@@ -29,7 +29,7 @@ pub fn generate_container_id() -> crate::error::Result<String> {
 /// Trust level for a container workload.
 ///
 /// Determines the minimum isolation guarantees the runtime must enforce.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum TrustLevel {
     /// Native kernel isolation (namespaces + seccomp + Landlock) is acceptable.
     Trusted,
@@ -42,7 +42,7 @@ pub enum TrustLevel {
 ///
 /// Determines whether the container runs as an ephemeral agent sandbox
 /// or a long-running production service with stricter requirements.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum ServiceMode {
     /// Ephemeral agent workload (default). Allows degraded fallbacks.
     #[default]
@@ -56,7 +56,7 @@ pub enum ServiceMode {
 }
 
 /// Required host kernel lockdown mode, when asserted by the runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum KernelLockdownMode {
     /// Integrity mode blocks kernel writes from privileged userspace.
     Integrity,
@@ -262,7 +262,7 @@ pub struct ContainerConfig {
 }
 
 /// Seccomp operating mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum SeccompMode {
     /// Normal enforcement — deny unlisted syscalls.
     #[default]
@@ -737,6 +737,90 @@ impl ContainerConfig {
 
         Ok(())
     }
+
+    /// Apply runtime selection (native vs gVisor) and OCI bundle mode.
+    pub fn apply_runtime_selection(
+        mut self,
+        runtime: &str,
+        oci: bool,
+    ) -> crate::error::Result<Self> {
+        match runtime {
+            "native" => {
+                if oci {
+                    return Err(crate::error::NucleusError::ConfigError(
+                        "--bundle requires gVisor runtime; use --runtime gvisor".to_string(),
+                    ));
+                }
+                self = self.with_gvisor(false).with_trust_level(TrustLevel::Trusted);
+            }
+            "gvisor" => {
+                self = self.with_gvisor(true);
+                if !oci {
+                    tracing::info!(
+                        "Security hardening: enabling OCI bundle mode for gVisor runtime"
+                    );
+                }
+                self = self.with_oci_bundle();
+            }
+            other => {
+                return Err(crate::error::NucleusError::ConfigError(format!(
+                    "Unknown runtime '{}'; supported values are 'native' and 'gvisor'",
+                    other
+                )));
+            }
+        }
+        Ok(self)
+    }
+}
+
+/// Validate a container name for safe use.
+pub fn validate_container_name(name: &str) -> crate::error::Result<()> {
+    if name.is_empty() || name.len() > 128 {
+        return Err(crate::error::NucleusError::ConfigError(
+            "Invalid container name: must be 1-128 characters".to_string(),
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(crate::error::NucleusError::ConfigError(
+            "Invalid container name: allowed characters are a-zA-Z0-9, '-', '_', '.'".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a hostname according to RFC 1123.
+pub fn validate_hostname(hostname: &str) -> crate::error::Result<()> {
+    if hostname.is_empty() || hostname.len() > 253 {
+        return Err(crate::error::NucleusError::ConfigError(
+            "Invalid hostname: must be 1-253 characters".to_string(),
+        ));
+    }
+
+    for label in hostname.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(crate::error::NucleusError::ConfigError(format!(
+                "Invalid hostname label: '{}'",
+                label
+            )));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(crate::error::NucleusError::ConfigError(format!(
+                "Invalid hostname label '{}': cannot start or end with '-'",
+                label
+            )));
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(crate::error::NucleusError::ConfigError(format!(
+                "Invalid hostname label '{}': allowed characters are a-zA-Z0-9 and '-'",
+                label
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -5,27 +5,27 @@
 #[cfg(test)]
 mod tests {
     use nucleus::checkpoint::CheckpointMetadata;
-    use nucleus::container::ContainerState;
+    use nucleus::container::{ContainerState, ContainerStateParams};
     use std::fs;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
     fn sample_state() -> ContainerState {
-        ContainerState::new(
-            "abc123def456".to_string(),
-            "my-worker".to_string(),
-            12345,
-            vec![
+        ContainerState::new(ContainerStateParams {
+            id: "abc123def456".to_string(),
+            name: "my-worker".to_string(),
+            pid: 12345,
+            command: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
                 "while true; do sleep 1; done".to_string(),
             ],
-            Some(256 * 1024 * 1024),
-            Some(1000),
-            false,
-            true,
-            Some("/sys/fs/cgroup/nucleus-abc123def456".to_string()),
-        )
+            memory_limit: Some(256 * 1024 * 1024),
+            cpu_limit: Some(1000),
+            using_gvisor: false,
+            rootless: true,
+            cgroup_path: Some("/sys/fs/cgroup/nucleus-abc123def456".to_string()),
+        })
     }
 
     #[test]

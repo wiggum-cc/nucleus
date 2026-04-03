@@ -7,7 +7,7 @@ mod tests {
     use nucleus::container::{ContainerConfig, TrustLevel};
     use nucleus::error::NucleusError;
     use nucleus::isolation::NamespaceConfig;
-    use nucleus::network::{BridgeConfig, EgressPolicy, NetworkMode, PortForward};
+    use nucleus::network::{BridgeConfig, EgressPolicy, NetworkMode, PortForward, Protocol};
 
     // --- BridgeConfig validation ---
 
@@ -157,7 +157,7 @@ mod tests {
         let pf = PortForward::parse("8080:80").unwrap();
         assert_eq!(pf.host_port, 8080);
         assert_eq!(pf.container_port, 80);
-        assert_eq!(pf.protocol, "tcp");
+        assert_eq!(pf.protocol, Protocol::Tcp);
     }
 
     #[test]
@@ -165,7 +165,7 @@ mod tests {
         let pf = PortForward::parse("3000:3000/tcp").unwrap();
         assert_eq!(pf.host_port, 3000);
         assert_eq!(pf.container_port, 3000);
-        assert_eq!(pf.protocol, "tcp");
+        assert_eq!(pf.protocol, Protocol::Tcp);
     }
 
     #[test]
@@ -173,7 +173,7 @@ mod tests {
         let pf = PortForward::parse("5353:53/udp").unwrap();
         assert_eq!(pf.host_port, 5353);
         assert_eq!(pf.container_port, 53);
-        assert_eq!(pf.protocol, "udp");
+        assert_eq!(pf.protocol, Protocol::Udp);
     }
 
     #[test]

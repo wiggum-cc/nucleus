@@ -52,36 +52,42 @@ impl BridgeConfig {
     }
 
     /// Validate all fields to prevent argument injection into ip/iptables commands.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> crate::error::Result<()> {
         // Bridge name: alphanumeric, dash, underscore; max 15 chars (Linux IFNAMSIZ)
         if self.bridge_name.is_empty() || self.bridge_name.len() > 15 {
-            return Err(format!(
+            return Err(crate::error::NucleusError::NetworkError(format!(
                 "Bridge name must be 1-15 characters, got '{}'",
                 self.bridge_name
-            ));
+            )));
         }
         if !self
             .bridge_name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         {
-            return Err(format!(
+            return Err(crate::error::NucleusError::NetworkError(format!(
                 "Bridge name contains invalid characters (allowed: a-zA-Z0-9_-): '{}'",
                 self.bridge_name
-            ));
+            )));
         }
 
         // Subnet: must be valid IPv4 CIDR
-        validate_ipv4_cidr(&self.subnet)?;
+        validate_ipv4_cidr(&self.subnet).map_err(|e| {
+            crate::error::NucleusError::NetworkError(e)
+        })?;
 
         // Container IP (if specified)
         if let Some(ref ip) = self.container_ip {
-            validate_ipv4_addr(ip)?;
+            validate_ipv4_addr(ip).map_err(|e| {
+                crate::error::NucleusError::NetworkError(e)
+            })?;
         }
 
         // DNS servers
         for dns in &self.dns {
-            validate_ipv4_addr(dns)?;
+            validate_ipv4_addr(dns).map_err(|e| {
+                crate::error::NucleusError::NetworkError(e)
+            })?;
         }
 
         Ok(())
@@ -188,6 +194,28 @@ impl EgressPolicy {
     }
 }
 
+/// Network protocol for port forwarding rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Tcp,
+    Udp,
+}
+
+impl Protocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+impl std::fmt::Display for Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Port forwarding rule
 #[derive(Debug, Clone)]
 pub struct PortForward {
@@ -196,35 +224,45 @@ pub struct PortForward {
     /// Container port
     pub container_port: u16,
     /// Protocol (tcp/udp)
-    pub protocol: String,
+    pub protocol: Protocol,
 }
 
 impl PortForward {
     /// Parse a port forward spec like "8080:80" or "8080:80/udp"
-    pub fn parse(spec: &str) -> Result<Self, String> {
+    pub fn parse(spec: &str) -> crate::error::Result<Self> {
         let (ports, protocol) = if let Some((p, proto)) = spec.rsplit_once('/') {
-            if proto != "tcp" && proto != "udp" {
-                return Err(format!("Invalid protocol '{}', must be tcp or udp", proto));
-            }
-            (p, proto.to_string())
+            let protocol = match proto {
+                "tcp" => Protocol::Tcp,
+                "udp" => Protocol::Udp,
+                _ => {
+                    return Err(crate::error::NucleusError::ConfigError(format!(
+                        "Invalid protocol '{}', must be tcp or udp",
+                        proto
+                    )))
+                }
+            };
+            (p, protocol)
         } else {
-            (spec, "tcp".to_string())
+            (spec, Protocol::Tcp)
         };
 
         let parts: Vec<&str> = ports.split(':').collect();
         if parts.len() != 2 {
-            return Err(format!(
+            return Err(crate::error::NucleusError::ConfigError(format!(
                 "Invalid port forward format '{}', expected HOST:CONTAINER",
                 spec
-            ));
+            )));
         }
 
-        let host_port: u16 = parts[0]
-            .parse()
-            .map_err(|_| format!("Invalid host port: {}", parts[0]))?;
-        let container_port: u16 = parts[1]
-            .parse()
-            .map_err(|_| format!("Invalid container port: {}", parts[1]))?;
+        let host_port: u16 = parts[0].parse().map_err(|_| {
+            crate::error::NucleusError::ConfigError(format!("Invalid host port: {}", parts[0]))
+        })?;
+        let container_port: u16 = parts[1].parse().map_err(|_| {
+            crate::error::NucleusError::ConfigError(format!(
+                "Invalid container port: {}",
+                parts[1]
+            ))
+        })?;
 
         Ok(Self {
             host_port,
@@ -243,12 +281,12 @@ mod tests {
         let pf = PortForward::parse("8080:80").unwrap();
         assert_eq!(pf.host_port, 8080);
         assert_eq!(pf.container_port, 80);
-        assert_eq!(pf.protocol, "tcp");
+        assert_eq!(pf.protocol, Protocol::Tcp);
 
         let pf = PortForward::parse("5353:53/udp").unwrap();
         assert_eq!(pf.host_port, 5353);
         assert_eq!(pf.container_port, 53);
-        assert_eq!(pf.protocol, "udp");
+        assert_eq!(pf.protocol, Protocol::Udp);
     }
 
     #[test]

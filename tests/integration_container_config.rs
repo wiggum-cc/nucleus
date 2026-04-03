@@ -6,8 +6,8 @@
 #[cfg(test)]
 mod tests {
     use nucleus::container::{
-        generate_container_id, ContainerConfig, ContainerState, HealthCheck, ReadinessProbe,
-        SecretMount, ServiceMode, TrustLevel,
+        generate_container_id, ContainerConfig, ContainerState, ContainerStateParams, HealthCheck,
+        ReadinessProbe, SecretMount, ServiceMode, TrustLevel,
     };
     use nucleus::filesystem::ContextMode;
     use nucleus::isolation::NamespaceConfig;
@@ -372,17 +372,17 @@ mod tests {
 
     #[test]
     fn test_container_state_uptime() {
-        let state = ContainerState::new(
-            "test".to_string(),
-            "test".to_string(),
-            std::process::id(),
-            vec!["/bin/sh".to_string()],
-            None,
-            None,
-            false,
-            false,
-            None,
-        );
+        let state = ContainerState::new(ContainerStateParams {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            pid: std::process::id(),
+            command: vec!["/bin/sh".to_string()],
+            memory_limit: None,
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: false,
+            cgroup_path: None,
+        });
 
         // Uptime should be very small (just created)
         assert!(state.uptime() < 5);
@@ -390,21 +390,21 @@ mod tests {
 
     #[test]
     fn test_container_state_serialization() {
-        let state = ContainerState::new(
-            "abc123".to_string(),
-            "myapp".to_string(),
-            12345,
-            vec![
+        let state = ContainerState::new(ContainerStateParams {
+            id: "abc123".to_string(),
+            name: "myapp".to_string(),
+            pid: 12345,
+            command: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
                 "echo hi".to_string(),
             ],
-            Some(512 * 1024 * 1024),
-            Some(2000),
-            true,
-            false,
-            Some("/sys/fs/cgroup/nucleus-abc123".to_string()),
-        );
+            memory_limit: Some(512 * 1024 * 1024),
+            cpu_limit: Some(2000),
+            using_gvisor: true,
+            rootless: false,
+            cgroup_path: Some("/sys/fs/cgroup/nucleus-abc123".to_string()),
+        });
 
         let json = serde_json::to_string(&state).unwrap();
         let deserialized: ContainerState = serde_json::from_str(&json).unwrap();

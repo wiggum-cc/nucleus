@@ -1,29 +1,27 @@
 use crate::audit::{audit, audit_error, AuditEventType};
 use crate::container::{
-    ContainerConfig, ContainerState, ContainerStateManager, KernelLockdownMode, OciStatus,
-    ServiceMode, TrustLevel,
+    ContainerConfig, ContainerState, ContainerStateManager, ContainerStateParams,
+    OciStatus, ServiceMode,
 };
 use crate::error::{NucleusError, Result, StateTransition};
 use crate::filesystem::{
     audit_mounts, bind_mount_host_paths, bind_mount_rootfs, create_dev_nodes, create_minimal_fs,
     mask_proc_paths, mount_procfs, mount_secrets, mount_secrets_inmemory,
-    resolve_container_destination, snapshot_context_dir, switch_root, verify_context_manifest,
-    verify_rootfs_attestation, ContextPopulator, FilesystemState, LazyContextPopulator, TmpfsMount,
+    snapshot_context_dir, switch_root, verify_context_manifest,
+    verify_rootfs_attestation, FilesystemState, LazyContextPopulator, TmpfsMount,
 };
-use crate::isolation::{NamespaceCommandRunner, NamespaceManager, NamespaceProbe};
+use crate::isolation::{NamespaceManager};
 use crate::network::{BridgeNetwork, NetworkMode};
 use crate::resources::Cgroup;
 use crate::security::{
-    seccomp_trace::SeccompTraceReader, CapabilityManager, GVisorNetworkMode, GVisorRuntime,
-    LandlockManager, OciBundle, OciConfig, OciContainerState, OciHooks, OciMount, SeccompManager,
-    SecurityState,
+    CapabilityManager, GVisorRuntime, LandlockManager,
+    OciContainerState, OciHooks, SeccompManager, SeccompTraceReader, SecurityState,
 };
 use nix::sys::signal::{kill, Signal};
 use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
 use nix::sys::stat::Mode;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, pipe, read, write, ForkResult, Pid};
-use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use tempfile::Builder;
@@ -38,25 +36,25 @@ use tracing::{debug, error, info, info_span, warn};
 /// 4. Drop capabilities and apply seccomp (Nucleus_Security_SecurityEnforcement.tla)
 /// 5. Execute target process
 pub struct Container {
-    config: ContainerConfig,
+    pub(super) config: ContainerConfig,
     /// Pre-resolved runsc path, resolved before fork so that user-namespace
     /// UID changes don't block PATH-based lookup.
-    runsc_path: Option<String>,
+    pub(super) runsc_path: Option<String>,
 }
 
 /// Handle returned by `Container::create()` representing a container whose
 /// child process has been forked and is blocked on the exec FIFO, waiting for
 /// `start()` to release it.
 pub struct CreatedContainer {
-    config: ContainerConfig,
-    state_mgr: ContainerStateManager,
-    state: ContainerState,
-    child: Pid,
-    cgroup_opt: Option<Cgroup>,
-    bridge_net: Option<BridgeNetwork>,
-    trace_reader: Option<SeccompTraceReader>,
-    exec_fifo_path: PathBuf,
-    _lifecycle_span: tracing::Span,
+    pub(super) config: ContainerConfig,
+    pub(super) state_mgr: ContainerStateManager,
+    pub(super) state: ContainerState,
+    pub(super) child: Pid,
+    pub(super) cgroup_opt: Option<Cgroup>,
+    pub(super) bridge_net: Option<BridgeNetwork>,
+    pub(super) trace_reader: Option<SeccompTraceReader>,
+    pub(super) exec_fifo_path: PathBuf,
+    pub(super) _lifecycle_span: tracing::Span,
 }
 
 impl Container {
@@ -250,17 +248,17 @@ impl Container {
                     .limits
                     .cpu_quota_us
                     .map(|quota| (quota * 1000) / config.limits.cpu_period_us);
-                let mut state = ContainerState::new(
-                    config.id.clone(),
-                    config.name.clone(),
-                    target_pid,
-                    config.command.clone(),
-                    config.limits.memory_bytes,
-                    cpu_millicores,
-                    config.use_gvisor,
-                    config.user_ns_config.is_some(),
+                let mut state = ContainerState::new(ContainerStateParams {
+                    id: config.id.clone(),
+                    name: config.name.clone(),
+                    pid: target_pid,
+                    command: config.command.clone(),
+                    memory_limit: config.limits.memory_bytes,
+                    cpu_limit: cpu_millicores,
+                    using_gvisor: config.use_gvisor,
+                    rootless: config.user_ns_config.is_some(),
                     cgroup_path,
-                );
+                });
                 state.config_hash = config.config_hash;
                 state.bundle_path = config.rootfs_path.as_ref().map(|p| p.display().to_string());
 
@@ -433,6 +431,9 @@ impl Container {
             Self::notify_namespace_ready(&fd, std::process::id())?;
         }
 
+        // Namespace: Unshared -> Entered (process is now inside all namespaces)
+        namespace_mgr.enter()?;
+
         // 2. Ensure no_new_privs BEFORE any mount operations.
         // This prevents exploitation of setuid binaries on bind-mounted paths
         // even if a subsequent MS_NOSUID remount fails.
@@ -531,7 +532,7 @@ impl Container {
                 let hook_state = OciContainerState {
                     oci_version: "1.0.2".to_string(),
                     id: self.config.id.clone(),
-                    status: "creating".to_string(),
+                    status: OciStatus::Creating,
                     pid: std::process::id(),
                     bundle: String::new(),
                 };
@@ -560,7 +561,7 @@ impl Container {
                 let hook_state = OciContainerState {
                     oci_version: "1.0.2".to_string(),
                     id: self.config.id.clone(),
-                    status: "created".to_string(),
+                    status: OciStatus::Created,
                     pid: std::process::id(),
                     bundle: String::new(),
                 };
@@ -771,7 +772,7 @@ impl Container {
                 let hook_state = OciContainerState {
                     oci_version: "1.0.2".to_string(),
                     id: self.config.id.clone(),
-                    status: "running".to_string(),
+                    status: OciStatus::Running,
                     pid: std::process::id(),
                     bundle: String::new(),
                 };
@@ -792,539 +793,8 @@ impl Container {
         Ok(())
     }
 
-    /// Set up container with gVisor and exec
-    fn setup_and_exec_gvisor(&self) -> Result<()> {
-        info!("Using gVisor runtime");
-
-        let gvisor = if let Some(ref path) = self.runsc_path {
-            GVisorRuntime::with_path(path.clone())
-        } else {
-            GVisorRuntime::new().map_err(|e| {
-                NucleusError::GVisorError(format!("Failed to initialize gVisor runtime: {}", e))
-            })?
-        };
-
-        self.setup_and_exec_gvisor_oci(&gvisor)
-    }
-
-    /// Set up container with gVisor using OCI bundle format
-    fn setup_and_exec_gvisor_oci(&self, gvisor: &GVisorRuntime) -> Result<()> {
-        info!("Using gVisor with OCI bundle format");
-
-        let mut oci_config =
-            OciConfig::new(self.config.command.clone(), self.config.hostname.clone());
-        let context_manifest = if self.config.verify_context_integrity {
-            self.config
-                .context_dir
-                .as_ref()
-                .map(|dir| snapshot_context_dir(dir))
-                .transpose()?
-        } else {
-            None
-        };
-
-        oci_config = oci_config.with_resources(&self.config.limits);
-        oci_config = oci_config.with_namespace_config(&self.config.namespaces);
-
-        // Inject user-configured environment variables
-        if !self.config.environment.is_empty() {
-            oci_config = oci_config.with_env(&self.config.environment);
-        }
-
-        // Pass through sd_notify socket
-        if self.config.sd_notify {
-            oci_config = oci_config.with_sd_notify();
-        }
-
-        // Mount pre-built rootfs if provided
-        if let Some(ref rootfs_path) = self.config.rootfs_path {
-            if self.config.verify_rootfs_attestation {
-                verify_rootfs_attestation(rootfs_path)?;
-            }
-            oci_config = oci_config.with_rootfs_binds(rootfs_path);
-        } else {
-            oci_config = oci_config.with_host_runtime_binds();
-        }
-
-        if let Some(context_dir) = &self.config.context_dir {
-            if matches!(
-                self.config.context_mode,
-                crate::filesystem::ContextMode::BindMount
-            ) {
-                ContextPopulator::new(context_dir, "/context").validate_source_tree()?;
-                oci_config = oci_config.with_context_bind(context_dir);
-            }
-        }
-
-        if !self.config.secrets.is_empty() && self.config.service_mode == ServiceMode::Production {
-            let secret_stage_dir = Self::gvisor_secret_stage_dir(&self.config.id);
-            Self::mount_gvisor_secret_stage_tmpfs(&secret_stage_dir)?;
-            let staged_secrets =
-                Self::stage_gvisor_secret_files(&secret_stage_dir, &self.config.secrets)?;
-            oci_config =
-                oci_config.with_inmemory_secret_mounts(&secret_stage_dir, &staged_secrets)?;
-        } else if !self.config.secrets.is_empty() {
-            oci_config = oci_config.with_secret_mounts(&self.config.secrets);
-        }
-
-        if let Some(user_ns_config) = &self.config.user_ns_config {
-            oci_config = oci_config.with_rootless_user_namespace(user_ns_config);
-        }
-
-        // Pass OCI hooks into the gVisor config.json so gVisor executes them
-        if let Some(ref hooks) = self.config.hooks {
-            oci_config = oci_config.with_hooks(hooks.clone());
-        }
-
-        let artifact_dir = Self::gvisor_artifact_dir(&self.config.id);
-        std::fs::create_dir_all(&artifact_dir).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to create gVisor artifact dir {:?}: {}",
-                artifact_dir, e
-            ))
-        })?;
-        // Use --bundle path if provided, otherwise default
-        let bundle_path = self
-            .config
-            .bundle_dir
-            .clone()
-            .unwrap_or_else(|| Self::gvisor_bundle_path(&self.config.id));
-        let oci_mounts = oci_config.mounts.clone();
-        let bundle = OciBundle::new(bundle_path, oci_config);
-        bundle.create()?;
-
-        let rootfs = bundle.rootfs_path();
-        create_minimal_fs(&rootfs)?;
-        Self::prepare_oci_mountpoints(&rootfs, &oci_mounts)?;
-        if let Some(context_dir) = &self.config.context_dir {
-            if matches!(
-                self.config.context_mode,
-                crate::filesystem::ContextMode::Copy
-            ) {
-                let context_dest = rootfs.join("context");
-                ContextPopulator::new(context_dir, &context_dest).populate()?;
-                if let Some(expected) = &context_manifest {
-                    verify_context_manifest(expected, &context_dest)?;
-                }
-            }
-        }
-
-        let dev_path = rootfs.join("dev");
-        create_dev_nodes(&dev_path, false)?;
-
-        // Write resolv.conf for bridge networking into the OCI rootfs
-        if let NetworkMode::Bridge(ref bridge_config) = self.config.network {
-            BridgeNetwork::write_resolv_conf(&rootfs, &bridge_config.dns)?;
-        }
-
-        // Select gVisor network mode based on container network config
-        let gvisor_net = match &self.config.network {
-            NetworkMode::None => GVisorNetworkMode::None,
-            NetworkMode::Host => GVisorNetworkMode::Host,
-            NetworkMode::Bridge(_) => GVisorNetworkMode::Sandbox,
-        };
-
-        let rootless_oci = self.config.user_ns_config.is_some();
-        gvisor.exec_with_oci_bundle_network(
-            &self.config.id,
-            &bundle,
-            gvisor_net,
-            rootless_oci,
-            self.config.gvisor_platform,
-        )?;
-
-        Ok(())
-    }
-
-    fn prepare_oci_mountpoints(rootfs: &std::path::Path, mounts: &[OciMount]) -> Result<()> {
-        for mount in mounts {
-            let normalized = crate::filesystem::normalize_container_destination(
-                std::path::Path::new(&mount.destination),
-            )
-            .map_err(|e| {
-                NucleusError::FilesystemError(format!(
-                    "Invalid OCI mount destination {:?}: {}",
-                    mount.destination, e
-                ))
-            })?;
-            let relative = normalized.strip_prefix("/").map_err(|e| {
-                NucleusError::FilesystemError(format!(
-                    "Failed to convert OCI mount destination {:?} into a rootfs-relative path: {}",
-                    normalized, e
-                ))
-            })?;
-            let target = rootfs.join(relative);
-            if mount.mount_type == "bind" && std::path::Path::new(&mount.source).is_file() {
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        NucleusError::FilesystemError(format!(
-                            "Failed to create OCI mount parent {:?}: {}",
-                            parent, e
-                        ))
-                    })?;
-                }
-                if !target.exists() {
-                    std::fs::File::create(&target).map_err(|e| {
-                        NucleusError::FilesystemError(format!(
-                            "Failed to create OCI mount target {:?}: {}",
-                            target, e
-                        ))
-                    })?;
-                }
-            } else {
-                std::fs::create_dir_all(&target).map_err(|e| {
-                    NucleusError::FilesystemError(format!(
-                        "Failed to create OCI mount target {:?}: {}",
-                        target, e
-                    ))
-                })?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn gvisor_artifact_dir(container_id: &str) -> std::path::PathBuf {
-        std::env::temp_dir()
-            .join("nucleus-gvisor")
-            .join(container_id)
-    }
-
-    fn gvisor_bundle_path(container_id: &str) -> std::path::PathBuf {
-        Self::gvisor_artifact_dir(container_id).join("bundle")
-    }
-
-    fn gvisor_secret_stage_dir(container_id: &str) -> std::path::PathBuf {
-        Self::gvisor_artifact_dir(container_id).join("secrets-stage")
-    }
-
-    fn mount_gvisor_secret_stage_tmpfs(stage_dir: &std::path::Path) -> Result<()> {
-        std::fs::create_dir_all(stage_dir).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to create gVisor secret stage dir {:?}: {}",
-                stage_dir, e
-            ))
-        })?;
-
-        nix::mount::mount(
-            Some("tmpfs"),
-            stage_dir,
-            Some("tmpfs"),
-            nix::mount::MsFlags::MS_NOSUID
-                | nix::mount::MsFlags::MS_NODEV
-                | nix::mount::MsFlags::MS_NOEXEC,
-            Some("size=16m,mode=0700"),
-        )
-        .map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to mount gVisor secret stage tmpfs at {:?}: {}",
-                stage_dir, e
-            ))
-        })
-    }
-
-    fn stage_gvisor_secret_files(
-        stage_dir: &std::path::Path,
-        secrets: &[crate::container::SecretMount],
-    ) -> Result<Vec<crate::container::SecretMount>> {
-        let mut staged = Vec::with_capacity(secrets.len());
-
-        for secret in secrets {
-            if !secret.source.exists() {
-                return Err(NucleusError::FilesystemError(format!(
-                    "Secret source does not exist: {:?}",
-                    secret.source
-                )));
-            }
-
-            let staged_source = resolve_container_destination(stage_dir, &secret.dest)?;
-            if let Some(parent) = staged_source.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    NucleusError::FilesystemError(format!(
-                        "Failed to create gVisor secret parent {:?}: {}",
-                        parent, e
-                    ))
-                })?;
-            }
-
-            let mut content = std::fs::read(&secret.source).map_err(|e| {
-                NucleusError::FilesystemError(format!(
-                    "Failed to read secret {:?}: {}",
-                    secret.source, e
-                ))
-            })?;
-            std::fs::write(&staged_source, &content).map_err(|e| {
-                NucleusError::FilesystemError(format!(
-                    "Failed to write staged secret {:?}: {}",
-                    staged_source, e
-                ))
-            })?;
-
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(
-                    &staged_source,
-                    std::fs::Permissions::from_mode(secret.mode),
-                )
-                .map_err(|e| {
-                    NucleusError::FilesystemError(format!(
-                        "Failed to set permissions on staged secret {:?}: {}",
-                        staged_source, e
-                    ))
-                })?;
-            }
-
-            zeroize::Zeroize::zeroize(&mut content);
-
-            staged.push(crate::container::SecretMount {
-                source: staged_source,
-                dest: secret.dest.clone(),
-                mode: secret.mode,
-            });
-        }
-
-        Ok(staged)
-    }
-
-    fn cleanup_gvisor_artifacts(container_id: &str) -> Result<()> {
-        let artifact_dir = Self::gvisor_artifact_dir(container_id);
-        let secret_stage_dir = Self::gvisor_secret_stage_dir(container_id);
-
-        if secret_stage_dir.exists() {
-            match nix::mount::umount2(&secret_stage_dir, nix::mount::MntFlags::MNT_DETACH) {
-                Ok(()) => {}
-                Err(nix::errno::Errno::EINVAL) | Err(nix::errno::Errno::ENOENT) => {}
-                Err(e) => {
-                    return Err(NucleusError::FilesystemError(format!(
-                        "Failed to unmount gVisor secret stage {:?}: {}",
-                        secret_stage_dir, e
-                    )));
-                }
-            }
-        }
-
-        if artifact_dir.exists() {
-            std::fs::remove_dir_all(&artifact_dir).map_err(|e| {
-                NucleusError::FilesystemError(format!(
-                    "Failed to remove gVisor artifact dir {:?}: {}",
-                    artifact_dir, e
-                ))
-            })?;
-        }
-
-        Ok(())
-    }
-
-    /// Execute the target command
-    fn exec_command(&self) -> Result<()> {
-        if self.config.command.is_empty() {
-            return Err(NucleusError::ExecError("No command specified".to_string()));
-        }
-
-        info!("Executing command: {:?}", self.config.command);
-
-        let program = CString::new(self.config.command[0].as_str())
-            .map_err(|e| NucleusError::ExecError(format!("Invalid program name: {}", e)))?;
-
-        let args: Result<Vec<CString>> = self
-            .config
-            .command
-            .iter()
-            .map(|arg| {
-                CString::new(arg.as_str())
-                    .map_err(|e| NucleusError::ExecError(format!("Invalid argument: {}", e)))
-            })
-            .collect();
-        let args = args?;
-
-        let mut env = vec![
-            CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-                .map_err(|e| NucleusError::ExecError(format!("Invalid environment PATH: {}", e)))?,
-            CString::new("TERM=xterm")
-                .map_err(|e| NucleusError::ExecError(format!("Invalid environment TERM: {}", e)))?,
-            CString::new("HOME=/")
-                .map_err(|e| NucleusError::ExecError(format!("Invalid environment HOME: {}", e)))?,
-        ];
-
-        // Pass through sd_notify socket if enabled
-        if self.config.sd_notify {
-            if let Ok(notify_socket) = std::env::var("NOTIFY_SOCKET") {
-                env.push(
-                    CString::new(format!("NOTIFY_SOCKET={}", notify_socket)).map_err(|e| {
-                        NucleusError::ExecError(format!("Invalid NOTIFY_SOCKET: {}", e))
-                    })?,
-                );
-            }
-        }
-
-        // Append user-configured environment variables
-        for (key, value) in &self.config.environment {
-            env.push(CString::new(format!("{}={}", key, value)).map_err(|e| {
-                NucleusError::ExecError(format!(
-                    "Invalid environment variable {}={}: {}",
-                    key, value, e
-                ))
-            })?);
-        }
-
-        nix::unistd::execve(&program, &args, &env)?;
-
-        Ok(())
-    }
-
-    /// Run as a minimal PID 1 init process inside the container.
-    ///
-    /// Forks a child that execs the workload. PID 1 (this process) stays alive to:
-    /// - Reap zombie processes (orphaned children)
-    /// - Forward SIGTERM/SIGINT/SIGHUP to the workload child
-    /// - Exit with the workload's exit code
-    ///
-    /// This prevents zombie accumulation in long-running production containers
-    /// and ensures clean shutdown ordering.
-    fn run_as_init(&self) -> Result<()> {
-        info!("Starting as PID 1 init supervisor (production mode)");
-        audit(
-            &self.config.id,
-            &self.config.name,
-            AuditEventType::InitSupervisorStarted,
-            "PID 1 init supervisor for zombie reaping and signal forwarding",
-        );
-
-        match unsafe { fork() }? {
-            ForkResult::Parent { child } => {
-                // PID 1: mini-init — reap zombies and forward signals
-
-                // Set up signal forwarding to the workload child
-                let mut sigset = SigSet::empty();
-                for sig in [
-                    Signal::SIGTERM,
-                    Signal::SIGINT,
-                    Signal::SIGHUP,
-                    Signal::SIGQUIT,
-                    Signal::SIGUSR1,
-                    Signal::SIGUSR2,
-                ] {
-                    sigset.add(sig);
-                }
-
-                // Block forwarded signals so we can use sigtimedwait
-                pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&sigset), None).map_err(|e| {
-                    NucleusError::ExecError(format!("Init: failed to block signals: {}", e))
-                })?;
-
-                // Spawn a thread to forward signals to the child
-                let child_pid = child;
-                std::thread::spawn(move || {
-                    while let Ok(signal) = sigset.wait() {
-                        let _ = kill(child_pid, signal);
-                    }
-                });
-
-                // Main loop: reap all children, exit when workload child exits
-                let workload_exit = loop {
-                    match waitpid(Pid::from_raw(-1), None) {
-                        Ok(WaitStatus::Exited(pid, code)) => {
-                            if pid == child {
-                                debug!("Init: workload child exited with code {}", code);
-                                break code;
-                            }
-                            debug!("Init: reaped zombie PID {} (exit code {})", pid, code);
-                        }
-                        Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                            if pid == child {
-                                let code = 128 + signal as i32;
-                                debug!(
-                                    "Init: workload child killed by signal {:?} (exit code {})",
-                                    signal, code
-                                );
-                                break code;
-                            }
-                            debug!("Init: reaped zombie PID {} (killed by {:?})", pid, signal);
-                        }
-                        Err(nix::errno::Errno::ECHILD) => {
-                            // No more children — workload must have exited
-                            debug!("Init: no more children, exiting");
-                            break 1;
-                        }
-                        Err(nix::errno::Errno::EINTR) => continue,
-                        Err(e) => {
-                            error!("Init: waitpid error: {}", e);
-                            break 1;
-                        }
-                        _ => continue,
-                    }
-                };
-
-                std::process::exit(workload_exit);
-            }
-            ForkResult::Child => {
-                // Workload child: exec the target command
-                self.exec_command()?;
-                // Should never reach here
-                Ok(())
-            }
-        }
-    }
-
-    fn enforce_no_new_privs(&self) -> Result<()> {
-        let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-        if ret != 0 {
-            return Err(NucleusError::ExecError(format!(
-                "Failed to set PR_SET_NO_NEW_PRIVS: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(())
-    }
-
-    fn assert_kernel_lockdown(config: &ContainerConfig) -> Result<()> {
-        let Some(required) = config.required_kernel_lockdown else {
-            return Ok(());
-        };
-
-        let path = "/sys/kernel/security/lockdown";
-        let content = std::fs::read_to_string(path).map_err(|e| {
-            NucleusError::ConfigError(format!(
-                "Kernel lockdown assertion requested, but {} could not be read: {}",
-                path, e
-            ))
-        })?;
-
-        let active = Self::parse_active_lockdown_mode(&content).ok_or_else(|| {
-            NucleusError::ConfigError(format!(
-                "Kernel lockdown assertion requested, but active mode could not be parsed from {}",
-                path
-            ))
-        })?;
-
-        if required.accepts(active) {
-            info!(
-                required = required.as_str(),
-                active = active.as_str(),
-                "Kernel lockdown requirement satisfied"
-            );
-            Ok(())
-        } else {
-            Err(NucleusError::ConfigError(format!(
-                "Kernel lockdown mode '{}' does not satisfy required mode '{}'",
-                active.as_str(),
-                required.as_str()
-            )))
-        }
-    }
-
-    fn parse_active_lockdown_mode(content: &str) -> Option<KernelLockdownMode> {
-        let start = content.find('[')?;
-        let end = content[start + 1..].find(']')?;
-        match &content[start + 1..start + 1 + end] {
-            "integrity" => Some(KernelLockdownMode::Integrity),
-            "confidentiality" => Some(KernelLockdownMode::Confidentiality),
-            _ => None,
-        }
-    }
-
     /// Forward selected signals to child process using sigwait (no async signal handlers).
-    fn setup_signal_forwarding_static(child: Pid) -> Result<()> {
+    pub(super) fn setup_signal_forwarding_static(child: Pid) -> Result<()> {
         let mut set = SigSet::empty();
         for signal in [
             Signal::SIGTERM,
@@ -1352,7 +822,7 @@ impl Container {
     }
 
     /// Wait for child process to exit
-    fn wait_for_child_static(child: Pid) -> Result<i32> {
+    pub(super) fn wait_for_child_static(child: Pid) -> Result<i32> {
         loop {
             match waitpid(child, None) {
                 Ok(WaitStatus::Exited(_, code)) => {
@@ -1432,285 +902,6 @@ impl Container {
                 _ => continue,
             }
         }
-    }
-
-    /// Run a readiness probe and, if sd_notify is active, send READY=1.
-    fn run_readiness_probe(
-        pid: u32,
-        container_name: &str,
-        probe: &crate::container::ReadinessProbe,
-        rootless: bool,
-        using_gvisor: bool,
-        notify_socket: Option<&str>,
-    ) -> Result<()> {
-        use crate::container::ReadinessProbe;
-
-        info!("Running readiness probe for {}", container_name);
-
-        let max_attempts = 60u32; // ~60s total with 1s sleep
-        let poll_interval = std::time::Duration::from_secs(1);
-
-        for attempt in 1..=max_attempts {
-            // Check that the container is still alive
-            let proc_path = format!("/proc/{}", pid);
-            if !std::path::Path::new(&proc_path).exists() {
-                return Err(NucleusError::ExecError(format!(
-                    "Container process {} exited before becoming ready",
-                    pid
-                )));
-            }
-
-            let ready = match probe {
-                ReadinessProbe::Exec { command } => NamespaceCommandRunner::run(
-                    pid,
-                    rootless,
-                    using_gvisor,
-                    NamespaceProbe::Exec(command.clone()),
-                    Some(std::time::Duration::from_secs(5)),
-                )?,
-                ReadinessProbe::TcpPort(port) => NamespaceCommandRunner::run(
-                    pid,
-                    rootless,
-                    using_gvisor,
-                    NamespaceProbe::TcpConnect(*port),
-                    Some(std::time::Duration::from_secs(3)),
-                )?,
-                ReadinessProbe::SdNotify => {
-                    // For SdNotify probe type, the container itself sends READY=1.
-                    // We just pass through; the systemd integration handles it.
-                    info!("Readiness probe is SdNotify; deferring to container process");
-                    return Ok(());
-                }
-            };
-
-            if ready {
-                info!(
-                    "Readiness probe passed for {} (attempt {})",
-                    container_name, attempt
-                );
-
-                // Bridge to sd_notify if configured
-                if let Some(socket_path) = notify_socket {
-                    Self::send_sd_notify(socket_path, "READY=1")?;
-                    info!("Sent READY=1 to sd_notify for {}", container_name);
-                }
-
-                return Ok(());
-            }
-
-            debug!(
-                "Readiness probe attempt {}/{} failed for {}",
-                attempt, max_attempts, container_name
-            );
-            std::thread::sleep(poll_interval);
-        }
-
-        Err(NucleusError::ExecError(format!(
-            "Readiness probe timed out after {} attempts for {}",
-            max_attempts, container_name
-        )))
-    }
-
-    /// Send a notification to the systemd notify socket.
-    fn send_sd_notify(socket_path: &str, message: &str) -> Result<()> {
-        use std::os::unix::net::UnixDatagram;
-
-        let sock = UnixDatagram::unbound().map_err(|e| {
-            NucleusError::ExecError(format!("Failed to create notify socket: {}", e))
-        })?;
-        sock.send_to(message.as_bytes(), socket_path).map_err(|e| {
-            NucleusError::ExecError(format!(
-                "Failed to send to notify socket {}: {}",
-                socket_path, e
-            ))
-        })?;
-        Ok(())
-    }
-
-    /// Run periodic health checks against the container via nsenter.
-    fn health_check_loop(
-        pid: u32,
-        container_name: &str,
-        rootless: bool,
-        using_gvisor: bool,
-        hc: &crate::container::HealthCheck,
-        cancel: &std::sync::atomic::AtomicBool,
-    ) {
-        // BUG-18: Use cancellable sleep so we exit promptly on container stop.
-        let cancellable_sleep = |dur: std::time::Duration| -> bool {
-            let step = std::time::Duration::from_millis(100);
-            let start = std::time::Instant::now();
-            while start.elapsed() < dur {
-                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    return true; // cancelled
-                }
-                std::thread::sleep(step.min(dur.saturating_sub(start.elapsed())));
-            }
-            cancel.load(std::sync::atomic::Ordering::Relaxed)
-        };
-
-        // Wait for start_period before beginning checks
-        if cancellable_sleep(hc.start_period) {
-            return;
-        }
-
-        let mut consecutive_failures: u32 = 0;
-
-        loop {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                debug!("Health check: cancelled for {}", container_name);
-                return;
-            }
-
-            // Check if the container process is still alive
-            let proc_path = format!("/proc/{}", pid);
-            if !std::path::Path::new(&proc_path).exists() {
-                debug!("Health check: container process {} gone, stopping", pid);
-                return;
-            }
-
-            match NamespaceCommandRunner::run(
-                pid,
-                rootless,
-                using_gvisor,
-                NamespaceProbe::Exec(hc.command.clone()),
-                Some(hc.timeout),
-            ) {
-                Ok(true) => {
-                    if consecutive_failures > 0 {
-                        info!(
-                            "Health check passed for {} after {} failures",
-                            container_name, consecutive_failures
-                        );
-                    }
-                    consecutive_failures = 0;
-                }
-                Ok(false) => {
-                    consecutive_failures += 1;
-                    warn!(
-                        "Health check failed for {} ({}/{})",
-                        container_name, consecutive_failures, hc.retries
-                    );
-
-                    if consecutive_failures >= hc.retries {
-                        error!(
-                            "Container {} is unhealthy after {} consecutive failures",
-                            container_name, consecutive_failures
-                        );
-                        // Signal the container to stop — the parent will handle cleanup
-                        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-                        return;
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "Health check execution failed for {}: {}",
-                        container_name, e
-                    );
-                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-                    return;
-                }
-            }
-
-            if cancellable_sleep(hc.interval) {
-                return;
-            }
-        }
-    }
-
-    fn allow_degraded_security(config: &ContainerConfig) -> bool {
-        if std::env::var("NUCLEUS_ALLOW_DEGRADED_SECURITY")
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
-            && !config.allow_degraded_security
-        {
-            warn!(
-                "Ignoring NUCLEUS_ALLOW_DEGRADED_SECURITY environment variable; use \
-                 --allow-degraded-security for explicit opt-in"
-            );
-        }
-        config.allow_degraded_security
-    }
-
-    fn apply_trust_level_guards(config: &mut ContainerConfig) -> Result<()> {
-        match config.trust_level {
-            TrustLevel::Trusted => Ok(()),
-            TrustLevel::Untrusted => {
-                // Untrusted workloads must never use host networking
-                if matches!(config.network, NetworkMode::Host) {
-                    return Err(NucleusError::ConfigError(
-                        "Untrusted workloads cannot use host network mode. \
-                         Set --trust-level trusted to override."
-                            .to_string(),
-                    ));
-                }
-
-                if !config.use_gvisor {
-                    if GVisorRuntime::is_available() {
-                        info!(
-                            "Untrusted workload: auto-enabling gVisor runtime \
-                             (runsc detected on PATH)"
-                        );
-                        config.use_gvisor = true;
-                    } else if config.allow_degraded_security {
-                        warn!(
-                            "Untrusted workload without gVisor: running with \
-                             degraded isolation (native kernel only). \
-                             Install runsc for full protection."
-                        );
-                    } else {
-                        return Err(NucleusError::ConfigError(
-                            "Untrusted workloads require gVisor (runsc). \
-                             Install runsc: https://gvisor.dev/docs/user_guide/install/ \
-                             — or pass --allow-degraded-security to run with native \
-                             kernel isolation only, or --trust-level trusted to skip \
-                             this check."
-                                .to_string(),
-                        ));
-                    }
-                }
-
-                Ok(())
-            }
-        }
-    }
-
-    fn apply_network_mode_guards(config: &mut ContainerConfig, _is_root: bool) -> Result<()> {
-        if let NetworkMode::Host = &config.network {
-            if !config.allow_host_network {
-                return Err(NucleusError::NetworkError(
-                    "Host network mode requires explicit opt-in: pass --allow-host-network"
-                        .to_string(),
-                ));
-            }
-            warn!(
-                "Host network mode enabled: container shares host network namespace and can \
-                 access localhost services, scan LAN-reachable endpoints, and bypass network \
-                 namespace isolation"
-            );
-            info!("Host network mode: skipping network namespace");
-            config.namespaces.net = false;
-        }
-        Ok(())
-    }
-
-    fn maybe_start_seccomp_trace_reader(
-        config: &ContainerConfig,
-        target_pid: u32,
-    ) -> Result<Option<SeccompTraceReader>> {
-        if config.seccomp_mode != crate::container::config::SeccompMode::Trace {
-            return Ok(None);
-        }
-
-        let log_path = config.seccomp_trace_log.as_ref().ok_or_else(|| {
-            NucleusError::ConfigError(
-                "Seccomp trace mode requires --seccomp-log / seccomp_trace_log".to_string(),
-            )
-        })?;
-
-        let mut reader = SeccompTraceReader::new(target_pid, log_path);
-        reader.start_recording()?;
-        Ok(Some(reader))
     }
 }
 
@@ -1793,7 +984,7 @@ impl CreatedContainer {
                 let hook_state = OciContainerState {
                     oci_version: "1.0.2".to_string(),
                     id: config.id.clone(),
-                    status: "running".to_string(),
+                    status: OciStatus::Running,
                     pid: target_pid,
                     bundle: String::new(),
                 };
@@ -1827,7 +1018,7 @@ impl CreatedContainer {
                 let hook_state = OciContainerState {
                     oci_version: "1.0.2".to_string(),
                     id: config.id.clone(),
-                    status: "stopped".to_string(),
+                    status: OciStatus::Stopped,
                     pid: 0,
                     bundle: String::new(),
                 };
@@ -1899,6 +1090,7 @@ impl CreatedContainer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::container::KernelLockdownMode;
     use crate::network::NetworkMode;
 
     #[test]
@@ -2027,7 +1219,8 @@ mod tests {
     fn test_health_check_loop_supports_cancellation() {
         // BUG-18: health_check_loop must accept an AtomicBool cancel flag
         // and check it between iterations for prompt shutdown.
-        let source = include_str!("runtime.rs");
+        // Function lives in health.rs after the runtime split.
+        let source = include_str!("health.rs");
         let fn_start = source.find("fn health_check_loop").unwrap();
         let fn_body = &source[fn_start..fn_start + 2500];
         assert!(
@@ -2043,7 +1236,8 @@ mod tests {
 
     #[test]
     fn test_runtime_probes_do_not_spawn_host_nsenter() {
-        let source = include_str!("runtime.rs");
+        // Both functions live in health.rs after the runtime split.
+        let source = include_str!("health.rs");
 
         let readiness_start = source.find("fn run_readiness_probe").unwrap();
         let readiness_body = &source[readiness_start..readiness_start + 2500];
@@ -2063,7 +1257,8 @@ mod tests {
     #[test]
     fn test_oci_mount_strip_prefix_no_expect() {
         // BUG-08: prepare_oci_mountpoints must not use expect() - use ? instead
-        let source = include_str!("runtime.rs");
+        // Function lives in gvisor_setup.rs after the runtime split.
+        let source = include_str!("gvisor_setup.rs");
         let fn_start = source.find("fn prepare_oci_mountpoints").unwrap();
         let fn_body = &source[fn_start..fn_start + 600];
         assert!(
@@ -2102,7 +1297,8 @@ mod tests {
     #[test]
     fn test_tcp_readiness_probe_uses_portable_check() {
         // BUG-14: TCP readiness probe must not use /dev/tcp (bash-only)
-        let source = include_str!("runtime.rs");
+        // Function lives in health.rs after the runtime split.
+        let source = include_str!("health.rs");
         let probe_fn = source.find("TcpPort(port)").unwrap();
         let probe_body = &source[probe_fn..probe_fn + 500];
         assert!(

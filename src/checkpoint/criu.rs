@@ -1,6 +1,7 @@
 use crate::checkpoint::metadata::CheckpointMetadata;
+use crate::checkpoint::state::CheckpointState;
 use crate::container::ContainerState;
-use crate::error::{NucleusError, Result};
+use crate::error::{NucleusError, Result, StateTransition};
 use nix::unistd::Uid;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -14,6 +15,7 @@ use tracing::info;
 /// Follows the same pattern as GVisorRuntime: find binary, validate, invoke via Command.
 pub struct CriuRuntime {
     binary_path: PathBuf,
+    state: CheckpointState,
 }
 
 impl CriuRuntime {
@@ -36,7 +38,10 @@ impl CriuRuntime {
         let version = String::from_utf8_lossy(&output.stdout);
         info!("Found CRIU: {}", version.trim());
 
-        Ok(Self { binary_path })
+        Ok(Self {
+            binary_path,
+            state: CheckpointState::None,
+        })
     }
 
     /// Validate a binary path for safe execution
@@ -95,8 +100,10 @@ impl CriuRuntime {
     }
 
     /// Checkpoint a running container
+    ///
+    /// State transitions: None -> Dumping -> Dumped (or Dumping -> None on failure)
     pub fn checkpoint(
-        &self,
+        &mut self,
         state: &ContainerState,
         output_dir: &Path,
         leave_running: bool,
@@ -114,6 +121,9 @@ impl CriuRuntime {
                 state.id
             )));
         }
+
+        // State transition: None -> Dumping
+        self.state = self.state.transition(CheckpointState::Dumping)?;
 
         let images_dir = Self::prepare_checkpoint_dir(output_dir)?;
 
@@ -136,10 +146,14 @@ impl CriuRuntime {
         );
 
         let output = cmd.output().map_err(|e| {
+            // Abort: Dumping -> None
+            self.state = self.state.transition(CheckpointState::None).unwrap_or(self.state);
             NucleusError::CheckpointError(format!("Failed to run criu dump: {}", e))
         })?;
 
         if !output.status.success() {
+            // Abort: Dumping -> None
+            self.state = self.state.transition(CheckpointState::None).unwrap_or(self.state);
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(NucleusError::CheckpointError(format!(
                 "criu dump failed: {}",
@@ -151,12 +165,17 @@ impl CriuRuntime {
         let metadata = CheckpointMetadata::from_state(state);
         metadata.save(output_dir)?;
 
+        // State transition: Dumping -> Dumped
+        self.state = self.state.transition(CheckpointState::Dumped)?;
+
         info!("Checkpoint complete: {:?}", output_dir);
         Ok(())
     }
 
     /// Restore a container from checkpoint
-    pub fn restore(&self, input_dir: &Path) -> Result<u32> {
+    ///
+    /// State transitions: None -> Restoring -> Restored (or Restoring -> None on failure)
+    pub fn restore(&mut self, input_dir: &Path) -> Result<u32> {
         // Requires root
         if !nix::unistd::Uid::effective().is_root() {
             return Err(NucleusError::CheckpointError(
@@ -179,6 +198,9 @@ impl CriuRuntime {
             )));
         }
 
+        // State transition: None -> Restoring
+        self.state = self.state.transition(CheckpointState::Restoring)?;
+
         // Capture the restored init PID explicitly.
         let pidfile = Builder::new()
             .prefix("nucleus-criu-restore-")
@@ -198,16 +220,23 @@ impl CriuRuntime {
             .arg(&pidfile_path)
             .output()
             .map_err(|e| {
+                // Abort: Restoring -> None
+                self.state = self.state.transition(CheckpointState::None).unwrap_or(self.state);
                 NucleusError::CheckpointError(format!("Failed to run criu restore: {}", e))
             })?;
 
         if !output.status.success() {
+            // Abort: Restoring -> None
+            self.state = self.state.transition(CheckpointState::None).unwrap_or(self.state);
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(NucleusError::CheckpointError(format!(
                 "criu restore failed: {}",
                 stderr
             )));
         }
+
+        // State transition: Restoring -> Restored
+        self.state = self.state.transition(CheckpointState::Restored)?;
 
         // Parse restored PID from pidfile, with output fallback for compatibility.
         let pid_text = fs::read_to_string(&pidfile_path).unwrap_or_default();

@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use nucleus::container::ContainerState;
+use nucleus::container::{ContainerState, ContainerStateParams};
 use nucleus::resources::{IoDeviceLimit, ResourceLimits, ResourceStats};
 use nucleus::security::OciConfig;
 use std::fs;
@@ -129,21 +129,21 @@ fn oci_config_build_and_serialize(c: &mut Criterion) {
 
 fn container_state_serde(c: &mut Criterion) {
     c.bench_function("container_state_serde", |b| {
-        let state = ContainerState::new(
-            "bench-container-001".to_string(),
-            "bench-container-001".to_string(),
-            12345,
-            vec![
+        let state = ContainerState::new(ContainerStateParams {
+            id: "bench-container-001".to_string(),
+            name: "bench-container-001".to_string(),
+            pid: 12345,
+            command: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
                 "echo hello".to_string(),
             ],
-            Some(512 * 1024 * 1024),
-            Some(2000),
-            false,
-            true,
-            Some("/sys/fs/cgroup/nucleus-bench".to_string()),
-        );
+            memory_limit: Some(512 * 1024 * 1024),
+            cpu_limit: Some(2000),
+            using_gvisor: false,
+            rootless: true,
+            cgroup_path: Some("/sys/fs/cgroup/nucleus-bench".to_string()),
+        });
 
         b.iter(|| {
             let json = serde_json::to_string(&state).unwrap();

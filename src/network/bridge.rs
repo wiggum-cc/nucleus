@@ -32,9 +32,7 @@ impl BridgeNetwork {
 
     fn setup_for(pid: u32, config: &BridgeConfig, container_id: &str) -> Result<Self> {
         // Validate all network parameters before using them in shell commands
-        config.validate().map_err(|e| {
-            NucleusError::NetworkError(format!("Invalid bridge configuration: {}", e))
-        })?;
+        config.validate()?;
 
         let mut net_state = NetworkState::Unconfigured;
         net_state = net_state.transition(NetworkState::Configuring)?;
@@ -716,7 +714,7 @@ impl BridgeNetwork {
             operation.to_string(),
             chain.to_string(),
             "-p".to_string(),
-            pf.protocol.clone(),
+            pf.protocol.as_str().to_string(),
         ];
 
         if chain == "OUTPUT" {
@@ -1030,7 +1028,7 @@ mod tests {
         let pf = PortForward {
             host_port: 8080,
             container_port: 80,
-            protocol: "tcp".to_string(),
+            protocol: crate::network::config::Protocol::Tcp,
         };
 
         let prerouting =

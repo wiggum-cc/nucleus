@@ -504,7 +504,7 @@ fn health_check_passes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::ContainerState;
+    use crate::container::{ContainerState, ContainerStateParams};
 
     #[test]
     fn test_plan_new_topology() {
@@ -554,17 +554,17 @@ memory = "256M"
         let config = TopologyConfig::from_toml(toml).unwrap();
         let temp = tempfile::TempDir::new().unwrap();
         let state_mgr = ContainerStateManager::with_state_dir(temp.path().join("nucleus")).unwrap();
-        let mut state = ContainerState::new(
-            "abc123".to_string(),
-            "test-web".to_string(),
-            std::process::id(),
-            vec!["/bin/web".to_string()],
-            None,
-            None,
-            false,
-            false,
-            None,
-        );
+        let mut state = ContainerState::new(ContainerStateParams {
+            id: "abc123".to_string(),
+            name: "test-web".to_string(),
+            pid: std::process::id(),
+            command: vec!["/bin/web".to_string()],
+            memory_limit: None,
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: false,
+            cgroup_path: None,
+        });
         state.config_hash = config.service_config_hash("web");
         state_mgr.save_state(&state).unwrap();
 
@@ -700,17 +700,17 @@ memory = "256M"
         let state_mgr = ContainerStateManager::with_state_dir(temp.path().join("nucleus")).unwrap();
 
         // Simulate a previously-running service "db" that is no longer in config
-        let state = ContainerState::new(
-            "old-db-id".to_string(),
-            "test-db".to_string(),
-            std::process::id(), // use our own PID so is_running() returns true
-            vec!["postgres".to_string()],
-            None,
-            None,
-            false,
-            false,
-            None,
-        );
+        let state = ContainerState::new(ContainerStateParams {
+            id: "old-db-id".to_string(),
+            name: "test-db".to_string(),
+            pid: std::process::id(), // use our own PID so is_running() returns true
+            command: vec!["postgres".to_string()],
+            memory_limit: None,
+            cpu_limit: None,
+            using_gvisor: false,
+            rootless: false,
+            cgroup_path: None,
+        });
         state_mgr.save_state(&state).unwrap();
 
         let plan = plan_reconcile(&config, &state_mgr).unwrap();

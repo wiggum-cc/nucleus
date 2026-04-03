@@ -11,11 +11,12 @@
 //! - **Reconcile**: Diff running vs desired state, apply changes with zero-downtime
 //! - **DNS**: Lightweight per-topology DNS for container name resolution
 
-pub mod config;
-pub mod dag;
-pub mod dns;
-pub mod reconcile;
+mod config;
+mod dag;
+mod dns;
+mod reconcile;
 
 pub use config::*;
 pub use dag::*;
+pub use dns::*;
 pub use reconcile::*;

@@ -1,4 +1,5 @@
-use crate::error::{NucleusError, Result};
+use crate::error::{NucleusError, Result, StateTransition};
+use crate::isolation::state::NamespaceState;
 use crate::isolation::usermap::{UserNamespaceConfig, UserNamespaceMapper};
 use nix::mount::MsFlags;
 use nix::sched::{unshare, CloneFlags};
@@ -114,7 +115,7 @@ impl Default for NamespaceConfig {
 /// Nucleus_Isolation_NamespaceLifecycle.tla
 pub struct NamespaceManager {
     config: NamespaceConfig,
-    unshared: bool,
+    state: NamespaceState,
     user_mapper: Option<UserNamespaceMapper>,
 }
 
@@ -122,7 +123,7 @@ impl NamespaceManager {
     pub fn new(config: NamespaceConfig) -> Self {
         Self {
             config,
-            unshared: false,
+            state: NamespaceState::Uninitialized,
             user_mapper: None,
         }
     }
@@ -138,7 +139,7 @@ impl NamespaceManager {
     /// This implements the transition: uninitialized -> unshared
     /// in the namespace state machine
     pub fn unshare_namespaces(&mut self) -> Result<()> {
-        if self.unshared {
+        if self.state != NamespaceState::Uninitialized {
             debug!("Namespaces already created, skipping");
             return Ok(());
         }
@@ -179,7 +180,8 @@ impl NamespaceManager {
             }
         }
 
-        self.unshared = true;
+        // State transition: Uninitialized -> Unshared
+        self.state = self.state.transition(NamespaceState::Unshared)?;
         info!("Successfully created namespaces");
 
         Ok(())
@@ -187,7 +189,21 @@ impl NamespaceManager {
 
     /// Check if namespaces have been created
     pub fn is_unshared(&self) -> bool {
-        self.unshared
+        self.state != NamespaceState::Uninitialized
+    }
+
+    /// Mark that the process has entered the namespaces
+    ///
+    /// State transition: Unshared -> Entered
+    pub fn enter(&mut self) -> Result<()> {
+        self.state = self.state.transition(NamespaceState::Entered)?;
+        debug!("Namespace state: {:?}", self.state);
+        Ok(())
+    }
+
+    /// Get the current namespace state
+    pub fn state(&self) -> NamespaceState {
+        self.state
     }
 
     /// Get namespace configuration

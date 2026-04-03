@@ -1,3 +1,4 @@
+use crate::container::OciStatus;
 use crate::error::{NucleusError, Result};
 use crate::filesystem::normalize_container_destination;
 use crate::isolation::{IdMapping, NamespaceConfig, UserNamespaceConfig};
@@ -357,7 +358,7 @@ pub struct OciContainerState {
     #[serde(rename = "ociVersion")]
     pub oci_version: String,
     pub id: String,
-    pub status: String,
+    pub status: OciStatus,
     pub pid: u32,
     pub bundle: String,
 }
@@ -1493,7 +1494,7 @@ mod tests {
         let state = OciContainerState {
             oci_version: "1.0.2".to_string(),
             id: "test".to_string(),
-            status: "creating".to_string(),
+            status: OciStatus::Creating,
             pid: 1234,
             bundle: "/tmp/bundle".to_string(),
         };
@@ -1578,7 +1579,7 @@ mod tests {
         let state = OciContainerState {
             oci_version: "1.0.2".to_string(),
             id: "test-container".to_string(),
-            status: "creating".to_string(),
+            status: OciStatus::Creating,
             pid: 12345,
             bundle: "/tmp/test-bundle".to_string(),
         };
@@ -1608,7 +1609,7 @@ mod tests {
         let state = OciContainerState {
             oci_version: "1.0.2".to_string(),
             id: "test".to_string(),
-            status: "creating".to_string(),
+            status: OciStatus::Creating,
             pid: 1,
             bundle: "".to_string(),
         };
@@ -1648,7 +1649,7 @@ mod tests {
         let state = OciContainerState {
             oci_version: "1.0.2".to_string(),
             id: "test".to_string(),
-            status: "stopped".to_string(),
+            status: OciStatus::Stopped,
             pid: 0,
             bundle: "".to_string(),
         };
