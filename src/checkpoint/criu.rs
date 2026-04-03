@@ -333,7 +333,7 @@ impl CriuRuntime {
 mod tests {
     use super::CriuRuntime;
     use std::fs;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use tempfile::TempDir;
 
     #[test]
@@ -380,5 +380,152 @@ mod tests {
             err.to_string().contains("symlink"),
             "expected symlink rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_prepare_checkpoint_dir_creates_images_subdir() {
+        let tmp = TempDir::new().unwrap();
+        let images = CriuRuntime::prepare_checkpoint_dir(tmp.path()).unwrap();
+        assert_eq!(images, tmp.path().join("images"));
+        assert!(images.is_dir());
+
+        // Verify permissions are 0o700
+        let mode = fs::metadata(&images).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "images dir should be mode 700, got {:o}", mode);
+    }
+
+    #[test]
+    fn test_prepare_checkpoint_dir_rejects_file_as_output_dir() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("not-a-dir");
+        fs::write(&file_path, "").unwrap();
+
+        let err = CriuRuntime::prepare_checkpoint_dir(&file_path).unwrap_err();
+        assert!(
+            err.to_string().contains("not a directory"),
+            "expected 'not a directory' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_prepare_checkpoint_dir_rejects_symlinked_output_dir() {
+        let tmp = TempDir::new().unwrap();
+        let real_dir = tmp.path().join("real");
+        fs::create_dir(&real_dir).unwrap();
+        let link = tmp.path().join("link");
+        symlink(&real_dir, &link).unwrap();
+
+        let err = CriuRuntime::prepare_checkpoint_dir(&link).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_binary_rejects_group_writable() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("criu");
+        fs::write(&bin, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o775)).unwrap();
+
+        let err = CriuRuntime::validate_binary(&bin).unwrap_err();
+        assert!(
+            err.to_string().contains("writable by group/others"),
+            "expected group-writable rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_binary_rejects_world_writable() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("criu");
+        fs::write(&bin, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o757)).unwrap();
+
+        let err = CriuRuntime::validate_binary(&bin).unwrap_err();
+        assert!(
+            err.to_string().contains("writable by group/others"),
+            "expected world-writable rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_binary_rejects_non_executable() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("criu");
+        fs::write(&bin, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let err = CriuRuntime::validate_binary(&bin).unwrap_err();
+        assert!(
+            err.to_string().contains("not executable"),
+            "expected non-executable rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_binary_accepts_secure_binary() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("criu");
+        fs::write(&bin, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        CriuRuntime::validate_binary(&bin).expect("should accept mode 0755");
+    }
+
+    #[test]
+    fn test_validate_binary_accepts_owner_only_executable() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("criu");
+        fs::write(&bin, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+
+        CriuRuntime::validate_binary(&bin).expect("should accept mode 0700");
+    }
+
+    #[test]
+    fn test_validate_binary_rejects_nonexistent() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("nonexistent");
+        assert!(CriuRuntime::validate_binary(&bin).is_err());
+    }
+
+    #[test]
+    fn test_checkpoint_state_transitions() {
+        use crate::checkpoint::state::CheckpointState;
+        use crate::error::StateTransition;
+
+        // Valid forward transitions
+        assert!(CheckpointState::None.can_transition_to(&CheckpointState::Dumping));
+        assert!(CheckpointState::Dumping.can_transition_to(&CheckpointState::Dumped));
+        assert!(CheckpointState::None.can_transition_to(&CheckpointState::Restoring));
+        assert!(CheckpointState::Restoring.can_transition_to(&CheckpointState::Restored));
+
+        // Valid abort transitions
+        assert!(CheckpointState::Dumping.can_transition_to(&CheckpointState::None));
+        assert!(CheckpointState::Restoring.can_transition_to(&CheckpointState::None));
+
+        // Invalid transitions
+        assert!(!CheckpointState::None.can_transition_to(&CheckpointState::Dumped));
+        assert!(!CheckpointState::None.can_transition_to(&CheckpointState::Restored));
+        assert!(!CheckpointState::Dumped.can_transition_to(&CheckpointState::Restoring));
+        assert!(!CheckpointState::Restored.can_transition_to(&CheckpointState::Dumping));
+    }
+
+    #[test]
+    fn test_prepare_checkpoint_dir_sets_secure_permissions() {
+        let tmp = TempDir::new().unwrap();
+        CriuRuntime::prepare_checkpoint_dir(tmp.path()).unwrap();
+
+        // Both output dir and images subdir should be 0700
+        let output_mode = fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777;
+        let images_mode = fs::metadata(tmp.path().join("images"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(output_mode, 0o700);
+        assert_eq!(images_mode, 0o700);
     }
 }

@@ -86,8 +86,18 @@ impl SeccompTraceReader {
 fn record_loop(pid: u32, output_path: &Path, stop: &AtomicBool) -> Result<()> {
     let mut syscalls: BTreeMap<i64, u64> = BTreeMap::new();
 
+    // Verify /dev/kmsg is not a symlink before opening
+    let kmsg_path = std::path::Path::new("/dev/kmsg");
+    if let Ok(meta) = std::fs::symlink_metadata(kmsg_path) {
+        if meta.file_type().is_symlink() {
+            warn!("/dev/kmsg is a symlink — refusing to open for seccomp tracing");
+            write_trace_file(output_path, &syscalls)?;
+            return Ok(());
+        }
+    }
+
     // Open /dev/kmsg for reading (requires CAP_SYSLOG or root)
-    let file = match std::fs::File::open("/dev/kmsg") {
+    let file = match std::fs::File::open(kmsg_path) {
         Ok(f) => f,
         Err(e) => {
             warn!(

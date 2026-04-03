@@ -3,8 +3,8 @@
 //! This example demonstrates basic container creation and execution.
 //! Note: Requires root privileges to run.
 
-use anyhow::Result;
 use nucleus::container::{Container, ContainerConfig};
+use nucleus::error::Result;
 use nucleus::isolation::NamespaceConfig;
 use nucleus::resources::ResourceLimits;
 
@@ -14,10 +14,10 @@ fn main() -> Result<()> {
         .with_memory("256M")?
         .with_cpu_cores(1.0)?;
 
-    let config = ContainerConfig::new(
+    let config = ContainerConfig::try_new(
         Some("example-container".to_string()),
         vec!["/bin/echo".to_string(), "Hello from Nucleus!".to_string()],
-    )
+    )?
     .with_limits(limits)
     .with_namespaces(NamespaceConfig::all());
 

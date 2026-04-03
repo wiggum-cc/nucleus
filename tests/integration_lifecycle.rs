@@ -33,10 +33,10 @@ mod tests {
             .with_cpu_cores(1.0)
             .expect("Failed to set CPU");
 
-        let config = ContainerConfig::new(
+        let config = ContainerConfig::try_new(
             Some("test-echo".to_string()),
             vec!["/bin/echo".to_string(), "hello".to_string()],
-        )
+        ).unwrap()
         .with_context(context_path)
         .with_limits(limits)
         .with_namespaces(NamespaceConfig::minimal())
@@ -55,14 +55,14 @@ mod tests {
     #[test]
     fn test_container_config_builder() {
         // Test the configuration builder pattern
-        let config = ContainerConfig::new(
+        let config = ContainerConfig::try_new(
             Some("test".to_string()),
             vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
                 "exit 0".to_string(),
             ],
-        )
+        ).unwrap()
         .with_context(PathBuf::from("/tmp/test"))
         .with_namespaces(NamespaceConfig::minimal())
         .with_gvisor(false);
@@ -105,14 +105,14 @@ mod tests {
     #[ignore] // Requires root privileges
     fn test_container_with_device_nodes() {
         // Test that device nodes are accessible in container
-        let config = ContainerConfig::new(
+        let config = ContainerConfig::try_new(
             Some("test-dev".to_string()),
             vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
                 "test -c /dev/null && test -c /dev/zero && test -c /dev/random".to_string(),
             ],
-        )
+        ).unwrap()
         .with_namespaces(NamespaceConfig::minimal())
         .with_trust_level(TrustLevel::Trusted);
 
@@ -131,14 +131,14 @@ mod tests {
         let mut namespaces = NamespaceConfig::minimal();
         namespaces.uts = true; // Enable UTS namespace
 
-        let config = ContainerConfig::new(
+        let config = ContainerConfig::try_new(
             Some("test-hostname".to_string()),
             vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
                 "test $(hostname) = 'custom-hostname'".to_string(),
             ],
-        )
+        ).unwrap()
         .with_namespaces(namespaces)
         .with_hostname(Some("custom-hostname".to_string()))
         .with_trust_level(TrustLevel::Trusted);
@@ -176,10 +176,10 @@ mod tests {
         let mut namespaces = NamespaceConfig::all();
         namespaces.uts = true;
 
-        let config = ContainerConfig::new(
+        let config = ContainerConfig::try_new(
             Some("test-full".to_string()),
             vec!["/bin/sh".to_string(), "/context/test.sh".to_string()],
-        )
+        ).unwrap()
         .with_context(context_path)
         .with_limits(limits)
         .with_namespaces(namespaces)
@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn test_container_with_custom_hostname() {
         // Test hostname configuration
-        let config = ContainerConfig::new(Some("test".to_string()), vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(Some("test".to_string()), vec!["/bin/sh".to_string()]).unwrap()
             .with_hostname(Some("custom-host".to_string()));
 
         assert_eq!(config.hostname, Some("custom-host".to_string()));
@@ -206,17 +206,17 @@ mod tests {
     #[test]
     fn test_container_default_hostname() {
         // Test that default hostname is set to container name
-        let config = ContainerConfig::new(
+        let config = ContainerConfig::try_new(
             Some("my-container".to_string()),
             vec!["/bin/sh".to_string()],
-        );
+        ).unwrap();
 
         assert_eq!(config.hostname, Some("my-container".to_string()));
     }
 
     #[test]
     fn test_container_rootless_config() {
-        let config = ContainerConfig::new(Some("test".to_string()), vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(Some("test".to_string()), vec!["/bin/sh".to_string()]).unwrap()
             .with_rootless();
 
         assert!(
@@ -271,7 +271,7 @@ mod tests {
         // The shell script checks if `unshare -U true` succeeds:
         //   - exit 0 = seccomp correctly blocked it (or unshare not available)
         //   - exit 1 = filter is broken, unshare succeeded
-        let config = ContainerConfig::new(
+        let config = ContainerConfig::try_new(
             Some("test-seccomp-clone".to_string()),
             vec![
                 "/bin/sh".to_string(),
@@ -280,7 +280,7 @@ mod tests {
                  if unshare -U true 2>/dev/null; then exit 1; else exit 0; fi"
                     .to_string(),
             ],
-        )
+        ).unwrap()
         .with_namespaces(NamespaceConfig::minimal())
         .with_trust_level(TrustLevel::Trusted);
 
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_trust_level_default_is_untrusted() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap();
         assert_eq!(config.trust_level, TrustLevel::Untrusted);
     }
 
@@ -308,10 +308,10 @@ mod tests {
         use nucleus::network::NetworkMode;
 
         // Untrusted + host network should be rejected before fork (ConfigError)
-        let config = ContainerConfig::new(
+        let config = ContainerConfig::try_new(
             Some("test-untrusted-host".to_string()),
             vec!["/bin/sh".to_string()],
-        )
+        ).unwrap()
         .with_trust_level(TrustLevel::Untrusted)
         .with_network(NetworkMode::Host)
         .with_allow_host_network(true)
@@ -336,10 +336,10 @@ mod tests {
             return;
         }
 
-        let config = ContainerConfig::new(
+        let config = ContainerConfig::try_new(
             Some("test-untrusted-no-gvisor".to_string()),
             vec!["/bin/sh".to_string()],
-        )
+        ).unwrap()
         .with_gvisor(false)
         .with_trust_level(TrustLevel::Untrusted)
         .with_namespaces(NamespaceConfig::minimal());

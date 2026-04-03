@@ -106,7 +106,7 @@ mod tests {
 
     /// Run a container through the production code path and return exit code.
     fn run_gvisor(name: &str, command: Vec<String>) -> nucleus::Result<i32> {
-        let config = ContainerConfig::new(Some(name.to_string()), command);
+        let config = ContainerConfig::try_new(Some(name.to_string()), command).unwrap();
         Container::new(config).run()
     }
 
@@ -718,10 +718,11 @@ mod tests {
             .with_pids(100)
             .unwrap();
 
-        let config = ContainerConfig::new(
+        let config = ContainerConfig::try_new(
             Some(unique_name("gv-limits")),
             vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
         )
+        .unwrap()
         .with_limits(limits);
 
         let exit_code = Container::new(config).run().unwrap();

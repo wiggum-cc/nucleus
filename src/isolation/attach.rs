@@ -24,7 +24,7 @@ pub struct NamespaceCommandRunner;
 impl ContainerAttach {
     /// Attach to a running container and execute a command
     ///
-    /// Opens namespace FDs from /proc/<pid>/ns/*, forks, calls setns(2) for each,
+    /// Opens namespace FDs from /proc/`<pid>`/ns/\*, forks, calls setns(2) for each,
     /// then execve the command. Parent waits with waitpid.
     pub fn attach(state: &ContainerState, command: Vec<String>) -> Result<i32> {
         if !state.is_running() {

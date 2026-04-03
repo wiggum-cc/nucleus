@@ -34,10 +34,10 @@ impl ContainerLifecycle {
 
         let pid = Pid::from_raw(state.pid as i32);
 
-        // Verify PID is still alive and is the expected process before sending signal.
-        // kill(pid, 0) returns ESRCH if the PID doesn't exist, which protects
-        // against PID recycling TOCTOU races.
-        if let Err(e) = kill(pid, Signal::SIGKILL) {
+        // Verify PID is still alive before sending signal.
+        // kill(pid, None) sends signal 0 — a no-op that returns ESRCH if the
+        // PID doesn't exist, protecting against PID recycling TOCTOU races.
+        if let Err(e) = kill(pid, None) {
             if e == nix::errno::Errno::ESRCH {
                 info!("Process already exited");
                 return Ok(());
@@ -170,15 +170,37 @@ pub fn parse_signal(s: &str) -> Result<Signal> {
     let normalized = upper.strip_prefix("SIG").unwrap_or(&upper);
 
     match normalized {
-        "TERM" => Ok(Signal::SIGTERM),
-        "KILL" => Ok(Signal::SIGKILL),
-        "INT" => Ok(Signal::SIGINT),
+        "ABRT" | "IOT" => Ok(Signal::SIGABRT),
+        "ALRM" => Ok(Signal::SIGALRM),
+        "BUS" => Ok(Signal::SIGBUS),
+        "CHLD" | "CLD" => Ok(Signal::SIGCHLD),
+        "CONT" => Ok(Signal::SIGCONT),
+        "FPE" => Ok(Signal::SIGFPE),
         "HUP" => Ok(Signal::SIGHUP),
+        "ILL" => Ok(Signal::SIGILL),
+        "INT" => Ok(Signal::SIGINT),
+        "IO" | "POLL" => Ok(Signal::SIGIO),
+        "KILL" => Ok(Signal::SIGKILL),
+        "PIPE" => Ok(Signal::SIGPIPE),
+        "PROF" => Ok(Signal::SIGPROF),
+        "PWR" => Ok(Signal::SIGPWR),
         "QUIT" => Ok(Signal::SIGQUIT),
+        "SEGV" => Ok(Signal::SIGSEGV),
+        "STKFLT" => Ok(Signal::SIGSTKFLT),
+        "STOP" => Ok(Signal::SIGSTOP),
+        "SYS" => Ok(Signal::SIGSYS),
+        "TERM" => Ok(Signal::SIGTERM),
+        "TRAP" => Ok(Signal::SIGTRAP),
+        "TSTP" => Ok(Signal::SIGTSTP),
+        "TTIN" => Ok(Signal::SIGTTIN),
+        "TTOU" => Ok(Signal::SIGTTOU),
+        "URG" => Ok(Signal::SIGURG),
         "USR1" => Ok(Signal::SIGUSR1),
         "USR2" => Ok(Signal::SIGUSR2),
-        "STOP" => Ok(Signal::SIGSTOP),
-        "CONT" => Ok(Signal::SIGCONT),
+        "VTALRM" => Ok(Signal::SIGVTALRM),
+        "WINCH" => Ok(Signal::SIGWINCH),
+        "XCPU" => Ok(Signal::SIGXCPU),
+        "XFSZ" => Ok(Signal::SIGXFSZ),
         _ => Err(NucleusError::ConfigError(format!("Unknown signal: {}", s))),
     }
 }
@@ -210,6 +232,51 @@ mod tests {
         assert_eq!(parse_signal("term").unwrap(), Signal::SIGTERM);
         assert_eq!(parse_signal("sigterm").unwrap(), Signal::SIGTERM);
         assert_eq!(parse_signal("Term").unwrap(), Signal::SIGTERM);
+    }
+
+    #[test]
+    fn test_parse_signal_all_standard_names() {
+        let cases = vec![
+            ("ABRT", Signal::SIGABRT),
+            ("IOT", Signal::SIGABRT),
+            ("ALRM", Signal::SIGALRM),
+            ("BUS", Signal::SIGBUS),
+            ("CHLD", Signal::SIGCHLD),
+            ("CLD", Signal::SIGCHLD),
+            ("FPE", Signal::SIGFPE),
+            ("ILL", Signal::SIGILL),
+            ("IO", Signal::SIGIO),
+            ("POLL", Signal::SIGIO),
+            ("PIPE", Signal::SIGPIPE),
+            ("PROF", Signal::SIGPROF),
+            ("PWR", Signal::SIGPWR),
+            ("SEGV", Signal::SIGSEGV),
+            ("STKFLT", Signal::SIGSTKFLT),
+            ("SYS", Signal::SIGSYS),
+            ("TRAP", Signal::SIGTRAP),
+            ("TSTP", Signal::SIGTSTP),
+            ("TTIN", Signal::SIGTTIN),
+            ("TTOU", Signal::SIGTTOU),
+            ("URG", Signal::SIGURG),
+            ("VTALRM", Signal::SIGVTALRM),
+            ("WINCH", Signal::SIGWINCH),
+            ("XCPU", Signal::SIGXCPU),
+            ("XFSZ", Signal::SIGXFSZ),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                parse_signal(name).unwrap(),
+                expected,
+                "parse_signal({name}) failed"
+            );
+            // Also with SIG prefix
+            let prefixed = format!("SIG{name}");
+            assert_eq!(
+                parse_signal(&prefixed).unwrap(),
+                expected,
+                "parse_signal({prefixed}) failed"
+            );
+        }
     }
 
     #[test]

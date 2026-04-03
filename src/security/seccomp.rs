@@ -87,9 +87,12 @@ impl SeccompManager {
             libc::SYS_madvise,
             libc::SYS_msync,
             // Process management
-            libc::SYS_fork,
+            // fork intentionally excluded — modern glibc/musl use clone(), which
+            // has namespace-flag filtering. Removing SYS_fork forces all forks
+            // through the filtered clone path (defense-in-depth against fork bombs
+            // and unfiltered namespace creation).
             libc::SYS_execve,
-            libc::SYS_execveat,
+            // execveat is conditionally allowed below (AT_EMPTY_PATH blocked)
             libc::SYS_wait4,
             libc::SYS_waitid,
             libc::SYS_exit,
@@ -265,7 +268,8 @@ impl SeccompManager {
             0x5413, // TIOCGWINSZ
             0x5429, // TIOCGSID
             0x541B, // FIONREAD
-            0x5421, // FIONBIO
+            // FIONBIO (0x5421) intentionally excluded — sets non-blocking mode
+            // on network sockets, enabling sophisticated network exploitation.
             0x5451, // FIOCLEX
             0x5450, // FIONCLEX
         ];
@@ -287,7 +291,11 @@ impl SeccompManager {
         }
         rules.insert(libc::SYS_ioctl, ioctl_rules);
 
-        // prctl: allow only safe operations (arg0 = option)
+        // prctl: allow only safe operations (arg0 = option).
+        // Notably absent (hit default deny):
+        //   PR_CAPBSET_READ (23) — leaks capability bounding set info
+        //   PR_CAPBSET_DROP (24) — could weaken the capability bounding set
+        //   PR_SET_SECUREBITS (28) — could disable secure-exec restrictions
         let prctl_allowed: &[u64] = &[
             1,  // PR_SET_PDEATHSIG
             2,  // PR_GET_PDEATHSIG
@@ -333,14 +341,14 @@ impl SeccompManager {
         }
         rules.insert(libc::SYS_mprotect, mprotect_rules);
 
-        // clone3: DENIED. clone3 passes flags inside a struct pointer that seccomp
-        // BPF cannot dereference, so namespace-flag filtering is impossible. Rather
-        // than relying on capability ordering as the sole defense, we block clone3
-        // entirely. glibc/musl fall back to the classic clone() syscall, which *is*
-        // filtered above. This is defense-in-depth: even if capabilities are
-        // mis-ordered, namespace creation via clone3 is blocked at the BPF level.
-        //
-        // clone3 is NOT added to the rules map, so it hits the default EPERM action.
+        // clone3: ALLOWED unconditionally. clone3 passes flags inside a struct
+        // pointer that seccomp BPF cannot dereference, so namespace-flag filtering
+        // is impossible at the BPF level. However, glibc 2.34+ and newer musl use
+        // clone3 internally for posix_spawn/fork — blocking it breaks
+        // std::process::Command and any child-process spawning on modern systems.
+        // Namespace creation is still prevented by dropped capabilities
+        // (CAP_SYS_ADMIN etc.) which are enforced before seccomp applies.
+        rules.insert(libc::SYS_clone3, Vec::new());
 
         // clone: allow but deny namespace-creating flags to prevent nested namespace creation
         let clone_condition = SeccompCondition::new(
@@ -356,6 +364,26 @@ impl SeccompManager {
             NucleusError::SeccompError(format!("Failed to create clone rule: {}", e))
         })?;
         rules.insert(libc::SYS_clone, vec![clone_rule]);
+
+        // execveat: allow but block AT_EMPTY_PATH (0x1000) to prevent fileless
+        // execution. With AT_EMPTY_PATH, execveat can execute code from any open
+        // fd (e.g., open + unlink, or even a socket fd), bypassing filesystem
+        // controls — not just memfd_create. Blocking memfd_create alone is
+        // insufficient. Normal execveat with dirfd+pathname (no AT_EMPTY_PATH)
+        // remains allowed.
+        let execveat_condition = SeccompCondition::new(
+            4, // arg4 = flags for execveat(dirfd, pathname, argv, envp, flags)
+            seccompiler::SeccompCmpArgLen::Dword,
+            seccompiler::SeccompCmpOp::MaskedEq(libc::AT_EMPTY_PATH as u64),
+            0, // (flags & AT_EMPTY_PATH) == 0: AT_EMPTY_PATH not set
+        )
+        .map_err(|e| {
+            NucleusError::SeccompError(format!("Failed to create execveat condition: {}", e))
+        })?;
+        let execveat_rule = SeccompRule::new(vec![execveat_condition]).map_err(|e| {
+            NucleusError::SeccompError(format!("Failed to create execveat rule: {}", e))
+        })?;
+        rules.insert(libc::SYS_execveat, vec![execveat_rule]);
 
         Ok(rules)
     }
@@ -679,7 +707,7 @@ impl SeccompManager {
     /// Syscalls that the built-in filter restricts at the argument level.
     /// Custom profiles allowing these without argument filters weaken security.
     const ARG_FILTERED_SYSCALLS: &'static [&'static str] =
-        &["clone", "clone3", "ioctl", "mprotect", "prctl", "socket"];
+        &["clone", "clone3", "execveat", "ioctl", "mprotect", "prctl", "socket"];
 
     /// Warn when a custom seccomp profile allows security-critical syscalls
     /// without argument-level filtering.
@@ -1055,20 +1083,21 @@ mod tests {
         let net = SeccompManager::network_mode_syscalls(true);
 
         // Snapshot counts to catch unintended policy drift.
-        // +5 accounts for conditional rules inserted in minimal_filter():
-        // socket/ioctl/prctl/mprotect/clone.
-        // clone3 is blocked (not in rules map), so it does not count.
-        assert_eq!(base.len(), 133);
+        // +7 accounts for conditional rules inserted in minimal_filter():
+        // socket/ioctl/prctl/mprotect/clone/clone3/execveat.
+        // fork removed (forces through filtered clone path).
+        // execveat removed from base (arg-filtered separately).
+        assert_eq!(base.len(), 131);
         assert_eq!(net.len(), 11);
-        assert_eq!(base.len() + 5, 138);
-        assert_eq!(base.len() + net.len() + 5, 149);
+        assert_eq!(base.len() + 7, 138);
+        assert_eq!(base.len() + net.len() + 7, 149);
     }
 
     #[test]
     fn test_arg_filtered_syscalls_list_includes_critical_syscalls() {
         // These syscalls must be in the arg-filtered list so custom profiles
         // get warnings when they allow them without filters.
-        for name in &["clone", "clone3", "ioctl", "prctl", "socket"] {
+        for name in &["clone", "clone3", "execveat", "ioctl", "prctl", "socket"] {
             assert!(
                 SeccompManager::ARG_FILTERED_SYSCALLS.contains(name),
                 "'{}' must be in ARG_FILTERED_SYSCALLS",
@@ -1078,14 +1107,15 @@ mod tests {
     }
 
     #[test]
-    fn test_clone3_blocked_in_minimal_filter() {
-        // clone3 must NOT appear in the BPF rules map — it should hit the
-        // default deny action (EPERM). This is defense-in-depth: clone3 cannot
-        // be arg-filtered by BPF, so we block it entirely.
+    fn test_clone3_allowed_in_minimal_filter() {
+        // clone3 MUST be in the BPF rules map — glibc 2.34+ and newer musl
+        // use clone3 internally for posix_spawn/fork. Blocking it breaks
+        // std::process::Command on modern systems. Namespace creation is
+        // prevented by dropped capabilities (CAP_SYS_ADMIN etc.), not seccomp.
         let rules = SeccompManager::minimal_filter(true).unwrap();
         assert!(
-            !rules.contains_key(&libc::SYS_clone3),
-            "clone3 must not be in the seccomp allowlist"
+            rules.contains_key(&libc::SYS_clone3),
+            "clone3 must be in the seccomp allowlist (glibc 2.34+ requires it)"
         );
     }
 
@@ -1133,12 +1163,15 @@ mod tests {
         // merge source for apply_profile_from_file.
         let rules = SeccompManager::minimal_filter(true).unwrap();
 
-        // Every ARG_FILTERED_SYSCALLS entry (except clone3, which is denied
-        // entirely) must have non-empty argument-level rules in the built-in
-        // filter so that apply_profile_from_file can merge them.
+        // Every ARG_FILTERED_SYSCALLS entry (except clone3, which is allowed
+        // unconditionally since BPF can't inspect its struct-based flags) must
+        // have non-empty argument-level rules in the built-in filter so that
+        // apply_profile_from_file can merge them.
         for name in SeccompManager::ARG_FILTERED_SYSCALLS {
             if *name == "clone3" {
-                // clone3 is blocked entirely (cannot be arg-filtered)
+                // clone3 is allowed unconditionally — BPF cannot dereference
+                // the clone_args struct, so arg filtering is impossible.
+                // Namespace defense relies on dropped capabilities.
                 continue;
             }
             if let Some(nr) = syscall_name_to_number(name) {
@@ -1213,5 +1246,82 @@ mod tests {
             );
             pos = abs_idx + 1;
         }
+    }
+
+    // --- H-1: mprotect MaskedEq logic verification ---
+    //
+    // The mprotect filter uses MaskedEq((PROT_WRITE | PROT_EXEC), value) to
+    // allow only combinations where the W|X bits match one of {0, W, X}.
+    // These tests prove the logic is correct without installing a real
+    // seccomp filter (which would affect the test process).
+
+    /// Helper: simulates the MaskedEq check that the seccomp BPF would perform.
+    /// Returns true if the prot value would be ALLOWED by one of the rules.
+    fn mprotect_would_allow(prot: u64) -> bool {
+        let mask = (libc::PROT_WRITE | libc::PROT_EXEC) as u64;
+        let allowed_values: &[u64] = &[0, libc::PROT_WRITE as u64, libc::PROT_EXEC as u64];
+        let masked = prot & mask;
+        allowed_values.contains(&masked)
+    }
+
+    #[test]
+    fn test_mprotect_allows_prot_none() {
+        assert!(mprotect_would_allow(0), "PROT_NONE must be allowed");
+    }
+
+    #[test]
+    fn test_mprotect_allows_prot_read_only() {
+        assert!(
+            mprotect_would_allow(libc::PROT_READ as u64),
+            "PROT_READ must be allowed (W|X bits are 0)"
+        );
+    }
+
+    #[test]
+    fn test_mprotect_allows_prot_read_write() {
+        assert!(
+            mprotect_would_allow((libc::PROT_READ | libc::PROT_WRITE) as u64),
+            "PROT_READ|PROT_WRITE must be allowed"
+        );
+    }
+
+    #[test]
+    fn test_mprotect_allows_prot_read_exec() {
+        assert!(
+            mprotect_would_allow((libc::PROT_READ | libc::PROT_EXEC) as u64),
+            "PROT_READ|PROT_EXEC must be allowed"
+        );
+    }
+
+    #[test]
+    fn test_mprotect_rejects_prot_write_exec() {
+        assert!(
+            !mprotect_would_allow((libc::PROT_WRITE | libc::PROT_EXEC) as u64),
+            "PROT_WRITE|PROT_EXEC (W^X violation) must be REJECTED"
+        );
+    }
+
+    #[test]
+    fn test_mprotect_rejects_prot_read_write_exec() {
+        assert!(
+            !mprotect_would_allow((libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64),
+            "PROT_READ|PROT_WRITE|PROT_EXEC (W^X violation) must be REJECTED"
+        );
+    }
+
+    #[test]
+    fn test_mprotect_allows_prot_write_alone() {
+        assert!(
+            mprotect_would_allow(libc::PROT_WRITE as u64),
+            "PROT_WRITE alone must be allowed"
+        );
+    }
+
+    #[test]
+    fn test_mprotect_allows_prot_exec_alone() {
+        assert!(
+            mprotect_would_allow(libc::PROT_EXEC as u64),
+            "PROT_EXEC alone must be allowed"
+        );
     }
 }

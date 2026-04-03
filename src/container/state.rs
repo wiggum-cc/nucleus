@@ -75,7 +75,7 @@ pub struct ContainerState {
     #[serde(default)]
     pub creator_uid: u32,
 
-    /// Process start time in clock ticks (from /proc/<pid>/stat field 22)
+    /// Process start time in clock ticks (from /proc/`<pid>`/stat field 22)
     /// Used to detect PID reuse in is_running()
     #[serde(default)]
     pub start_ticks: u64,
@@ -400,11 +400,46 @@ impl ContainerStateManager {
             }
 
             // Final fallback for restricted sandboxes where standard runtime/home
-            // paths are mounted read-only. Keep it private to the effective UID.
-            candidates.push(PathBuf::from(format!(
-                "/tmp/nucleus-{}",
-                nix::unistd::Uid::effective().as_raw()
-            )));
+            // paths are mounted read-only. Use a private directory under /tmp
+            // with O_NOFOLLOW semantics to prevent symlink attacks.
+            let uid = nix::unistd::Uid::effective().as_raw();
+            let fallback = PathBuf::from(format!("/tmp/nucleus-{}", uid));
+            // Only add the /tmp fallback if it either doesn't exist yet
+            // (will be created later) or passes symlink/ownership checks.
+            let fallback_ok = if fallback.exists() {
+                match std::fs::symlink_metadata(&fallback) {
+                    Ok(meta) => {
+                        use std::os::unix::fs::MetadataExt;
+                        if meta.file_type().is_symlink() {
+                            tracing::warn!(
+                                "Skipping {} — it is a symlink (possible attack)",
+                                fallback.display()
+                            );
+                            false
+                        } else if meta.uid() != uid {
+                            tracing::warn!(
+                                "Skipping {} — owned by UID {} not {}",
+                                fallback.display(), meta.uid(), uid
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Skipping {} — cannot stat: {}",
+                            fallback.display(), e
+                        );
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+            if fallback_ok {
+                candidates.push(fallback);
+            }
 
             candidates
         }

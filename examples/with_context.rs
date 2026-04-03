@@ -4,8 +4,8 @@
 //! that the containerized process can access.
 //! Note: Requires root privileges to run.
 
-use anyhow::Result;
 use nucleus::container::{Container, ContainerConfig};
+use nucleus::error::Result;
 use nucleus::isolation::NamespaceConfig;
 use nucleus::resources::ResourceLimits;
 use tempfile::TempDir;
@@ -25,14 +25,14 @@ fn main() -> Result<()> {
         .with_memory("512M")?
         .with_cpu_cores(2.0)?;
 
-    let config = ContainerConfig::new(
+    let config = ContainerConfig::try_new(
         Some("context-example".to_string()),
         vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
             "ls -la /context && cat /context/data.txt".to_string(),
         ],
-    )
+    )?
     .with_context(context_path.to_path_buf())
     .with_limits(limits)
     .with_namespaces(NamespaceConfig::all());

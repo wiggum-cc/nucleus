@@ -4,8 +4,8 @@
 //! for a container using cgroups v2.
 //! Note: Requires root privileges and cgroup v2 to run.
 
-use anyhow::Result;
 use nucleus::container::{Container, ContainerConfig};
+use nucleus::error::Result;
 use nucleus::isolation::NamespaceConfig;
 use nucleus::resources::ResourceLimits;
 
@@ -24,14 +24,14 @@ fn main() -> Result<()> {
     );
     println!("  PIDs: {:?}", limits.pids_max);
 
-    let config = ContainerConfig::new(
+    let config = ContainerConfig::try_new(
         Some("limited-container".to_string()),
         vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
             "echo 'Running with resource limits'; sleep 1".to_string(),
         ],
-    )
+    )?
     .with_limits(limits)
     .with_namespaces(NamespaceConfig::all());
 

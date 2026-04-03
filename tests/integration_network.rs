@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_container_default_network_is_none() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap();
         assert!(matches!(config.network, NetworkMode::None));
     }
 
@@ -247,7 +247,8 @@ mod tests {
     fn test_container_with_bridge_network() {
         let bridge = BridgeConfig::default().with_public_dns();
         let config =
-            ContainerConfig::new(Some("test-bridge".to_string()), vec!["/bin/sh".to_string()])
+            ContainerConfig::try_new(Some("test-bridge".to_string()), vec!["/bin/sh".to_string()])
+                .unwrap()
                 .with_network(NetworkMode::Bridge(bridge));
 
         assert!(matches!(config.network, NetworkMode::Bridge(_)));
@@ -255,7 +256,8 @@ mod tests {
 
     #[test]
     fn test_container_with_egress_policy() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_egress_policy(EgressPolicy::deny_all().with_allowed_tcp_ports(vec![443]));
 
         assert!(config.egress_policy.is_some());
@@ -266,7 +268,8 @@ mod tests {
     #[test]
     fn test_host_network_requires_opt_in() {
         // Host network without allow_host_network should fail for untrusted
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_trust_level(TrustLevel::Untrusted)
             .with_network(NetworkMode::Host)
             .with_allow_host_network(true)
@@ -281,7 +284,8 @@ mod tests {
 
     #[test]
     fn test_production_mode_rejects_host_network() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_service_mode(nucleus::container::ServiceMode::Production)
             .with_network(NetworkMode::Host)
             .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake"))

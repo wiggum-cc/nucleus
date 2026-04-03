@@ -165,11 +165,40 @@ impl GVisorRuntime {
     }
 
     fn is_trusted_runsc_owner(path: &Path, owner: u32, current_uid: u32) -> bool {
-        owner == 0
-            || owner == current_uid
-            // Nix store artifacts are immutable content-addressed paths and are
-            // commonly owned by `nobody` rather than root/current user.
-            || path.starts_with("/nix/store")
+        if owner == 0 || owner == current_uid {
+            return true;
+        }
+
+        // Nix store artifacts are immutable content-addressed paths and are
+        // commonly owned by `nobody` rather than root/current user.
+        // Extra hardening: verify the binary is not writable by *anyone* and
+        // the parent directory is also not writable, to guard against a
+        // compromised or mutable store.
+        if path.starts_with("/nix/store") {
+            if let Ok(meta) = std::fs::metadata(path) {
+                let mode = meta.permissions().mode();
+                // Reject if owner-writable (group/other already checked by caller)
+                if mode & 0o200 != 0 {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+            // Verify the immediate parent directory is not writable
+            if let Some(parent) = path.parent() {
+                if let Ok(parent_meta) = std::fs::metadata(parent) {
+                    let parent_mode = parent_meta.permissions().mode();
+                    if parent_mode & 0o222 != 0 {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        false
     }
 
     /// If `path` is a Nix wrapper script, extract the real binary path.
@@ -325,6 +354,18 @@ impl GVisorRuntime {
 
         let c_env = self.exec_environment(&runsc_runtime_dir)?;
 
+        // Defense-in-depth: even though gVisor provides its own sandboxing,
+        // apply PR_SET_NO_NEW_PRIVS so the runsc process (and anything it
+        // spawns) cannot gain privileges via setuid/setgid binaries.
+        let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        if ret != 0 {
+            return Err(NucleusError::GVisorError(format!(
+                "Failed to set PR_SET_NO_NEW_PRIVS before gVisor exec: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        info!("PR_SET_NO_NEW_PRIVS applied before gVisor exec (defense-in-depth)");
+
         // execve - this replaces the current process with runsc
         nix::unistd::execve::<std::ffi::CString, std::ffi::CString>(&program, &c_args, &c_env)?;
 
@@ -452,11 +493,32 @@ mod tests {
 
     #[test]
     fn test_runsc_owner_accepts_nix_store_artifact_owner() {
-        assert!(GVisorRuntime::is_trusted_runsc_owner(
-            Path::new("/nix/store/fake-runsc/bin/runsc"),
-            65534,
-            1000
-        ));
+        // Use a real Nix store binary so the metadata/permission checks pass.
+        // The /nix/store contents are read-only and content-addressed, so any
+        // existing file with mode 555 works.
+        let nix_binary = std::fs::read_dir("/nix/store")
+            .ok()
+            .and_then(|mut entries| {
+                entries.find_map(|e| {
+                    let dir = e.ok()?.path();
+                    let candidate = dir.join("bin/runsc");
+                    if candidate.exists() {
+                        Some(candidate)
+                    } else {
+                        None
+                    }
+                })
+            });
+
+        let path = match nix_binary {
+            Some(p) => p,
+            None => {
+                eprintln!("skipping: no runsc binary found in /nix/store");
+                return;
+            }
+        };
+
+        assert!(GVisorRuntime::is_trusted_runsc_owner(&path, 65534, 1000));
     }
 
     #[test]

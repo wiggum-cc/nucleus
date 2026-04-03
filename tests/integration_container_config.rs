@@ -37,7 +37,7 @@ mod tests {
 
     #[test]
     fn test_config_defaults_are_secure() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap();
 
         assert!(!config.allow_degraded_security);
         assert!(!config.allow_chroot_fallback);
@@ -59,20 +59,20 @@ mod tests {
 
     #[test]
     fn test_config_name_defaults_to_id() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap();
         assert_eq!(config.name, config.id);
     }
 
     #[test]
     fn test_config_custom_name() {
-        let config = ContainerConfig::new(Some("my-app".to_string()), vec!["/bin/sh".to_string()]);
+        let config = ContainerConfig::try_new(Some("my-app".to_string()), vec!["/bin/sh".to_string()]).unwrap();
         assert_eq!(config.name, "my-app");
         assert_ne!(config.id, "my-app"); // ID is always generated
     }
 
     #[test]
     fn test_config_hostname_defaults_to_name() {
-        let config = ContainerConfig::new(Some("myhost".to_string()), vec!["/bin/sh".to_string()]);
+        let config = ContainerConfig::try_new(Some("myhost".to_string()), vec!["/bin/sh".to_string()]).unwrap();
         assert_eq!(config.hostname, Some("myhost".to_string()));
     }
 
@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn test_config_builder_chaining() {
-        let config = ContainerConfig::new(Some("test".to_string()), vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(Some("test".to_string()), vec!["/bin/sh".to_string()]).unwrap()
             .with_context(PathBuf::from("/tmp/ctx"))
             .with_limits(
                 ResourceLimits::unlimited()
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn test_config_rootless() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]).with_rootless();
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap().with_rootless();
 
         assert!(config.namespaces.user);
         assert!(config.user_ns_config.is_some());
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn test_config_with_oci_bundle_enables_gvisor() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]).with_oci_bundle();
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap().with_oci_bundle();
         assert!(config.use_gvisor);
     }
 
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn test_config_with_secrets() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
             .with_secret(SecretMount {
                 source: PathBuf::from("/run/secrets/api-key"),
                 dest: PathBuf::from("/secrets/api-key"),
@@ -182,7 +182,7 @@ mod tests {
             timeout: Duration::from_secs(3),
         };
 
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]).with_health_check(hc);
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap().with_health_check(hc);
 
         assert!(config.health_check.is_some());
         let hc = config.health_check.unwrap();
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn test_config_with_readiness_probe_exec() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]).with_readiness_probe(
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap().with_readiness_probe(
             ReadinessProbe::Exec {
                 command: vec!["pg_isready".to_string()],
             },
@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_config_with_readiness_probe_tcp() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
             .with_readiness_probe(ReadinessProbe::TcpPort(8080));
 
         assert!(matches!(
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn test_config_with_readiness_probe_sd_notify() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
             .with_readiness_probe(ReadinessProbe::SdNotify);
 
         assert!(matches!(
@@ -235,7 +235,7 @@ mod tests {
     fn test_production_mode_valid_config() {
         let temp_dir = std::env::temp_dir().join("nucleus-test-nix-store-fake-rootfs");
         std::fs::create_dir_all(&temp_dir).unwrap();
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_rootfs_path(temp_dir)
             .with_verify_rootfs_attestation(true)
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn test_production_mode_requires_rootfs_attestation() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_rootfs_path(PathBuf::from("/nix/store/fake-rootfs"))
             .with_limits(
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_production_mode_rejects_degraded_security() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_allow_degraded_security(true)
             .with_rootfs_path(PathBuf::from("/nix/store/fake"))
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn test_production_mode_rejects_chroot_fallback() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_allow_chroot_fallback(true)
             .with_rootfs_path(PathBuf::from("/nix/store/fake"))
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn test_production_mode_rejects_host_network_flag() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_allow_host_network(true)
             .with_rootfs_path(PathBuf::from("/nix/store/fake"))
@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn test_production_mode_requires_rootfs() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_limits(
                 ResourceLimits::unlimited()
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn test_production_mode_requires_memory_limit() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_rootfs_path(PathBuf::from("/nix/store/fake"))
             .with_limits(ResourceLimits::unlimited().with_cpu_cores(1.0).unwrap());
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn test_production_mode_requires_cpu_limit() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_rootfs_path(PathBuf::from("/nix/store/fake"))
             .with_limits(ResourceLimits::unlimited().with_memory("512M").unwrap());
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn test_agent_mode_skips_production_validation() {
         // Agent mode should always pass validate_production_mode
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
             .with_service_mode(ServiceMode::Agent)
             .with_allow_degraded_security(true);
 

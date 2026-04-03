@@ -76,6 +76,9 @@ pub enum NucleusError {
 
     #[error("OCI hook failed: {0}")]
     HookError(String),
+
+    #[error("JSON serialization error: {0}")]
+    SerdeJsonError(#[from] serde_json::Error),
 }
 
 pub type Result<T> = std::result::Result<T, NucleusError>;

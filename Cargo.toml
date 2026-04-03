@@ -33,20 +33,15 @@ name = "nucleus"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-opentelemetry = "0.32"
 nix = { version = "0.29", features = ["process", "sched", "mount", "user", "signal", "fs", "hostname"] }
 libc = "0.2"
 caps = "0.5"
 seccompiler = "0.4"
 landlock = "0.4"
-opentelemetry = "0.31"
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-blocking-client"] }
-opentelemetry_sdk = "0.31"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "5"
@@ -77,3 +72,8 @@ harness = false
 [[bench]]
 name = "concurrency"
 harness = false
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/nucleus-{ target }{ archive-suffix }"
+bin-dir = "nucleus-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"

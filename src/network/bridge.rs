@@ -198,6 +198,17 @@ impl BridgeNetwork {
 
         let pid_str = pid.to_string();
 
+        // Flush any existing OUTPUT rules to prevent duplication on repeated calls
+        Self::run_cmd(
+            "nsenter",
+            &["-t", &pid_str, "-n", "iptables", "-F", "OUTPUT"],
+        )?;
+        // Reset OUTPUT policy to ACCEPT before rebuilding rules
+        Self::run_cmd(
+            "nsenter",
+            &["-t", &pid_str, "-n", "iptables", "-P", "OUTPUT", "ACCEPT"],
+        )?;
+
         // Default policy: drop all OUTPUT (except established/related and loopback)
         Self::run_cmd(
             "nsenter",
@@ -875,6 +886,12 @@ impl BridgeNetwork {
         .map_err(|e| {
             NucleusError::NetworkError(format!("Failed to bind mount resolv.conf: {}", e))
         })?;
+
+        // The bind mount holds a reference to the inode, so we can safely
+        // unlink the staging path to avoid leaking DNS server info on disk.
+        if let Err(e) = std::fs::remove_file(&staging) {
+            warn!("Failed to remove staging resolv.conf {:?}: {}", staging, e);
+        }
 
         info!("Bind-mounted resolv.conf for bridge networking (rootfs mode, staging)");
         Ok(())

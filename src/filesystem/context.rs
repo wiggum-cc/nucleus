@@ -179,11 +179,15 @@ impl ContextPopulator {
         let name_str = name.to_string_lossy();
         let lower = name_str.to_lowercase();
 
+        // Exact matches (case-insensitive for .git to cover .Git/.GIT variants):
+        if lower == ".git" {
+            return true;
+        }
+
         // Exact matches: build artifacts, caches, sensitive directories
         if matches!(
             name_str.as_ref(),
-            ".git"
-                | "target"
+            "target"
                 | "node_modules"
                 | ".DS_Store"
                 | "__pycache__"

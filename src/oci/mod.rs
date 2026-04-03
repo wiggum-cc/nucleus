@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 /// OCI Runtime Specification configuration
 ///
 /// This implements a subset of the OCI runtime spec for gVisor compatibility
-/// Spec: https://github.com/opencontainers/runtime-spec/blob/main/config.md
+/// Spec: <https://github.com/opencontainers/runtime-spec/blob/main/config.md>
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OciConfig {
     #[serde(rename = "ociVersion")]
@@ -182,7 +182,7 @@ pub struct OciPids {
 
 /// OCI process resource limit.
 ///
-/// Spec: https://github.com/opencontainers/runtime-spec/blob/main/config.md#posix-process
+/// Spec: <https://github.com/opencontainers/runtime-spec/blob/main/config.md#posix-process>
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OciRlimit {
     /// Resource type (e.g. "RLIMIT_NOFILE", "RLIMIT_NPROC")
@@ -203,7 +203,7 @@ pub struct OciConsoleSize {
 
 /// OCI linux device entry.
 ///
-/// Spec: https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md#devices
+/// Spec: <https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md#devices>
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OciDevice {
     /// Device type: "c" (char), "b" (block), "u" (unbuffered), "p" (FIFO)
@@ -230,7 +230,7 @@ pub struct OciDevice {
 
 /// OCI seccomp configuration.
 ///
-/// Spec: https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md#seccomp
+/// Spec: <https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md#seccomp>
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OciSeccomp {
     /// Default action when no rule matches (e.g. "SCMP_ACT_ERRNO", "SCMP_ACT_ALLOW")
@@ -276,7 +276,7 @@ fn is_zero(v: &u64) -> bool {
 
 /// OCI Intel RDT (Resource Director Technology) configuration.
 ///
-/// Spec: https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md#intel-rdt
+/// Spec: <https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md#intel-rdt>
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OciIntelRdt {
     /// Unique identity for the container's cache and memory bandwidth allocation
@@ -300,12 +300,12 @@ pub struct OciIntelRdt {
 
 /// A single OCI lifecycle hook entry.
 ///
-/// Spec: https://github.com/opencontainers/runtime-spec/blob/main/config.md#posix-platform-hooks
+/// Spec: <https://github.com/opencontainers/runtime-spec/blob/main/config.md#posix-platform-hooks>
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OciHook {
     /// Absolute path to the hook binary.
     pub path: String,
-    /// Arguments passed to the hook (argv[0] should be the binary name).
+    /// Arguments passed to the hook (argv\[0\] should be the binary name).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
     /// Environment variables for the hook process.
@@ -318,7 +318,7 @@ pub struct OciHook {
 
 /// OCI lifecycle hooks.
 ///
-/// Spec: https://github.com/opencontainers/runtime-spec/blob/main/config.md#posix-platform-hooks
+/// Spec: <https://github.com/opencontainers/runtime-spec/blob/main/config.md#posix-platform-hooks>
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OciHooks {
     /// Called after the runtime environment has been created but before pivot_root.
@@ -352,7 +352,7 @@ pub struct OciHooks {
 
 /// Container state JSON passed to OCI hooks on stdin.
 ///
-/// Spec: https://github.com/opencontainers/runtime-spec/blob/main/runtime.md#state
+/// Spec: <https://github.com/opencontainers/runtime-spec/blob/main/runtime.md#state>
 #[derive(Debug, Clone, Serialize)]
 pub struct OciContainerState {
     #[serde(rename = "ociVersion")]
@@ -429,6 +429,7 @@ impl OciHooks {
     }
 
     fn execute_hook(hook: &OciHook, state_json: &str, phase: &str) -> Result<()> {
+        #[cfg(not(test))]
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 

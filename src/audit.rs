@@ -67,7 +67,7 @@ pub struct AuditEvent {
 /// Security posture captured at container start for incident analysis.
 #[derive(Debug, Clone, Serialize)]
 pub struct SecurityPosture {
-    /// Seccomp mode: "enforce", "trace", "profile:<path>", or "none"
+    /// Seccomp mode: "enforce", "trace", "profile:`<path>`", or "none"
     pub seccomp_mode: String,
     /// Landlock ABI version negotiated (e.g. "V5", "none")
     #[serde(skip_serializing_if = "Option::is_none")]

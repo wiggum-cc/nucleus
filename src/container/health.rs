@@ -24,9 +24,8 @@ impl Container {
         let poll_interval = std::time::Duration::from_secs(1);
 
         for attempt in 1..=max_attempts {
-            // Check that the container is still alive
-            let proc_path = format!("/proc/{}", pid);
-            if !std::path::Path::new(&proc_path).exists() {
+            // Check that the container is still alive using signal 0
+            if kill(Pid::from_raw(pid as i32), None).is_err() {
                 return Err(NucleusError::ExecError(format!(
                     "Container process {} exited before becoming ready",
                     pid
@@ -135,9 +134,8 @@ impl Container {
                 return;
             }
 
-            // Check if the container process is still alive
-            let proc_path = format!("/proc/{}", pid);
-            if !std::path::Path::new(&proc_path).exists() {
+            // Check if the container process is still alive using signal 0
+            if kill(Pid::from_raw(pid as i32), None).is_err() {
                 debug!("Health check: container process {} gone, stopping", pid);
                 return;
             }

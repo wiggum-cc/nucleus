@@ -172,7 +172,9 @@ impl Default for EgressPolicy {
 }
 
 impl EgressPolicy {
-    /// Create a deny-all egress policy.
+    /// Create a deny-all egress policy. DNS is still permitted by default
+    /// so containers can resolve names; use `allow_dns = false` for strict
+    /// deny-all egress.
     pub fn deny_all() -> Self {
         Self::default()
     }

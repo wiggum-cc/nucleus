@@ -1,4 +1,3 @@
-use anyhow::Result;
 use clap::Parser;
 use nucleus::checkpoint::CriuRuntime;
 use nucleus::container::{
@@ -11,6 +10,7 @@ use nucleus::filesystem::ContextMode;
 use nucleus::isolation::{ContainerAttach, NamespaceConfig};
 use nucleus::network::{BridgeConfig, EgressPolicy, NetworkMode, PortForward};
 use nucleus::resources::{IoDeviceLimit, ResourceLimits, ResourceStats};
+use nucleus::error::{NucleusError, Result};
 use nucleus::security::GVisorPlatform;
 use nucleus::topology::{
     execute_reconcile, plan_reconcile, DependencyGraph, ReconcileAction, TopologyConfig,
@@ -436,7 +436,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let state_root = cli.root.clone();
 
-    nucleus::telemetry::init_tracing()?;
+    nucleus::telemetry::init_tracing();
 
     match cli.command {
         Commands::State { container, all } => {
@@ -578,11 +578,10 @@ fn main() -> Result<()> {
             let state_mgr = ContainerStateManager::new_with_root(state_root.clone())?;
             let state = state_mgr.resolve_container(&container)?;
             if state.status != OciStatus::Created {
-                anyhow::bail!(
-                    "Container {} is in '{}' state, not 'created'",
-                    state.id,
-                    state.status
-                );
+                return Err(NucleusError::InvalidStateTransition {
+                    from: state.status.to_string(),
+                    to: "created".to_string(),
+                });
             }
             Container::trigger_start(&state.id)?;
             println!("{}", state.id);
@@ -627,11 +626,11 @@ fn main() -> Result<()> {
             let state = state_mgr.resolve_container(&container)?;
 
             if state.using_gvisor {
-                return Err(anyhow::anyhow!(
+                return Err(NucleusError::CheckpointError(format!(
                     "Container {} uses gVisor runtime; CRIU checkpoint is not supported \
                      (gVisor manages its own sandbox state)",
                     state.id
-                ));
+                )));
             }
 
             let mut criu = CriuRuntime::new()?;
@@ -733,7 +732,7 @@ fn main() -> Result<()> {
             command,
         } => {
             if command.is_empty() {
-                anyhow::bail!("No command specified");
+                return Err(NucleusError::ConfigError("No command specified".to_string()));
             }
 
             if let Some(ref n) = name {
@@ -786,9 +785,9 @@ fn main() -> Result<()> {
                 "bridge" => {
                     // Production mode requires explicit DNS to avoid silent empty resolv.conf
                     if service_mode == ServiceMode::Production && dns.is_empty() {
-                        anyhow::bail!(
-                            "Production mode with bridge networking requires explicit --dns servers"
-                        );
+                        return Err(NucleusError::ConfigError(
+                            "Production mode with bridge networking requires explicit --dns servers".to_string()
+                        ));
                     }
                     let mut bridge_config = if dns.is_empty() {
                         BridgeConfig::default().with_public_dns()
@@ -803,7 +802,7 @@ fn main() -> Result<()> {
                     NetworkMode::Bridge(bridge_config)
                 }
                 other => {
-                    anyhow::bail!("Unknown network mode: {}. Use none, host, or bridge.", other);
+                    return Err(NucleusError::ConfigError(format!("Unknown network mode: {}. Use none, host, or bridge.", other)));
                 }
             };
 
@@ -886,7 +885,7 @@ fn main() -> Result<()> {
                     if let Some(log_path) = seccomp_log {
                         config = config.with_seccomp_trace_log(PathBuf::from(log_path));
                     } else {
-                        anyhow::bail!("--seccomp-log is required when --seccomp-mode=trace");
+                        return Err(NucleusError::ConfigError("--seccomp-log is required when --seccomp-mode=trace".to_string()));
                     }
                 }
             }
@@ -926,10 +925,10 @@ fn main() -> Result<()> {
                     + readiness_tcp.is_some() as u8
                     + readiness_sd_notify as u8;
                 if probe_count > 1 {
-                    anyhow::bail!(
+                    return Err(NucleusError::ConfigError(
                         "Only one readiness probe type may be set \
-                         (--readiness-exec, --readiness-tcp, --readiness-sd-notify)"
-                    );
+                         (--readiness-exec, --readiness-tcp, --readiness-sd-notify)".to_string()
+                    ));
                 }
                 if let Some(cmd) = readiness_exec {
                     config = config.with_readiness_probe(ReadinessProbe::Exec {
@@ -958,7 +957,7 @@ fn main() -> Result<()> {
             for spec in &secrets {
                 let parts: Vec<&str> = spec.splitn(2, ':').collect();
                 if parts.len() != 2 {
-                    anyhow::bail!("Invalid secret format '{}', expected SOURCE:DEST", spec);
+                    return Err(NucleusError::ConfigError(format!("Invalid secret format '{}', expected SOURCE:DEST", spec)));
                 }
                 config = config.with_secret(SecretMount {
                     source: PathBuf::from(parts[0]),
@@ -972,18 +971,18 @@ fn main() -> Result<()> {
                 if let Some((key, value)) = spec.split_once('=') {
                     config = config.with_env(key.to_string(), value.to_string());
                 } else {
-                    anyhow::bail!("Invalid env var format '{}', expected KEY=VALUE", spec);
+                    return Err(NucleusError::ConfigError(format!("Invalid env var format '{}', expected KEY=VALUE", spec)));
                 }
             }
 
             // OCI lifecycle hooks
             if let Some(hooks_path) = hooks {
                 let hooks_json = std::fs::read_to_string(&hooks_path).map_err(|e| {
-                    anyhow::anyhow!("Failed to read hooks file '{}': {}", hooks_path, e)
+                    NucleusError::ConfigError(format!("Failed to read hooks file '{}': {}", hooks_path, e))
                 })?;
                 let oci_hooks: nucleus::security::OciHooks = serde_json::from_str(&hooks_json)
                     .map_err(|e| {
-                        anyhow::anyhow!("Failed to parse hooks file '{}': {}", hooks_path, e)
+                        NucleusError::ConfigError(format!("Failed to parse hooks file '{}': {}", hooks_path, e))
                     })?;
                 config.hooks = Some(oci_hooks);
             }

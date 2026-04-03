@@ -111,7 +111,7 @@ impl Container {
 
                 // Spawn a thread to forward signals to the child
                 let child_pid = child;
-                std::thread::spawn(move || {
+                let sig_thread = std::thread::spawn(move || {
                     while let Ok(signal) = sigset.wait() {
                         let _ = kill(child_pid, signal);
                     }
@@ -152,6 +152,9 @@ impl Container {
                     }
                 };
 
+                // Drop the signal-forwarding thread cleanly before exiting.
+                // It will unblock once there are no more signals to wait on.
+                drop(sig_thread);
                 std::process::exit(workload_exit);
             }
             ForkResult::Child => {

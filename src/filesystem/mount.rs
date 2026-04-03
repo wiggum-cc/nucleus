@@ -9,6 +9,9 @@ use tracing::{debug, info, warn};
 struct ExpectedMount {
     path: &'static str,
     required_flags: &'static [&'static str],
+    /// If true, the mount *must* exist in production mode. A missing critical
+    /// mount (e.g. /proc) is treated as a violation rather than silently skipped.
+    critical: bool,
 }
 
 /// Known mount paths and the flags they must carry in production mode.
@@ -16,38 +19,47 @@ const PRODUCTION_MOUNT_EXPECTATIONS: &[ExpectedMount] = &[
     ExpectedMount {
         path: "/bin",
         required_flags: &["ro", "nosuid", "nodev"],
+        critical: true,
     },
     ExpectedMount {
         path: "/usr",
         required_flags: &["ro", "nosuid", "nodev"],
+        critical: true,
     },
     ExpectedMount {
         path: "/lib",
         required_flags: &["ro", "nosuid", "nodev"],
+        critical: false, // not all rootfs layouts have /lib
     },
     ExpectedMount {
         path: "/lib64",
         required_flags: &["ro", "nosuid", "nodev"],
+        critical: false, // not all rootfs layouts have /lib64
     },
     ExpectedMount {
         path: "/etc",
         required_flags: &["ro", "nosuid", "nodev"],
+        critical: true,
     },
     ExpectedMount {
         path: "/nix",
         required_flags: &["ro", "nosuid", "nodev"],
+        critical: false, // only present on NixOS-based rootfs
     },
     ExpectedMount {
         path: "/sbin",
         required_flags: &["ro", "nosuid", "nodev"],
+        critical: false, // not all rootfs layouts have /sbin
     },
     ExpectedMount {
         path: "/proc",
         required_flags: &["nosuid", "nodev", "noexec"],
+        critical: true,
     },
     ExpectedMount {
         path: "/run/secrets",
         required_flags: &["nosuid", "nodev", "noexec"],
+        critical: false, // only present when secrets are configured
     },
 ];
 
@@ -140,8 +152,12 @@ pub fn audit_mounts(production_mode: bool) -> Result<()> {
                     }
                 }
             }
+        } else if expectation.critical && production_mode {
+            violations.push(format!(
+                "Critical mount {} is missing from the mount namespace",
+                expectation.path
+            ));
         }
-        // If mount doesn't exist, that's OK — not all subdirs are present in every rootfs
     }
 
     if violations.is_empty() {
@@ -524,7 +540,29 @@ pub fn mask_proc_paths(proc_path: &Path, production: bool) -> Result<()> {
             MsFlags::MS_BIND,
             None::<&str>,
         ) {
-            Ok(_) => debug!("Masked /proc/{}", name),
+            Ok(_) => {
+                // Remount read-only: Linux ignores MS_RDONLY on the initial bind mount,
+                // so a separate MS_REMOUNT|MS_BIND|MS_RDONLY call is required.
+                if let Err(e) = mount(
+                    None::<&str>,
+                    &target,
+                    None::<&str>,
+                    MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+                    None::<&str>,
+                ) {
+                    if production && CRITICAL_PROC_PATHS.contains(name) {
+                        return Err(NucleusError::FilesystemError(format!(
+                            "Failed to remount /proc/{} read-only in production mode: {}",
+                            name, e
+                        )));
+                    }
+                    warn!(
+                        "Failed to remount /proc/{} read-only: {} (continuing)",
+                        name, e
+                    );
+                }
+                debug!("Masked /proc/{} (read-only)", name);
+            }
             Err(e) => {
                 if production && CRITICAL_PROC_PATHS.contains(name) {
                     return Err(NucleusError::FilesystemError(format!(

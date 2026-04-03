@@ -1095,7 +1095,7 @@ mod tests {
 
     #[test]
     fn test_container_config() {
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap();
         assert!(!config.id.is_empty());
         assert_eq!(config.command, vec!["/bin/sh"]);
         assert!(config.use_gvisor);
@@ -1104,7 +1104,8 @@ mod tests {
     #[test]
     fn test_container_config_with_name() {
         let config =
-            ContainerConfig::new(Some("mycontainer".to_string()), vec!["/bin/sh".to_string()]);
+            ContainerConfig::try_new(Some("mycontainer".to_string()), vec!["/bin/sh".to_string()])
+                .unwrap();
         assert_eq!(config.name, "mycontainer");
         assert!(!config.id.is_empty());
         assert_ne!(config.id, config.name);
@@ -1112,7 +1113,7 @@ mod tests {
 
     #[test]
     fn test_allow_degraded_security_requires_explicit_config() {
-        let strict = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
+        let strict = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap();
         assert!(!Container::allow_degraded_security(&strict));
 
         let relaxed = strict.clone().with_allow_degraded_security(true);
@@ -1124,7 +1125,7 @@ mod tests {
         let prev = std::env::var_os("NUCLEUS_ALLOW_DEGRADED_SECURITY");
         std::env::set_var("NUCLEUS_ALLOW_DEGRADED_SECURITY", "1");
 
-        let strict = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
+        let strict = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap();
         assert!(!Container::allow_degraded_security(&strict));
 
         let explicit = strict.with_allow_degraded_security(true);
@@ -1138,7 +1139,8 @@ mod tests {
 
     #[test]
     fn test_host_network_requires_explicit_opt_in() {
-        let mut config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let mut config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_network(NetworkMode::Host)
             .with_allow_host_network(false);
         let err = Container::apply_network_mode_guards(&mut config, true).unwrap_err();
@@ -1147,7 +1149,8 @@ mod tests {
 
     #[test]
     fn test_host_network_opt_in_disables_net_namespace() {
-        let mut config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let mut config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_network(NetworkMode::Host)
             .with_allow_host_network(true);
         assert!(config.namespaces.net);
@@ -1157,7 +1160,8 @@ mod tests {
 
     #[test]
     fn test_non_host_network_does_not_require_host_opt_in() {
-        let mut config = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+        let mut config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_network(NetworkMode::None)
             .with_allow_host_network(false);
         assert!(config.namespaces.net);
