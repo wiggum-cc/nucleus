@@ -436,7 +436,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Only run if gVisor is installed
     fn test_gvisor_new() {
         let runtime = GVisorRuntime::new();
         if let Ok(rt) = runtime {
