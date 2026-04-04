@@ -516,7 +516,9 @@ impl BridgeNetwork {
         // Range is 2..=254 (253 values). We reject random bytes >= 253 to
         // ensure uniform distribution, then add 2 to shift into the valid range.
         // Open /dev/urandom once and read all randomness in a single batch.
-        let mut rand_buf = [0u8; 32];
+        // 128 bytes gives ~125 valid candidates (byte < 253), making exhaustion
+        // in a populated subnet far less likely than the previous 32-byte buffer.
+        let mut rand_buf = [0u8; 128];
         std::fs::File::open("/dev/urandom")
             .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut rand_buf))
             .map_err(|e| {

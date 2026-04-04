@@ -92,12 +92,35 @@ impl AuditEvent {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| {
-                // Simple ISO-ish format: seconds.millis
-                let secs = d.as_secs();
+                // RFC 3339 / ISO 8601 UTC timestamp for audit log interoperability.
+                let total_secs = d.as_secs();
                 let millis = d.subsec_millis();
-                format!("{}.{:03}", secs, millis)
+
+                // Break epoch seconds into date/time components (no leap seconds).
+                let days = total_secs / 86400;
+                let day_secs = total_secs % 86400;
+                let hours = day_secs / 3600;
+                let minutes = (day_secs % 3600) / 60;
+                let seconds = day_secs % 60;
+
+                // Civil date from days since 1970-01-01 (Rata Die algorithm).
+                let z = days as i64 + 719468;
+                let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+                let doe = (z - era * 146097) as u64;
+                let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+                let y = yoe as i64 + era * 400;
+                let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                let mp = (5 * doy + 2) / 153;
+                let d = doy - (153 * mp + 2) / 5 + 1;
+                let m = if mp < 10 { mp + 3 } else { mp - 9 };
+                let y = if m <= 2 { y + 1 } else { y };
+
+                format!(
+                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                    y, m, d, hours, minutes, seconds, millis
+                )
             })
-            .unwrap_or_else(|_| "0.000".to_string());
+            .unwrap_or_else(|_| "1970-01-01T00:00:00.000Z".to_string());
 
         Self {
             timestamp,

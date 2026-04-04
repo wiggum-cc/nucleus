@@ -959,8 +959,16 @@ fn main() -> Result<()> {
                 if parts.len() != 2 {
                     return Err(NucleusError::ConfigError(format!("Invalid secret format '{}', expected SOURCE:DEST", spec)));
                 }
+                // Canonicalize source path to resolve symlinks and prevent
+                // path traversal (e.g., "../../etc/shadow:...").
+                let source = std::fs::canonicalize(parts[0]).map_err(|e| {
+                    NucleusError::ConfigError(format!(
+                        "Secret source '{}' cannot be resolved: {}",
+                        parts[0], e
+                    ))
+                })?;
                 config = config.with_secret(SecretMount {
-                    source: PathBuf::from(parts[0]),
+                    source,
                     dest: PathBuf::from(parts[1]),
                     mode: 0o400,
                 });

@@ -166,7 +166,7 @@ pub fn parse_signal(s: &str) -> Result<Signal> {
     }
 
     // Normalize: uppercase and strip optional "SIG" prefix
-    let upper = s.to_uppercase();
+    let upper = s.to_ascii_uppercase();
     let normalized = upper.strip_prefix("SIG").unwrap_or(&upper);
 
     match normalized {

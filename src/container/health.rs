@@ -6,6 +6,21 @@ use tracing::{debug, error, info, warn};
 
 use super::runtime::Container;
 
+/// Read the start time (field 22) from /proc/<pid>/stat to detect PID reuse.
+fn read_start_ticks(pid: u32) -> u64 {
+    let stat_path = format!("/proc/{}/stat", pid);
+    if let Ok(content) = std::fs::read_to_string(&stat_path) {
+        if let Some(after_comm) = content.rfind(')') {
+            return content[after_comm + 2..]
+                .split_whitespace()
+                .nth(19)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+        }
+    }
+    0
+}
+
 impl Container {
     /// Run a readiness probe and, if sd_notify is active, send READY=1.
     pub(super) fn run_readiness_probe(
@@ -121,6 +136,14 @@ impl Container {
             cancel.load(std::sync::atomic::Ordering::Relaxed)
         };
 
+        // Capture start_ticks to verify PID ownership before sending signals,
+        // preventing SIGTERM to a recycled PID.
+        let expected_ticks = read_start_ticks(pid);
+        if expected_ticks == 0 {
+            warn!("Health check: could not read start_ticks for PID {}, aborting", pid);
+            return;
+        }
+
         // Wait for start_period before beginning checks
         if cancellable_sleep(hc.start_period) {
             return;
@@ -168,8 +191,12 @@ impl Container {
                             "Container {} is unhealthy after {} consecutive failures",
                             container_name, consecutive_failures
                         );
-                        // Signal the container to stop — the parent will handle cleanup
-                        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                        // Re-verify PID ownership to avoid signaling a recycled PID
+                        if read_start_ticks(pid) == expected_ticks {
+                            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                        } else {
+                            warn!("Health check: PID {} was recycled, not sending SIGTERM", pid);
+                        }
                         return;
                     }
                 }
@@ -178,7 +205,12 @@ impl Container {
                         "Health check execution failed for {}: {}",
                         container_name, e
                     );
-                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                    // Re-verify PID ownership to avoid signaling a recycled PID
+                    if read_start_ticks(pid) == expected_ticks {
+                        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                    } else {
+                        warn!("Health check: PID {} was recycled, not sending SIGTERM", pid);
+                    }
                     return;
                 }
             }

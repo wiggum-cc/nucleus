@@ -346,8 +346,12 @@ impl SeccompManager {
         // is impossible at the BPF level. However, glibc 2.34+ and newer musl use
         // clone3 internally for posix_spawn/fork — blocking it breaks
         // std::process::Command and any child-process spawning on modern systems.
-        // Namespace creation is still prevented by dropped capabilities
-        // (CAP_SYS_ADMIN etc.) which are enforced before seccomp applies.
+        //
+        // SECURITY INVARIANT: Namespace creation via clone3 is prevented solely by
+        // dropping CAP_SYS_ADMIN (and other namespace caps) *before* this seccomp
+        // filter is installed. If capability dropping is bypassed, clone3 becomes
+        // an unfiltered path to namespace creation. This is a known single point
+        // of failure — see CapabilityManager::drop_all() which must run first.
         rules.insert(libc::SYS_clone3, Vec::new());
 
         // clone: allow but deny namespace-creating flags to prevent nested namespace creation
