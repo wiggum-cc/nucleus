@@ -810,7 +810,7 @@ dependencies = [
 
 [[package]]
 name = "nucleus-container"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "caps",
  "clap",

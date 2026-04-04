@@ -28,53 +28,43 @@ impl SeccompManager {
     }
 
     fn base_allowed_syscalls() -> Vec<i64> {
-        vec![
+        let mut syscalls = vec![
             // File I/O
             libc::SYS_read,
             libc::SYS_write,
-            libc::SYS_open,
             libc::SYS_openat,
             libc::SYS_close,
-            libc::SYS_stat,
             libc::SYS_fstat,
-            libc::SYS_lstat,
             libc::SYS_lseek,
-            libc::SYS_access,
             libc::SYS_fcntl,
             libc::SYS_readv,
             libc::SYS_writev,
             libc::SYS_pread64,
             libc::SYS_pwrite64,
-            libc::SYS_readlink,
             libc::SYS_readlinkat,
             libc::SYS_newfstatat,
             libc::SYS_statx,
             libc::SYS_faccessat,
             libc::SYS_faccessat2,
             libc::SYS_dup,
-            libc::SYS_dup2,
             libc::SYS_dup3,
-            libc::SYS_pipe,
             libc::SYS_pipe2,
-            libc::SYS_unlink,
             libc::SYS_unlinkat,
-            libc::SYS_rename,
             libc::SYS_renameat,
             libc::SYS_renameat2,
-            libc::SYS_link,
             libc::SYS_linkat,
-            libc::SYS_symlink,
             libc::SYS_symlinkat,
-            libc::SYS_chmod,
             libc::SYS_fchmod,
             libc::SYS_fchmodat,
             libc::SYS_truncate,
             libc::SYS_ftruncate,
             libc::SYS_fallocate,
+            #[cfg(target_arch = "x86_64")]
             libc::SYS_fadvise64,
             libc::SYS_fsync,
             libc::SYS_fdatasync,
             libc::SYS_flock,
+            #[cfg(target_arch = "x86_64")]
             libc::SYS_sendfile,
             libc::SYS_copy_file_range,
             libc::SYS_splice,
@@ -104,7 +94,6 @@ impl SeccompManager {
             libc::SYS_geteuid,
             libc::SYS_getegid,
             libc::SYS_getppid,
-            libc::SYS_getpgrp,
             libc::SYS_setsid,
             libc::SYS_getgroups,
             // Signals
@@ -125,10 +114,7 @@ impl SeccompManager {
             libc::SYS_getcwd,
             libc::SYS_chdir,
             libc::SYS_fchdir,
-            libc::SYS_mkdir,
             libc::SYS_mkdirat,
-            libc::SYS_rmdir,
-            libc::SYS_getdents,
             libc::SYS_getdents64,
             // Misc
             libc::SYS_uname,
@@ -137,10 +123,8 @@ impl SeccompManager {
             libc::SYS_set_tid_address,
             libc::SYS_set_robust_list,
             libc::SYS_get_robust_list,
-            libc::SYS_arch_prctl,
             libc::SYS_sysinfo,
             libc::SYS_umask,
-            libc::SYS_getrlimit,
             libc::SYS_prlimit64,
             libc::SYS_getrusage,
             libc::SYS_times,
@@ -161,23 +145,48 @@ impl SeccompManager {
             libc::SYS_socketpair,
             libc::SYS_getsockopt,
             // Poll/Select
-            libc::SYS_poll,
             libc::SYS_ppoll,
-            libc::SYS_select,
             libc::SYS_pselect6,
-            libc::SYS_epoll_create,
             libc::SYS_epoll_create1,
             libc::SYS_epoll_ctl,
-            libc::SYS_epoll_wait,
             libc::SYS_epoll_pwait,
-            libc::SYS_eventfd,
             libc::SYS_eventfd2,
-            libc::SYS_signalfd,
             libc::SYS_signalfd4,
             libc::SYS_timerfd_create,
             libc::SYS_timerfd_settime,
             libc::SYS_timerfd_gettime,
-        ]
+        ];
+
+        // Legacy syscalls only available on x86_64 (aarch64 only has the *at variants)
+        #[cfg(target_arch = "x86_64")]
+        syscalls.extend_from_slice(&[
+            libc::SYS_open,
+            libc::SYS_stat,
+            libc::SYS_lstat,
+            libc::SYS_access,
+            libc::SYS_readlink,
+            libc::SYS_dup2,
+            libc::SYS_pipe,
+            libc::SYS_unlink,
+            libc::SYS_rename,
+            libc::SYS_link,
+            libc::SYS_symlink,
+            libc::SYS_chmod,
+            libc::SYS_mkdir,
+            libc::SYS_rmdir,
+            libc::SYS_getdents,
+            libc::SYS_getpgrp,
+            libc::SYS_arch_prctl,
+            libc::SYS_getrlimit,
+            libc::SYS_poll,
+            libc::SYS_select,
+            libc::SYS_epoll_create,
+            libc::SYS_epoll_wait,
+            libc::SYS_eventfd,
+            libc::SYS_signalfd,
+        ]);
+
+        syscalls
     }
 
     fn allowed_socket_domains(allow_network: bool) -> Vec<i32> {
@@ -811,19 +820,24 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         // File I/O
         "read" => Some(libc::SYS_read),
         "write" => Some(libc::SYS_write),
+        #[cfg(target_arch = "x86_64")]
         "open" => Some(libc::SYS_open),
         "openat" => Some(libc::SYS_openat),
         "close" => Some(libc::SYS_close),
+        #[cfg(target_arch = "x86_64")]
         "stat" => Some(libc::SYS_stat),
         "fstat" => Some(libc::SYS_fstat),
+        #[cfg(target_arch = "x86_64")]
         "lstat" => Some(libc::SYS_lstat),
         "lseek" => Some(libc::SYS_lseek),
+        #[cfg(target_arch = "x86_64")]
         "access" => Some(libc::SYS_access),
         "fcntl" => Some(libc::SYS_fcntl),
         "readv" => Some(libc::SYS_readv),
         "writev" => Some(libc::SYS_writev),
         "pread64" => Some(libc::SYS_pread64),
         "pwrite64" => Some(libc::SYS_pwrite64),
+        #[cfg(target_arch = "x86_64")]
         "readlink" => Some(libc::SYS_readlink),
         "readlinkat" => Some(libc::SYS_readlinkat),
         "newfstatat" => Some(libc::SYS_newfstatat),
@@ -831,29 +845,38 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "faccessat" => Some(libc::SYS_faccessat),
         "faccessat2" => Some(libc::SYS_faccessat2),
         "dup" => Some(libc::SYS_dup),
+        #[cfg(target_arch = "x86_64")]
         "dup2" => Some(libc::SYS_dup2),
         "dup3" => Some(libc::SYS_dup3),
+        #[cfg(target_arch = "x86_64")]
         "pipe" => Some(libc::SYS_pipe),
         "pipe2" => Some(libc::SYS_pipe2),
+        #[cfg(target_arch = "x86_64")]
         "unlink" => Some(libc::SYS_unlink),
         "unlinkat" => Some(libc::SYS_unlinkat),
+        #[cfg(target_arch = "x86_64")]
         "rename" => Some(libc::SYS_rename),
         "renameat" => Some(libc::SYS_renameat),
         "renameat2" => Some(libc::SYS_renameat2),
+        #[cfg(target_arch = "x86_64")]
         "link" => Some(libc::SYS_link),
         "linkat" => Some(libc::SYS_linkat),
+        #[cfg(target_arch = "x86_64")]
         "symlink" => Some(libc::SYS_symlink),
         "symlinkat" => Some(libc::SYS_symlinkat),
+        #[cfg(target_arch = "x86_64")]
         "chmod" => Some(libc::SYS_chmod),
         "fchmod" => Some(libc::SYS_fchmod),
         "fchmodat" => Some(libc::SYS_fchmodat),
         "truncate" => Some(libc::SYS_truncate),
         "ftruncate" => Some(libc::SYS_ftruncate),
         "fallocate" => Some(libc::SYS_fallocate),
+        #[cfg(target_arch = "x86_64")]
         "fadvise64" => Some(libc::SYS_fadvise64),
         "fsync" => Some(libc::SYS_fsync),
         "fdatasync" => Some(libc::SYS_fdatasync),
         "flock" => Some(libc::SYS_flock),
+        #[cfg(target_arch = "x86_64")]
         "sendfile" => Some(libc::SYS_sendfile),
         "copy_file_range" => Some(libc::SYS_copy_file_range),
         "splice" => Some(libc::SYS_splice),
@@ -869,6 +892,7 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "mlock" => Some(libc::SYS_mlock),
         "munlock" => Some(libc::SYS_munlock),
         // Process
+        #[cfg(target_arch = "x86_64")]
         "fork" => Some(libc::SYS_fork),
         "clone" => Some(libc::SYS_clone),
         "clone3" => Some(libc::SYS_clone3),
@@ -885,6 +909,7 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "geteuid" => Some(libc::SYS_geteuid),
         "getegid" => Some(libc::SYS_getegid),
         "getppid" => Some(libc::SYS_getppid),
+        #[cfg(target_arch = "x86_64")]
         "getpgrp" => Some(libc::SYS_getpgrp),
         "setsid" => Some(libc::SYS_setsid),
         "getgroups" => Some(libc::SYS_getgroups),
@@ -906,9 +931,12 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "getcwd" => Some(libc::SYS_getcwd),
         "chdir" => Some(libc::SYS_chdir),
         "fchdir" => Some(libc::SYS_fchdir),
+        #[cfg(target_arch = "x86_64")]
         "mkdir" => Some(libc::SYS_mkdir),
         "mkdirat" => Some(libc::SYS_mkdirat),
+        #[cfg(target_arch = "x86_64")]
         "rmdir" => Some(libc::SYS_rmdir),
+        #[cfg(target_arch = "x86_64")]
         "getdents" => Some(libc::SYS_getdents),
         "getdents64" => Some(libc::SYS_getdents64),
         // Network
@@ -929,17 +957,23 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "getpeername" => Some(libc::SYS_getpeername),
         "socketpair" => Some(libc::SYS_socketpair),
         // Poll/Select
+        #[cfg(target_arch = "x86_64")]
         "poll" => Some(libc::SYS_poll),
         "ppoll" => Some(libc::SYS_ppoll),
+        #[cfg(target_arch = "x86_64")]
         "select" => Some(libc::SYS_select),
         "pselect6" => Some(libc::SYS_pselect6),
+        #[cfg(target_arch = "x86_64")]
         "epoll_create" => Some(libc::SYS_epoll_create),
         "epoll_create1" => Some(libc::SYS_epoll_create1),
         "epoll_ctl" => Some(libc::SYS_epoll_ctl),
+        #[cfg(target_arch = "x86_64")]
         "epoll_wait" => Some(libc::SYS_epoll_wait),
         "epoll_pwait" => Some(libc::SYS_epoll_pwait),
+        #[cfg(target_arch = "x86_64")]
         "eventfd" => Some(libc::SYS_eventfd),
         "eventfd2" => Some(libc::SYS_eventfd2),
+        #[cfg(target_arch = "x86_64")]
         "signalfd" => Some(libc::SYS_signalfd),
         "signalfd4" => Some(libc::SYS_signalfd4),
         "timerfd_create" => Some(libc::SYS_timerfd_create),
@@ -952,9 +986,11 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "set_tid_address" => Some(libc::SYS_set_tid_address),
         "set_robust_list" => Some(libc::SYS_set_robust_list),
         "get_robust_list" => Some(libc::SYS_get_robust_list),
+        #[cfg(target_arch = "x86_64")]
         "arch_prctl" => Some(libc::SYS_arch_prctl),
         "sysinfo" => Some(libc::SYS_sysinfo),
         "umask" => Some(libc::SYS_umask),
+        #[cfg(target_arch = "x86_64")]
         "getrlimit" => Some(libc::SYS_getrlimit),
         "prlimit64" => Some(libc::SYS_prlimit64),
         "getrusage" => Some(libc::SYS_getrusage),
