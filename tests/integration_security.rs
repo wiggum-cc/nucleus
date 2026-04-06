@@ -183,8 +183,15 @@ mod tests {
             .map(|m| m.destination.as_str())
             .collect();
 
-        assert!(mount_dests.contains(&"/bin"));
-        assert!(mount_dests.contains(&"/usr"));
+        for path in ["/bin", "/sbin", "/usr", "/lib", "/lib64", "/nix/store"] {
+            if std::path::Path::new(path).exists() {
+                assert!(
+                    mount_dests.contains(&path),
+                    "existing host runtime path {} should be bind-mounted",
+                    path
+                );
+            }
+        }
     }
 
     #[test]

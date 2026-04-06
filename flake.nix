@@ -65,6 +65,9 @@
 
         inherit (pkgs) lib;
 
+        gvisorRuntimePkgs = lib.optionals pkgs.stdenv.isLinux [ pkgs.gvisor ];
+        gvisorRuntimePath = lib.makeBinPath gvisorRuntimePkgs;
+
         rustToolchain = pkgs.rust-bin.stable.latest.default;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
@@ -77,7 +80,7 @@
         commonArgs = {
           inherit src;
           pname = "nucleus";
-          version = "0.2.0";
+          version = "0.3.0";
           strictDeps = true;
 
           nativeBuildInputs = [
@@ -97,6 +100,11 @@
         # Build the actual crate
         my-crate = if cargoLockExists then craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
+          nativeCheckInputs = gvisorRuntimePkgs;
+          nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ];
+          postFixup = lib.optionalString pkgs.stdenv.isLinux ''
+            wrapProgram $out/bin/nucleus --prefix PATH : "${gvisorRuntimePath}"
+          '';
         }) else null;
 
         # Apalache - TLA+ model checker
@@ -149,23 +157,24 @@
           my-crate-fmt = craneLib.cargoFmt {
             inherit src;
             pname = "nucleus";
-            version = "0.1.0";
+            version = "0.3.0";
           };
 
           my-crate-audit = craneLib.cargoAudit {
             inherit src advisory-db;
             pname = "nucleus";
-            version = "0.1.0";
+            version = "0.3.0";
           };
 
           my-crate-deny = craneLib.cargoDeny {
             inherit src;
             pname = "nucleus";
-            version = "0.1.0";
+            version = "0.3.0";
           };
 
           my-crate-nextest = craneLib.cargoNextest (commonArgs // {
             inherit cargoArtifacts;
+            nativeCheckInputs = gvisorRuntimePkgs;
             partitions = 1;
             partitionType = "count";
           });
