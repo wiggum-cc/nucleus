@@ -16,8 +16,7 @@ type BenchResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 const CPU_LOOP_SCRIPT: &str =
     "i=0; acc=0; while [ \"$i\" -lt 200000 ]; do acc=$((acc + (i % 97))); i=$((i + 1)); done; test \"$acc\" -ge 0";
-const CONTEXT_SCAN_SCRIPT_TEMPLATE: &str =
-    "total=0; for f in {PATH}/*; do bytes=$(wc -c < \"$f\"); total=$((total + bytes)); done; test \"$total\" -gt 0";
+const CONTEXT_SCAN_SCRIPT_TEMPLATE: &str = "total=0; for f in {PATH}/*; do chunk=''; IFS= read -r chunk < \"$f\" || [ -n \"$chunk\" ]; total=$((total + ${#chunk})); done; test \"$total\" -gt 0";
 
 #[derive(Clone, Copy)]
 enum Runner {
