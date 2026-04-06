@@ -18,6 +18,50 @@ use nucleus::topology::{
 use std::path::PathBuf;
 use tracing::info;
 
+fn validate_systemd_credential_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(NucleusError::ConfigError(
+            "Systemd credential name cannot be empty".to_string(),
+        ));
+    }
+    if name.contains('/') || name.contains('\0') || name == "." || name == ".." {
+        return Err(NucleusError::ConfigError(format!(
+            "Invalid systemd credential name '{}'",
+            name
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_systemd_credential_source(name: &str) -> Result<PathBuf> {
+    validate_systemd_credential_name(name)?;
+    let credentials_dir = std::env::var_os("CREDENTIALS_DIRECTORY").ok_or_else(|| {
+        NucleusError::ConfigError(
+            "--systemd-credential requires CREDENTIALS_DIRECTORY from systemd".to_string(),
+        )
+    })?;
+    let credentials_dir = PathBuf::from(credentials_dir);
+    let canonical_dir = std::fs::canonicalize(&credentials_dir).map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Failed to resolve CREDENTIALS_DIRECTORY {:?}: {}",
+            credentials_dir, e
+        ))
+    })?;
+    let source = std::fs::canonicalize(credentials_dir.join(name)).map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Systemd credential '{}' cannot be resolved under {:?}: {}",
+            name, credentials_dir, e
+        ))
+    })?;
+    if !source.starts_with(&canonical_dir) {
+        return Err(NucleusError::ConfigError(format!(
+            "Systemd credential '{}' resolved outside CREDENTIALS_DIRECTORY",
+            name
+        )));
+    }
+    Ok(source)
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "nucleus")]
 #[command(about = "Extremely lightweight Docker alternative for agents", long_about = None)]
@@ -127,7 +171,8 @@ enum Commands {
         #[arg(long)]
         proc_rw: bool,
 
-        /// Publish a port (format: HOST:CONTAINER or HOST:CONTAINER/PROTOCOL)
+        /// Publish a port (format: HOST:CONTAINER, HOST:CONTAINER/PROTOCOL,
+        /// or HOST_IP:HOST:CONTAINER[/PROTOCOL])
         #[arg(short = 'p', long = "publish")]
         publish: Vec<String>,
 
@@ -178,6 +223,10 @@ enum Commands {
         /// Mount a secret file: SOURCE:DEST (repeatable)
         #[arg(long = "secret")]
         secrets: Vec<String>,
+
+        /// Mount a systemd credential by name: NAME:DEST (repeatable)
+        #[arg(long = "systemd-credential")]
+        systemd_credentials: Vec<String>,
 
         /// Mount a host path as a bind volume: SOURCE:DEST[:ro|rw] (repeatable)
         #[arg(long = "volume")]
@@ -715,6 +764,7 @@ fn main() -> Result<()> {
             health_retries,
             health_start_period,
             secrets,
+            systemd_credentials,
             volumes,
             tmpfs,
             env_vars,
@@ -995,6 +1045,23 @@ fn main() -> Result<()> {
                 });
             }
 
+            // Systemd credentials
+            for spec in &systemd_credentials {
+                let parts: Vec<&str> = spec.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    return Err(NucleusError::ConfigError(format!(
+                        "Invalid systemd credential format '{}', expected NAME:DEST",
+                        spec
+                    )));
+                }
+                let source = resolve_systemd_credential_source(parts[0])?;
+                config = config.with_secret(SecretMount {
+                    source,
+                    dest: PathBuf::from(parts[1]),
+                    mode: 0o400,
+                });
+            }
+
             // Bind volumes
             for spec in &volumes {
                 let parts: Vec<&str> = spec.split(':').collect();
@@ -1236,6 +1303,12 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn test_native_runtime_disables_gvisor() {
@@ -1262,5 +1335,29 @@ mod tests {
             err.to_string().contains("requires gVisor"),
             "native runtime with --bundle must be rejected explicitly"
         );
+    }
+
+    #[test]
+    fn test_resolve_systemd_credential_source() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let cred = dir.path().join("db-password");
+        std::fs::write(&cred, "secret").unwrap();
+        std::env::set_var("CREDENTIALS_DIRECTORY", dir.path());
+
+        let resolved = resolve_systemd_credential_source("db-password").unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&cred).unwrap());
+        std::env::remove_var("CREDENTIALS_DIRECTORY");
+    }
+
+    #[test]
+    fn test_resolve_systemd_credential_rejects_path_traversal() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("CREDENTIALS_DIRECTORY", dir.path());
+
+        let err = resolve_systemd_credential_source("../db-password").unwrap_err();
+        assert!(err.to_string().contains("Invalid systemd credential name"));
+        std::env::remove_var("CREDENTIALS_DIRECTORY");
     }
 }

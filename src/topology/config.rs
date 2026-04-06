@@ -107,7 +107,7 @@ pub struct ServiceDef {
     #[serde(default)]
     pub egress_tcp_ports: Vec<u16>,
 
-    /// Port forwards (format: "HOST:CONTAINER")
+    /// Port forwards (format: "HOST:CONTAINER" or "HOST_IP:HOST:CONTAINER")
     #[serde(default)]
     pub port_forwards: Vec<String>,
 

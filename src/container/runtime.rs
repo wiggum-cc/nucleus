@@ -53,7 +53,7 @@ pub struct CreatedContainer {
     pub(super) cgroup_opt: Option<Cgroup>,
     pub(super) bridge_net: Option<BridgeNetwork>,
     pub(super) trace_reader: Option<SeccompTraceReader>,
-    pub(super) exec_fifo_path: PathBuf,
+    pub(super) exec_fifo_path: Option<PathBuf>,
     pub(super) _lifecycle_span: tracing::Span,
 }
 
@@ -67,13 +67,17 @@ impl Container {
 
     /// Run the container (convenience wrapper: create + start)
     pub fn run(&self) -> Result<i32> {
-        self.create()?.start()
+        self.create_internal(false)?.start()
     }
 
     /// Create phase: fork the child, set up cgroup/bridge, leave child blocked
     /// on the exec FIFO. Returns a `CreatedContainer` whose `start()` method
     /// releases the child process.
     pub fn create(&self) -> Result<CreatedContainer> {
+        self.create_internal(true)
+    }
+
+    fn create_internal(&self, defer_exec_until_start: bool) -> Result<CreatedContainer> {
         let lifecycle_span = info_span!(
             "container.lifecycle",
             container.id = %self.config.id,
@@ -155,12 +159,20 @@ impl Container {
             }
         }
 
-        // Create exec FIFO for two-phase create/start synchronization.
-        // The child will block on open-for-write until start() opens for read.
-        let exec_fifo = state_mgr.exec_fifo_path(&config.id)?;
-        nix::unistd::mkfifo(&exec_fifo, Mode::S_IRUSR | Mode::S_IWUSR).map_err(|e| {
-            NucleusError::ExecError(format!("Failed to create exec FIFO {:?}: {}", exec_fifo, e))
-        })?;
+        // Create exec FIFO only for the two-phase create/start lifecycle.
+        // `run()` starts immediately and avoids this cross-root-path sync.
+        let exec_fifo = if defer_exec_until_start {
+            let exec_fifo = state_mgr.exec_fifo_path(&config.id)?;
+            nix::unistd::mkfifo(&exec_fifo, Mode::S_IRUSR | Mode::S_IWUSR).map_err(|e| {
+                NucleusError::ExecError(format!(
+                    "Failed to create exec FIFO {:?}: {}",
+                    exec_fifo, e
+                ))
+            })?;
+            Some(exec_fifo)
+        } else {
+            None
+        };
 
         // Try to create cgroup (optional for rootless mode)
         let cgroup_name = format!("nucleus-{}", config.id);
@@ -330,7 +342,7 @@ impl Container {
             ForkResult::Child => {
                 drop(ready_read);
                 let temp_container = Container { config, runsc_path };
-                match temp_container.setup_and_exec(Some(ready_write), Some(exec_fifo)) {
+                match temp_container.setup_and_exec(Some(ready_write), exec_fifo) {
                     Ok(_) => unreachable!(),
                     Err(e) => {
                         error!("Container setup failed: {}", e);
@@ -917,16 +929,21 @@ impl CreatedContainer {
 
         // Open the exec FIFO for reading — this unblocks the child's
         // blocking open-for-write, allowing it to proceed to exec.
-        {
-            let file = std::fs::File::open(&self.exec_fifo_path).map_err(|e| {
+        if let Some(exec_fifo_path) = &self.exec_fifo_path {
+            let file = std::fs::File::open(exec_fifo_path).map_err(|e| {
                 NucleusError::ExecError(format!("Failed to open exec FIFO for reading: {}", e))
             })?;
             let mut buf = [0u8; 1];
-            std::io::Read::read(&mut &file, &mut buf).map_err(|e| {
+            let read = std::io::Read::read(&mut &file, &mut buf).map_err(|e| {
                 NucleusError::ExecError(format!("Failed to read exec FIFO sync byte: {}", e))
             })?;
+            if read != 1 {
+                return Err(NucleusError::ExecError(
+                    "Exec FIFO closed before start signal was delivered".to_string(),
+                ));
+            }
+            let _ = std::fs::remove_file(exec_fifo_path);
         }
-        let _ = std::fs::remove_file(&self.exec_fifo_path);
 
         // Transition: Created -> Running
         self.state.status = OciStatus::Running;
@@ -1102,6 +1119,38 @@ mod tests {
         assert!(!config.id.is_empty());
         assert_eq!(config.command, vec!["/bin/sh"]);
         assert!(config.use_gvisor);
+    }
+
+    #[test]
+    fn test_run_uses_immediate_start_path() {
+        let source = include_str!("runtime.rs");
+        let fn_start = source.find("pub fn run(&self) -> Result<i32>").unwrap();
+        let after = &source[fn_start..];
+        let open = after.find('{').unwrap();
+        let mut depth = 0u32;
+        let mut fn_end = open;
+        for (i, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        fn_end = open + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let run_body = &after[..fn_end];
+        assert!(
+            run_body.contains("create_internal(false)"),
+            "run() must bypass deferred exec FIFO startup to avoid cross-root deadlocks"
+        );
+        assert!(
+            !run_body.contains("self.create()?.start()"),
+            "run() must not route through create()+start()"
+        );
     }
 
     #[test]

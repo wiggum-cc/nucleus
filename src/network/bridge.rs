@@ -482,9 +482,13 @@ impl BridgeNetwork {
             Self::run_cmd_owned("iptables", &args)?;
         }
 
+        let host_ip = pf
+            .host_ip
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "0.0.0.0".to_string());
         info!(
             "Port forward: {}:{} -> {}:{}/{}",
-            "host", pf.host_port, container_ip, pf.container_port, pf.protocol
+            host_ip, pf.host_port, container_ip, pf.container_port, pf.protocol
         );
         Ok(())
     }
@@ -737,6 +741,10 @@ impl BridgeNetwork {
                 "--dst-type".to_string(),
                 "LOCAL".to_string(),
             ]);
+        }
+
+        if let Some(host_ip) = pf.host_ip {
+            args.extend(["-d".to_string(), host_ip.to_string()]);
         }
 
         args.extend([
@@ -1045,6 +1053,7 @@ mod tests {
     #[test]
     fn test_port_forward_rules_include_output_chain_for_local_host_clients() {
         let pf = PortForward {
+            host_ip: None,
             host_port: 8080,
             container_port: 80,
             protocol: crate::network::config::Protocol::Tcp,
@@ -1062,5 +1071,27 @@ mod tests {
                 .any(|pair| pair[0] == "--dst-type" && pair[1] == "LOCAL"),
             "OUTPUT rule must target local-destination traffic"
         );
+    }
+
+    #[test]
+    fn test_port_forward_rules_include_host_ip_when_configured() {
+        let pf = PortForward {
+            host_ip: Some(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            host_port: 4173,
+            container_port: 4173,
+            protocol: crate::network::config::Protocol::Tcp,
+        };
+
+        let prerouting =
+            BridgeNetwork::port_forward_rule_args("-A", "PREROUTING", "10.0.42.2", &pf);
+        let output = BridgeNetwork::port_forward_rule_args("-A", "OUTPUT", "10.0.42.2", &pf);
+
+        for args in [&prerouting, &output] {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "-d" && pair[1] == "127.0.0.1"),
+                "port forward must restrict DNAT rules to the configured host IP"
+            );
+        }
     }
 }

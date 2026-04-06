@@ -79,6 +79,7 @@ nucleus run --rootless -- /bin/sh
 # Optional networking
 nucleus run --network host --allow-host-network -- curl https://example.com
 nucleus run --network bridge -p 8080:80 -- ./server
+nucleus run --network bridge -p 127.0.0.1:8080:80 -- ./server
 
 # Context streaming (bind mount for instant access)
 nucleus run --context ./large-dir/ --context-mode bind -- ./agent
@@ -116,10 +117,11 @@ nucleus run \
   --health-cmd "curl -sf http://localhost:8080/health" \
   --health-interval 30 --health-retries 3 \
   --secret /run/secrets/tls-cert:/etc/tls/cert.pem \
+  --systemd-credential db-url:/run/secrets/db-url \
   --volume /var/lib/myservice:/var/lib/myservice:rw \
   -e CONFIG_PATH=/etc/myservice/config.toml \
   --sd-notify \
-  -p 8080:8080 \
+  -p 127.0.0.1:8080:8080 \
   -- /bin/my-service --config /etc/myservice/config.toml
 
 # gVisor with network access (sandbox network stack)
@@ -384,7 +386,7 @@ in
       # Networking
       network = "bridge";
       dns = [ "10.0.0.1" ];  # internal resolver — no public DNS default
-      portForwards = [ "8080:8080" "8443:8443" ];
+      portForwards = [ "127.0.0.1:8080:8080" "127.0.0.1:8443:8443" ];
 
       # Egress policy — audited outbound access
       egressAllow = [ "10.0.0.0/8" ];
@@ -399,6 +401,16 @@ in
       # Secrets (mounted read-only)
       secrets = [
         { source = config.age.secrets.proxy-tls.path; dest = "/etc/tls/cert.pem"; }
+      ];
+
+      # systemd-creds integration
+      credentials = [
+        {
+          name = "proxy-key";
+          source = config.age.secrets.proxy-key.path;
+          dest = "/run/secrets/proxy-key";
+          encrypted = false;
+        }
       ];
 
       # Volumes (bind-mounted host paths)
@@ -424,6 +436,8 @@ in
 ```
 
 Writable bind volumes are automatically added to the generated systemd unit's `ReadWritePaths`. When `createHostPath = true`, the NixOS module creates the host directory with `systemd-tmpfiles` before the container starts.
+
+Credentials declared via `credentials = [ ... ]` use systemd's credential pipeline (`LoadCredential` or `LoadCredentialEncrypted`) and are mounted into the container through Nucleus's secret path. The CLI flag `--systemd-credential NAME:DEST` resolves `NAME` from `CREDENTIALS_DIRECTORY` at runtime.
 
 ### Topology Services
 
@@ -583,6 +597,9 @@ cargo build --release
 
 # Clippy
 cargo clippy --all-targets -- --deny warnings
+
+# Host vs container runtime benchmarks (requires root)
+sudo -E cargo bench --bench container_runtime
 ```
 
 ### Project Structure
@@ -633,6 +650,23 @@ Nucleus uses spec-driven development with comprehensive testing:
 - **Integration tests**: Complete container lifecycle
 
 All state machines are formally verified using TLA+ and the Apalache model checker.
+
+### Performance Benchmarks
+
+`benches/container_runtime.rs` compares the same workloads when run directly on the host vs inside a native Nucleus container. The matrix covers:
+
+- cold startup (`/bin/sh -lc ':'`)
+- a CPU-bound shell arithmetic loop
+- context-heavy file scans with both bind-mounted and copied context
+- a constrained profile that applies the same cgroup limits to the direct host process and the containerized process
+
+Because the benchmark creates namespaces and cgroups, it must run as root:
+
+```bash
+sudo -E cargo bench --bench container_runtime
+```
+
+Criterion writes the comparison reports to `target/criterion/container_runtime/`.
 
 ### System-Level TLA+ Model
 

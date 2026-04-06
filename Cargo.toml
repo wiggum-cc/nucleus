@@ -73,6 +73,10 @@ harness = false
 name = "concurrency"
 harness = false
 
+[[bench]]
+name = "container_runtime"
+harness = false
+
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/nucleus-{ target }{ archive-suffix }"
 bin-dir = "nucleus-{ target }/{ bin }{ binary-ext }"

@@ -77,8 +77,8 @@ let
       portForwards = mkOption {
         type = types.listOf types.str;
         default = [ ];
-        example = [ "8080:80" "5353:53/udp" ];
-        description = "Port forwarding rules (HOST:CONTAINER[/PROTOCOL]).";
+        example = [ "127.0.0.1:8080:80" "5353:53/udp" ];
+        description = "Port forwarding rules (HOST:CONTAINER[/PROTOCOL] or HOST_IP:HOST:CONTAINER[/PROTOCOL]).";
       };
 
       trustLevel = mkOption {
@@ -175,6 +175,32 @@ let
         });
         default = [ ];
         description = "Secret files to mount read-only into the container.";
+      };
+
+      credentials = mkOption {
+        type = types.listOf (types.submodule {
+          options = {
+            name = mkOption {
+              type = types.str;
+              description = "Systemd credential name exposed to the unit.";
+            };
+            source = mkOption {
+              type = types.either types.path types.str;
+              description = "Credential source passed to LoadCredential or LoadCredentialEncrypted.";
+            };
+            dest = mkOption {
+              type = types.str;
+              description = "Destination path inside the container.";
+            };
+            encrypted = mkOption {
+              type = types.bool;
+              default = false;
+              description = "Use systemd LoadCredentialEncrypted instead of LoadCredential.";
+            };
+          };
+        });
+        default = [ ];
+        description = "Systemd-managed credentials mounted into the container as secrets.";
       };
 
       volumes = mkOption {
@@ -319,6 +345,10 @@ let
     let
       e = lib.escapeShellArg;
       writableVolumeSources = lib.unique (map (v: v.source) (lib.filter (v: !v.readOnly) containerCfg.volumes));
+      loadCredentialEntries =
+        map (c: "${c.name}:${toString c.source}") (lib.filter (c: !c.encrypted) containerCfg.credentials);
+      loadCredentialEncryptedEntries =
+        map (c: "${c.name}:${toString c.source}") (lib.filter (c: c.encrypted) containerCfg.credentials);
       nucleusArgs = lib.concatStringsSep " " (
         [
           "--service-mode" "production"
@@ -348,6 +378,7 @@ let
         ++ (lib.concatMap (p: [ "--egress-udp-port" (e (toString p)) ]) containerCfg.egressUdpPorts)
         ++ (lib.concatMap (p: [ "-p" (e p) ]) containerCfg.portForwards)
         ++ (lib.concatMap (s: [ "--secret" (e "${toString s.source}:${s.dest}") ]) containerCfg.secrets)
+        ++ (lib.concatMap (c: [ "--systemd-credential" (e "${c.name}:${c.dest}") ]) containerCfg.credentials)
         ++ (lib.concatMap (v: [ "--volume" (e "${v.source}:${v.dest}:${if v.readOnly then "ro" else "rw"}") ]) containerCfg.volumes)
         ++ (lib.concatLists (lib.mapAttrsToList (k: v: [ "-e" (e "${k}=${v}") ]) containerCfg.environment))
         ++ lib.optionals (containerCfg.readinessExec != null) [ "--readiness-exec" (e containerCfg.readinessExec) ]
@@ -413,6 +444,10 @@ let
         LimitNOFILE = 65536;
       } // lib.optionalAttrs (writableVolumeSources != [ ]) {
         ReadWritePaths = writableVolumeSources;
+      } // lib.optionalAttrs (loadCredentialEntries != [ ]) {
+        LoadCredential = loadCredentialEntries;
+      } // lib.optionalAttrs (loadCredentialEncryptedEntries != [ ]) {
+        LoadCredentialEncrypted = loadCredentialEncryptedEntries;
       };
     };
 

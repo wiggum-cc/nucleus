@@ -1,3 +1,5 @@
+use std::net::Ipv4Addr;
+
 /// Network mode for container
 #[derive(Debug, Clone)]
 pub enum NetworkMode {
@@ -216,6 +218,8 @@ impl std::fmt::Display for Protocol {
 /// Port forwarding rule
 #[derive(Debug, Clone)]
 pub struct PortForward {
+    /// Optional host bind IP address. When omitted, match all local addresses.
+    pub host_ip: Option<Ipv4Addr>,
     /// Host port
     pub host_port: u16,
     /// Container port
@@ -225,7 +229,11 @@ pub struct PortForward {
 }
 
 impl PortForward {
-    /// Parse a port forward spec like "8080:80" or "8080:80/udp"
+    /// Parse a port forward spec like:
+    /// - "8080:80"
+    /// - "8080:80/udp"
+    /// - "127.0.0.1:8080:80"
+    /// - "127.0.0.1:8080:80/udp"
     pub fn parse(spec: &str) -> crate::error::Result<Self> {
         let (ports, protocol) = if let Some((p, proto)) = spec.rsplit_once('/') {
             let protocol = match proto {
@@ -244,21 +252,38 @@ impl PortForward {
         };
 
         let parts: Vec<&str> = ports.split(':').collect();
-        if parts.len() != 2 {
-            return Err(crate::error::NucleusError::ConfigError(format!(
-                "Invalid port forward format '{}', expected HOST:CONTAINER",
-                spec
-            )));
-        }
+        let (host_ip, host_port, container_port) = match parts.as_slice() {
+            [host_port, container_port] => (None, *host_port, *container_port),
+            [host_ip, host_port, container_port] => {
+                validate_ipv4_addr(host_ip).map_err(crate::error::NucleusError::ConfigError)?;
+                let host_ip = host_ip.parse::<Ipv4Addr>().map_err(|_| {
+                    crate::error::NucleusError::ConfigError(format!(
+                        "Invalid host IP address: {}",
+                        host_ip
+                    ))
+                })?;
+                (Some(host_ip), *host_port, *container_port)
+            }
+            _ => {
+                return Err(crate::error::NucleusError::ConfigError(format!(
+                    "Invalid port forward format '{}', expected HOST:CONTAINER or HOST_IP:HOST:CONTAINER",
+                    spec
+                )))
+            }
+        };
 
-        let host_port: u16 = parts[0].parse().map_err(|_| {
-            crate::error::NucleusError::ConfigError(format!("Invalid host port: {}", parts[0]))
+        let host_port: u16 = host_port.parse().map_err(|_| {
+            crate::error::NucleusError::ConfigError(format!("Invalid host port: {}", host_port))
         })?;
-        let container_port: u16 = parts[1].parse().map_err(|_| {
-            crate::error::NucleusError::ConfigError(format!("Invalid container port: {}", parts[1]))
+        let container_port: u16 = container_port.parse().map_err(|_| {
+            crate::error::NucleusError::ConfigError(format!(
+                "Invalid container port: {}",
+                container_port
+            ))
         })?;
 
         Ok(Self {
+            host_ip,
             host_port,
             container_port,
             protocol,
@@ -273,11 +298,25 @@ mod tests {
     #[test]
     fn test_port_forward_parse() {
         let pf = PortForward::parse("8080:80").unwrap();
+        assert_eq!(pf.host_ip, None);
         assert_eq!(pf.host_port, 8080);
         assert_eq!(pf.container_port, 80);
         assert_eq!(pf.protocol, Protocol::Tcp);
 
         let pf = PortForward::parse("5353:53/udp").unwrap();
+        assert_eq!(pf.host_ip, None);
+        assert_eq!(pf.host_port, 5353);
+        assert_eq!(pf.container_port, 53);
+        assert_eq!(pf.protocol, Protocol::Udp);
+
+        let pf = PortForward::parse("127.0.0.1:8080:80").unwrap();
+        assert_eq!(pf.host_ip, Some(Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(pf.host_port, 8080);
+        assert_eq!(pf.container_port, 80);
+        assert_eq!(pf.protocol, Protocol::Tcp);
+
+        let pf = PortForward::parse("10.0.0.5:5353:53/udp").unwrap();
+        assert_eq!(pf.host_ip, Some(Ipv4Addr::new(10, 0, 0, 5)));
         assert_eq!(pf.host_port, 5353);
         assert_eq!(pf.container_port, 53);
         assert_eq!(pf.protocol, Protocol::Udp);
@@ -288,6 +327,8 @@ mod tests {
         assert!(PortForward::parse("8080").is_err());
         assert!(PortForward::parse("abc:80").is_err());
         assert!(PortForward::parse("8080:abc").is_err());
+        assert!(PortForward::parse("127.0.0.1:abc:80").is_err());
+        assert!(PortForward::parse("999.0.0.1:8080:80").is_err());
     }
 
     #[test]
