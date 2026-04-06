@@ -12,7 +12,9 @@ Nucleus is a minimalist container runtime for Linux. It provides isolated execut
 - **Zero-overhead isolation** – Direct use of cgroups, namespaces, pivot_root, capabilities, seccomp, and Landlock
 - **Memory-backed filesystems** – Container disk mapped to tmpfs, pre-populated with agent context
 - **gVisor integration** – Optional application kernel for enhanced security, including networked service mode
+- **OCI runtime-spec subset for gVisor** – Generates OCI bundle/config data for `runsc`, including process identity, mounts, namespaces, seccomp, hooks, and cgroup path wiring
 - **Production service support** – Declarative NixOS module, egress policies, health checks, secrets mounting, sd_notify, and journald integration
+- **Explicit workload identity** – Native and gVisor runtimes can drop to a configured `uid`/`gid` plus supplementary groups after privileged setup
 - **Minimal rootfs** – Replace host bind mounts with a purpose-built Nix store closure for production services
 - **External security policies** – Per-service seccomp profiles (JSON), capability policies (TOML), and Landlock rules (TOML) with SHA-256 pinning
 - **Seccomp profile generation** – Trace mode records syscalls, then `nucleus seccomp generate` creates a minimal allowlist profile
@@ -32,6 +34,7 @@ Nucleus leverages Linux kernel isolation primitives:
 - **seccomp** – Syscall whitelist filtering with per-service JSON profiles and trace-based generation (irreversible)
 - **Landlock** – Path-based filesystem access control via hardcoded defaults or TOML policy file (Linux 5.13+)
 - **gVisor** – Optional application kernel (runsc) with None/Sandbox/Host network modes
+- **OCI bundle generation** – Emits OCI `config.json` plus bundle layout for gVisor, including `process.user`, lifecycle hooks, seccomp, resource limits, and namespace mappings
 - **PID 1 init** – Mini-init supervisor in production mode for zombie reaping and signal forwarding
 - **In-memory secrets** – Dedicated tmpfs at `/run/secrets` with volatile zeroing of source buffers
 - **Mount audit** – Post-setup verification of mount flags in production mode
@@ -47,14 +50,24 @@ Container filesystem is backed by tmpfs and either populated with context files 
 ## Installation
 
 ```bash
-cargo install nucleus
+cargo install nucleus-container --version 0.3.0
 ```
 
 Or via Nix:
 
 ```bash
-nix run github:0kenx/nucleus
+nix run github:0kenx/nucleus/v0.3.0
 ```
+
+The Cargo package name is `nucleus-container`; it installs the `nucleus` binary.
+
+## Recent Features in 0.3.0
+
+- **Privilege drop for services** – `--user`, `--group`, and `--additional-group` now apply a real post-setup workload identity in both the native runtime and gVisor.
+- **Ownership-aware secrets and writable paths** – Production secret staging and NixOS `createHostPath = true` defaults now align file ownership with the configured workload user/group.
+- **OCI bundle identity support** – Generated gVisor OCI configs now carry `process.user` including supplementary groups, alongside namespaces, mounts, resource limits, seccomp, hooks, and `cgroupsPath`.
+- **Probe execution under workload identity** – Exec-based health and readiness probes now run as the configured service account instead of implicitly as root.
+- **Systemd/NixOS service integration improvements** – The module exposes `user`, `group`, and `supplementaryGroups`, and packaged Nix usage includes `gvisor` in the flake/dev shell path.
 
 ## Usage
 
@@ -328,7 +341,7 @@ Nucleus provides a declarative NixOS module for running containers as systemd se
 
 ```nix
 {
-  inputs.nucleus.url = "github:0kenx/nucleus";
+  inputs.nucleus.url = "github:0kenx/nucleus/v0.3.0";
 
   outputs = { self, nixpkgs, nucleus, ... }: {
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
@@ -562,6 +575,18 @@ When using gVisor (`--runtime gvisor`), the network mode is automatically select
 | `host` | `host` | Shared host network namespace |
 
 The `sandbox` mode gives gVisor-isolated services full network access through gVisor's user-space TCP/IP stack, without exposing the host kernel's network code.
+
+## OCI Support
+
+Nucleus is not a generic external OCI runtime. For gVisor execution it generates an OCI bundle layout and `config.json` that follow the OCI runtime-spec fields Nucleus uses in practice.
+
+- `process`: args, env, cwd, `noNewPrivileges`, terminal settings, rlimits, and `process.user` (`uid`, `gid`, `additionalGids`)
+- `root` and `mounts`: read-only rootfs plus bind, tmpfs, and secret mounts
+- `linux`: namespaces, cgroup path, resource limits, uid/gid mappings, masked paths, readonly paths, devices, seccomp, and sysctls
+- `hooks`: OCI lifecycle hooks with OCI state JSON on stdin
+- `annotations`: runtime metadata passed through to the bundle
+
+That OCI path is the contract used with `runsc`. The native runtime uses Nucleus's direct Linux setup path rather than exposing a separate OCI CLI surface.
 
 ## Additional Hardening Flags
 
