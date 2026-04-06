@@ -177,6 +177,48 @@ let
         description = "Secret files to mount read-only into the container.";
       };
 
+      volumes = mkOption {
+        type = types.listOf (types.submodule {
+          options = {
+            source = mkOption {
+              type = types.str;
+              description = "Host path to bind-mount into the container.";
+            };
+            dest = mkOption {
+              type = types.str;
+              description = "Destination path inside the container.";
+            };
+            readOnly = mkOption {
+              type = types.bool;
+              default = false;
+              description = "Mount the volume read-only.";
+            };
+            createHostPath = mkOption {
+              type = types.bool;
+              default = false;
+              description = "Create the host path as a directory via systemd-tmpfiles before container start.";
+            };
+            directoryMode = mkOption {
+              type = types.str;
+              default = "0750";
+              description = "Mode to use when createHostPath = true.";
+            };
+            user = mkOption {
+              type = types.str;
+              default = "root";
+              description = "Owner user to use when createHostPath = true.";
+            };
+            group = mkOption {
+              type = types.str;
+              default = "root";
+              description = "Owner group to use when createHostPath = true.";
+            };
+          };
+        });
+        default = [ ];
+        description = "Host bind volumes to mount into the container.";
+      };
+
       environment = mkOption {
         type = types.attrsOf types.str;
         default = { };
@@ -276,6 +318,7 @@ let
   mkContainerService = name: containerCfg:
     let
       e = lib.escapeShellArg;
+      writableVolumeSources = lib.unique (map (v: v.source) (lib.filter (v: !v.readOnly) containerCfg.volumes));
       nucleusArgs = lib.concatStringsSep " " (
         [
           "--service-mode" "production"
@@ -305,6 +348,7 @@ let
         ++ (lib.concatMap (p: [ "--egress-udp-port" (e (toString p)) ]) containerCfg.egressUdpPorts)
         ++ (lib.concatMap (p: [ "-p" (e p) ]) containerCfg.portForwards)
         ++ (lib.concatMap (s: [ "--secret" (e "${toString s.source}:${s.dest}") ]) containerCfg.secrets)
+        ++ (lib.concatMap (v: [ "--volume" (e "${v.source}:${v.dest}:${if v.readOnly then "ro" else "rw"}") ]) containerCfg.volumes)
         ++ (lib.concatLists (lib.mapAttrsToList (k: v: [ "-e" (e "${k}=${v}") ]) containerCfg.environment))
         ++ lib.optionals (containerCfg.readinessExec != null) [ "--readiness-exec" (e containerCfg.readinessExec) ]
         ++ lib.optionals (containerCfg.readinessTcp != null) [ "--readiness-tcp" (e (toString containerCfg.readinessTcp)) ]
@@ -367,6 +411,8 @@ let
         ProtectHome = true;
         NoNewPrivileges = false; # nucleus needs to set up namespaces
         LimitNOFILE = 65536;
+      } // lib.optionalAttrs (writableVolumeSources != [ ]) {
+        ReadWritePaths = writableVolumeSources;
       };
     };
 
@@ -425,6 +471,14 @@ in
   };
 
   config = mkIf cfg.enable {
+    systemd.tmpfiles.rules = lib.concatMap
+      (containerCfg:
+        map
+          (v: "d ${v.source} ${v.directoryMode} ${v.user} ${v.group} -")
+          (lib.filter (v: v.createHostPath) containerCfg.volumes)
+      )
+      (lib.attrValues (lib.filterAttrs (_: c: c.enable) cfg.containers));
+
     systemd.services = lib.mapAttrs' mkContainerService
       (lib.filterAttrs (_: c: c.enable) cfg.containers)
     // lib.mapAttrs' mkTopologyService

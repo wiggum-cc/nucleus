@@ -428,6 +428,149 @@ pub fn bind_mount_host_paths(root: &Path, best_effort: bool) -> Result<()> {
     Ok(())
 }
 
+/// Mount persistent bind volumes and ephemeral tmpfs volumes into the container root.
+pub fn mount_volumes(root: &Path, volumes: &[crate::container::VolumeMount]) -> Result<()> {
+    use crate::container::VolumeSource;
+
+    if volumes.is_empty() {
+        return Ok(());
+    }
+
+    info!("Mounting {} volume(s) into container", volumes.len());
+
+    for volume in volumes {
+        let dest = resolve_container_destination(root, &volume.dest)?;
+
+        match &volume.source {
+            VolumeSource::Bind { source } => {
+                if !source.exists() {
+                    return Err(NucleusError::FilesystemError(format!(
+                        "Volume source does not exist: {:?}",
+                        source
+                    )));
+                }
+
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        NucleusError::FilesystemError(format!(
+                            "Failed to create volume mount parent {:?}: {}",
+                            parent, e
+                        ))
+                    })?;
+                }
+
+                let recursive = source.is_dir();
+                if source.is_file() {
+                    std::fs::write(&dest, "").map_err(|e| {
+                        NucleusError::FilesystemError(format!(
+                            "Failed to create volume mount point {:?}: {}",
+                            dest, e
+                        ))
+                    })?;
+                } else {
+                    std::fs::create_dir_all(&dest).map_err(|e| {
+                        NucleusError::FilesystemError(format!(
+                            "Failed to create volume mount dir {:?}: {}",
+                            dest, e
+                        ))
+                    })?;
+                }
+
+                let initial_flags = if recursive {
+                    MsFlags::MS_BIND | MsFlags::MS_REC
+                } else {
+                    MsFlags::MS_BIND
+                };
+                mount(
+                    Some(source.as_path()),
+                    &dest,
+                    None::<&str>,
+                    initial_flags,
+                    None::<&str>,
+                )
+                .map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to bind mount volume {:?} -> {:?}: {}",
+                        source, dest, e
+                    ))
+                })?;
+
+                let mut remount_flags =
+                    MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+                if recursive {
+                    remount_flags |= MsFlags::MS_REC;
+                }
+                if volume.read_only {
+                    remount_flags |= MsFlags::MS_RDONLY;
+                }
+
+                mount(
+                    None::<&str>,
+                    &dest,
+                    None::<&str>,
+                    remount_flags,
+                    None::<&str>,
+                )
+                .map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to remount volume {:?} with final flags: {}",
+                        dest, e
+                    ))
+                })?;
+
+                info!(
+                    "Mounted bind volume {:?} -> {:?} ({})",
+                    source,
+                    volume.dest,
+                    if volume.read_only { "ro" } else { "rw" }
+                );
+            }
+            VolumeSource::Tmpfs { size } => {
+                std::fs::create_dir_all(&dest).map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to create tmpfs mount dir {:?}: {}",
+                        dest, e
+                    ))
+                })?;
+
+                let mount_data = size
+                    .as_ref()
+                    .map(|value| format!("size={},mode=0755", value))
+                    .unwrap_or_else(|| "mode=0755".to_string());
+
+                let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+                if volume.read_only {
+                    flags |= MsFlags::MS_RDONLY;
+                }
+                mount(
+                    Some("tmpfs"),
+                    &dest,
+                    Some("tmpfs"),
+                    flags,
+                    Some(mount_data.as_str()),
+                )
+                .map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to mount tmpfs volume at {:?}: {}",
+                        dest, e
+                    ))
+                })?;
+
+                info!(
+                    "Mounted tmpfs volume at {:?}{}{}",
+                    volume.dest,
+                    size.as_ref()
+                        .map(|value| format!(" (size={})", value))
+                        .unwrap_or_default(),
+                    if volume.read_only { " (ro)" } else { "" }
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Mount procfs at the given path
 ///
 /// In rootless mode, procfs mounting should work due to user namespace capabilities.

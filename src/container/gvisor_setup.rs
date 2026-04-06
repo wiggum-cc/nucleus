@@ -1,7 +1,7 @@
 use crate::error::{NucleusError, Result};
 use crate::filesystem::{
-    resolve_container_destination, snapshot_context_dir, verify_context_manifest,
-    verify_rootfs_attestation, ContextPopulator, create_dev_nodes, create_minimal_fs,
+    create_dev_nodes, create_minimal_fs, resolve_container_destination, snapshot_context_dir,
+    verify_context_manifest, verify_rootfs_attestation, ContextPopulator,
 };
 use crate::network::{BridgeNetwork, NetworkMode};
 use crate::security::{GVisorNetworkMode, GVisorRuntime, OciBundle, OciConfig, OciMount};
@@ -63,6 +63,10 @@ impl Container {
             oci_config = oci_config.with_rootfs_binds(rootfs_path);
         } else {
             oci_config = oci_config.with_host_runtime_binds();
+        }
+
+        if !self.config.volumes.is_empty() {
+            oci_config = oci_config.with_volume_mounts(&self.config.volumes)?;
         }
 
         if let Some(context_dir) = &self.config.context_dir {

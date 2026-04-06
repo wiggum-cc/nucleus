@@ -72,22 +72,17 @@ impl BridgeConfig {
         }
 
         // Subnet: must be valid IPv4 CIDR
-        validate_ipv4_cidr(&self.subnet).map_err(|e| {
-            crate::error::NucleusError::NetworkError(e)
-        })?;
+        validate_ipv4_cidr(&self.subnet)
+            .map_err(|e| crate::error::NucleusError::NetworkError(e))?;
 
         // Container IP (if specified)
         if let Some(ref ip) = self.container_ip {
-            validate_ipv4_addr(ip).map_err(|e| {
-                crate::error::NucleusError::NetworkError(e)
-            })?;
+            validate_ipv4_addr(ip).map_err(|e| crate::error::NucleusError::NetworkError(e))?;
         }
 
         // DNS servers
         for dns in &self.dns {
-            validate_ipv4_addr(dns).map_err(|e| {
-                crate::error::NucleusError::NetworkError(e)
-            })?;
+            validate_ipv4_addr(dns).map_err(|e| crate::error::NucleusError::NetworkError(e))?;
         }
 
         Ok(())
@@ -260,10 +255,7 @@ impl PortForward {
             crate::error::NucleusError::ConfigError(format!("Invalid host port: {}", parts[0]))
         })?;
         let container_port: u16 = parts[1].parse().map_err(|_| {
-            crate::error::NucleusError::ConfigError(format!(
-                "Invalid container port: {}",
-                parts[1]
-            ))
+            crate::error::NucleusError::ConfigError(format!("Invalid container port: {}", parts[1]))
         })?;
 
         Ok(Self {

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A complete topology definition (equivalent to docker-compose.yml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +171,68 @@ fn default_condition() -> String {
     "started".to_string()
 }
 
+/// Parsed service volume reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceVolumeMount {
+    /// Referenced topology volume name.
+    pub volume: String,
+    /// Destination path inside the container.
+    pub dest: PathBuf,
+    /// Whether the mount is read-only.
+    pub read_only: bool,
+}
+
+pub(crate) fn parse_service_volume_mount(spec: &str) -> crate::error::Result<ServiceVolumeMount> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    let (volume, dest, read_only) = match parts.as_slice() {
+        [volume, dest] => (*volume, *dest, false),
+        [volume, dest, mode] if *mode == "ro" => (*volume, *dest, true),
+        [volume, dest, mode] if *mode == "rw" => (*volume, *dest, false),
+        _ => {
+            return Err(crate::error::NucleusError::ConfigError(format!(
+                "Invalid volume mount '{}', expected VOLUME:DEST[:ro|rw]",
+                spec
+            )));
+        }
+    };
+
+    if volume.is_empty() {
+        return Err(crate::error::NucleusError::ConfigError(format!(
+            "Volume mount '{}' must name a topology volume",
+            spec
+        )));
+    }
+
+    let dest = crate::filesystem::normalize_container_destination(Path::new(dest))?;
+    Ok(ServiceVolumeMount {
+        volume: volume.to_string(),
+        dest,
+        read_only,
+    })
+}
+
+pub(crate) fn parse_volume_owner(owner: &str) -> crate::error::Result<(u32, u32)> {
+    let (uid, gid) = owner.split_once(':').ok_or_else(|| {
+        crate::error::NucleusError::ConfigError(format!(
+            "Invalid volume owner '{}', expected UID:GID",
+            owner
+        ))
+    })?;
+    let uid = uid.parse::<u32>().map_err(|e| {
+        crate::error::NucleusError::ConfigError(format!(
+            "Invalid volume owner UID '{}' in '{}': {}",
+            uid, owner, e
+        ))
+    })?;
+    let gid = gid.parse::<u32>().map_err(|e| {
+        crate::error::NucleusError::ConfigError(format!(
+            "Invalid volume owner GID '{}' in '{}': {}",
+            gid, owner, e
+        ))
+    })?;
+    Ok((uid, gid))
+}
+
 impl TopologyConfig {
     /// Load a topology from a TOML file.
     pub fn from_file(path: &Path) -> crate::error::Result<Self> {
@@ -202,6 +264,43 @@ impl TopologyConfig {
             return Err(crate::error::NucleusError::ConfigError(
                 "Topology must have at least one service".to_string(),
             ));
+        }
+
+        for (name, volume) in &self.volumes {
+            match volume.volume_type.as_str() {
+                "persistent" => {
+                    let path = volume.path.as_ref().ok_or_else(|| {
+                        crate::error::NucleusError::ConfigError(format!(
+                            "Persistent volume '{}' must define path",
+                            name
+                        ))
+                    })?;
+                    if !Path::new(path).is_absolute() {
+                        return Err(crate::error::NucleusError::ConfigError(format!(
+                            "Persistent volume '{}' path must be absolute: {}",
+                            name, path
+                        )));
+                    }
+                }
+                "ephemeral" => {
+                    if volume.path.is_some() {
+                        return Err(crate::error::NucleusError::ConfigError(format!(
+                            "Ephemeral volume '{}' must not define path",
+                            name
+                        )));
+                    }
+                }
+                other => {
+                    return Err(crate::error::NucleusError::ConfigError(format!(
+                        "Volume '{}' has unsupported type '{}'",
+                        name, other
+                    )));
+                }
+            }
+
+            if let Some(owner) = &volume.owner {
+                parse_volume_owner(owner)?;
+            }
         }
 
         // Validate dependencies reference existing services
@@ -247,17 +346,17 @@ impl TopologyConfig {
 
             // Validate volume mounts reference existing volume defs
             for vol_mount in &svc.volumes {
-                let vol_name = vol_mount.split(':').next().unwrap_or("");
-                if vol_name.starts_with('/') {
+                let parsed = parse_service_volume_mount(vol_mount)?;
+                if parsed.volume.starts_with('/') {
                     return Err(crate::error::NucleusError::ConfigError(format!(
                         "Service '{}' uses absolute host-path volume mount '{}'; topology configs must reference a named volume instead",
-                        name, vol_name
+                        name, parsed.volume
                     )));
                 }
-                if !self.volumes.contains_key(vol_name) {
+                if !self.volumes.contains_key(&parsed.volume) {
                     return Err(crate::error::NucleusError::ConfigError(format!(
                         "Service '{}' references unknown volume '{}'",
-                        name, vol_name
+                        name, parsed.volume
                     )));
                 }
             }
@@ -407,7 +506,10 @@ memory = "256M"
         let config = TopologyConfig::from_toml(toml).unwrap();
         let hash1 = config.service_config_hash("web").unwrap();
         let hash2 = config.service_config_hash("web").unwrap();
-        assert_eq!(hash1, hash2, "hash must be deterministic within same process");
+        assert_eq!(
+            hash1, hash2,
+            "hash must be deterministic within same process"
+        );
 
         // Verify hash stability: the implementation must use a stable hasher
         // (e.g., SHA-256), not DefaultHasher which varies across Rust versions.
@@ -441,5 +543,26 @@ volumes = ["/host/path:/container/path"]
             "Absolute path volume mount must produce a clear error about named volumes, got: {}",
             msg
         );
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_volume_owner() {
+        let toml = r#"
+name = "test"
+
+[volumes.data]
+volume_type = "persistent"
+path = "/var/lib/test"
+owner = "abc:def"
+
+[services.web]
+rootfs = "/nix/store/web"
+command = ["/bin/web"]
+memory = "256M"
+volumes = ["data:/var/lib/web"]
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("volume owner"));
     }
 }

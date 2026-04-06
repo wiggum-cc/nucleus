@@ -63,10 +63,8 @@ mod tests {
     #[test]
     fn test_self_transitions() {
         assert!(SecurityState::Privileged.can_transition_to(&SecurityState::Privileged));
-        assert!(
-            SecurityState::CapabilitiesDropped
-                .can_transition_to(&SecurityState::CapabilitiesDropped)
-        );
+        assert!(SecurityState::CapabilitiesDropped
+            .can_transition_to(&SecurityState::CapabilitiesDropped));
         assert!(SecurityState::SeccompApplied.can_transition_to(&SecurityState::SeccompApplied));
         assert!(SecurityState::LandlockApplied.can_transition_to(&SecurityState::LandlockApplied));
         assert!(SecurityState::Locked.can_transition_to(&SecurityState::Locked));
@@ -79,8 +77,7 @@ mod tests {
         assert!(!SecurityState::Privileged.can_transition_to(&SecurityState::LandlockApplied));
         assert!(!SecurityState::Privileged.can_transition_to(&SecurityState::Locked));
         assert!(
-            !SecurityState::CapabilitiesDropped
-                .can_transition_to(&SecurityState::LandlockApplied)
+            !SecurityState::CapabilitiesDropped.can_transition_to(&SecurityState::LandlockApplied)
         );
         assert!(!SecurityState::CapabilitiesDropped.can_transition_to(&SecurityState::Locked));
         assert!(!SecurityState::SeccompApplied.can_transition_to(&SecurityState::Locked));

@@ -116,6 +116,7 @@ nucleus run \
   --health-cmd "curl -sf http://localhost:8080/health" \
   --health-interval 30 --health-retries 3 \
   --secret /run/secrets/tls-cert:/etc/tls/cert.pem \
+  --volume /var/lib/myservice:/var/lib/myservice:rw \
   -e CONFIG_PATH=/etc/myservice/config.toml \
   --sd-notify \
   -p 8080:8080 \
@@ -234,12 +235,25 @@ name = "myapp"
 [networks.internal]
 subnet = "10.42.0.0/24"
 
+[volumes.db-data]
+volume_type = "persistent"
+path = "/var/lib/nucleus/myapp/db"
+owner = "70:70"
+
+[volumes.cache]
+volume_type = "ephemeral"
+size = "128M"
+
 [services.postgres]
 rootfs = "/nix/store/...-postgres"
 command = ["postgres", "-D", "/var/lib/postgresql/data"]
 memory = "2G"
 cpus = 2.0
 networks = ["internal"]
+volumes = [
+  "db-data:/var/lib/postgresql/data",
+  "cache:/var/cache/postgresql"
+]
 health_check = "pg_isready -U myapp"
 
 [services.web]
@@ -387,6 +401,15 @@ in
         { source = config.age.secrets.proxy-tls.path; dest = "/etc/tls/cert.pem"; }
       ];
 
+      # Volumes (bind-mounted host paths)
+      volumes = [
+        {
+          source = "/var/lib/sigid-proxy";
+          dest = "/var/lib/sigid-proxy";
+          createHostPath = true;
+        }
+      ];
+
       # Environment
       environment = {
         RUST_LOG = "info";
@@ -399,6 +422,8 @@ in
   };
 }
 ```
+
+Writable bind volumes are automatically added to the generated systemd unit's `ReadWritePaths`. When `createHostPath = true`, the NixOS module creates the host directory with `systemd-tmpfiles` before the container starts.
 
 ### Topology Services
 

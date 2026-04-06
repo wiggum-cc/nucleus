@@ -270,14 +270,8 @@ keep = ["NET_BIND_SERVICE"]
 
         assert_eq!(resolved.bounding, vec![Capability::CAP_NET_BIND_SERVICE]);
         assert_eq!(resolved.effective, vec![Capability::CAP_CHOWN]);
-        assert_eq!(
-            resolved.ambient,
-            vec![Capability::CAP_NET_BIND_SERVICE]
-        );
-        assert_eq!(
-            resolved.inheritable,
-            vec![Capability::CAP_NET_BIND_SERVICE]
-        );
+        assert_eq!(resolved.ambient, vec![Capability::CAP_NET_BIND_SERVICE]);
+        assert_eq!(resolved.inheritable, vec![Capability::CAP_NET_BIND_SERVICE]);
         assert_eq!(
             resolved.permitted,
             vec![Capability::CAP_CHOWN, Capability::CAP_NET_BIND_SERVICE]

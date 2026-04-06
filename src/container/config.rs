@@ -118,6 +118,26 @@ pub struct SecretMount {
     pub mode: u32,
 }
 
+/// Source backing for a volume mount.
+#[derive(Debug, Clone)]
+pub enum VolumeSource {
+    /// Bind mount a host path into the container.
+    Bind { source: PathBuf },
+    /// Mount a fresh tmpfs at the destination.
+    Tmpfs { size: Option<String> },
+}
+
+/// Volume configuration for mounting persistent or ephemeral storage.
+#[derive(Debug, Clone)]
+pub struct VolumeMount {
+    /// Backing storage for the volume.
+    pub source: VolumeSource,
+    /// Destination path inside the container.
+    pub dest: PathBuf,
+    /// Whether the volume is mounted read-only.
+    pub read_only: bool,
+}
+
 /// Readiness probe configuration.
 #[derive(Debug, Clone)]
 pub enum ReadinessProbe {
@@ -198,6 +218,9 @@ pub struct ContainerConfig {
 
     /// Secret files to mount into the container.
     pub secrets: Vec<SecretMount>,
+
+    /// Volume mounts to attach to the container filesystem.
+    pub volumes: Vec<VolumeMount>,
 
     /// Environment variables to pass to the container process.
     pub environment: Vec<(String, String)>,
@@ -312,6 +335,7 @@ impl ContainerConfig {
             health_check: None,
             readiness_probe: None,
             secrets: Vec::new(),
+            volumes: Vec::new(),
             environment: Vec::new(),
             config_hash: None,
             sd_notify: false,
@@ -463,6 +487,12 @@ impl ContainerConfig {
     #[must_use]
     pub fn with_secret(mut self, secret: SecretMount) -> Self {
         self.secrets.push(secret);
+        self
+    }
+
+    #[must_use]
+    pub fn with_volume(mut self, volume: VolumeMount) -> Self {
+        self.volumes.push(volume);
         self
     }
 
@@ -676,6 +706,27 @@ impl ContainerConfig {
             normalize_container_destination(&secret.dest)?;
         }
 
+        for volume in &self.volumes {
+            normalize_container_destination(&volume.dest)?;
+            match &volume.source {
+                VolumeSource::Bind { source } => {
+                    if !source.is_absolute() {
+                        return Err(crate::error::NucleusError::ConfigError(format!(
+                            "Volume source must be absolute: {:?}",
+                            source
+                        )));
+                    }
+                    if !source.exists() {
+                        return Err(crate::error::NucleusError::ConfigError(format!(
+                            "Volume source does not exist: {:?}",
+                            source
+                        )));
+                    }
+                }
+                VolumeSource::Tmpfs { .. } => {}
+            }
+        }
+
         if !self.use_gvisor {
             return Ok(());
         }
@@ -751,7 +802,9 @@ impl ContainerConfig {
                         "--bundle requires gVisor runtime; use --runtime gvisor".to_string(),
                     ));
                 }
-                self = self.with_gvisor(false).with_trust_level(TrustLevel::Trusted);
+                self = self
+                    .with_gvisor(false)
+                    .with_trust_level(TrustLevel::Trusted);
             }
             "gvisor" => {
                 self = self.with_gvisor(true);
@@ -863,6 +916,7 @@ mod tests {
         assert!(cfg.rootfs_path.is_none());
         assert!(cfg.egress_policy.is_none());
         assert!(cfg.secrets.is_empty());
+        assert!(cfg.volumes.is_empty());
         assert!(!cfg.sd_notify);
         assert!(cfg.required_kernel_lockdown.is_none());
         assert!(!cfg.verify_context_integrity);
@@ -1127,6 +1181,52 @@ mod tests {
                 mode: 0o400,
             },
         );
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("parent traversal"));
+    }
+
+    #[test]
+    fn test_bind_volume_source_must_exist() {
+        let cfg =
+            ContainerConfig::new(None, vec!["/bin/sh".to_string()]).with_volume(VolumeMount {
+                source: VolumeSource::Bind {
+                    source: PathBuf::from("/tmp/definitely-missing-nucleus-volume"),
+                },
+                dest: PathBuf::from("/var/lib/app"),
+                read_only: false,
+            });
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("Volume source does not exist"));
+    }
+
+    #[test]
+    fn test_bind_volume_dest_must_be_absolute() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg =
+            ContainerConfig::new(None, vec!["/bin/sh".to_string()]).with_volume(VolumeMount {
+                source: VolumeSource::Bind {
+                    source: dir.path().to_path_buf(),
+                },
+                dest: PathBuf::from("var/lib/app"),
+                read_only: false,
+            });
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn test_tmpfs_volume_rejects_parent_traversal() {
+        let cfg =
+            ContainerConfig::new(None, vec!["/bin/sh".to_string()]).with_volume(VolumeMount {
+                source: VolumeSource::Tmpfs {
+                    size: Some("64M".to_string()),
+                },
+                dest: PathBuf::from("/../../var/lib/app"),
+                read_only: false,
+            });
 
         let err = cfg.validate_runtime_support().unwrap_err();
         assert!(err.to_string().contains("parent traversal"));

@@ -185,8 +185,8 @@ fn write_trace_file(path: &Path, syscalls: &BTreeMap<i64, u64>) -> Result<()> {
             name: super::seccomp_generate::syscall_number_to_name(nr).map(String::from),
             count,
         };
-        let line = serde_json::to_string(&record)
-            .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e));
+        let line =
+            serde_json::to_string(&record).unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e));
         writeln!(file, "{}", line).map_err(|e| {
             NucleusError::ConfigError(format!("Failed to write trace record: {}", e))
         })?;
@@ -213,10 +213,12 @@ mod tests {
     /// Extract the body of a function from source text by brace-matching,
     /// avoiding fragile hardcoded character-window offsets (SEC-MED-03).
     fn extract_fn_body<'a>(source: &'a str, fn_signature: &str) -> &'a str {
-        let fn_start = source.find(fn_signature)
+        let fn_start = source
+            .find(fn_signature)
             .unwrap_or_else(|| panic!("function '{}' not found in source", fn_signature));
         let after = &source[fn_start..];
-        let open = after.find('{')
+        let open = after
+            .find('{')
             .unwrap_or_else(|| panic!("no opening brace found for '{}'", fn_signature));
         let mut depth = 0u32;
         let mut end = open;
@@ -225,7 +227,10 @@ mod tests {
                 '{' => depth += 1,
                 '}' => {
                     depth -= 1;
-                    if depth == 0 { end = open + i + 1; break; }
+                    if depth == 0 {
+                        end = open + i + 1;
+                        break;
+                    }
                 }
                 _ => {}
             }

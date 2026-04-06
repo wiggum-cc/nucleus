@@ -419,7 +419,9 @@ impl ContainerStateManager {
                         } else if meta.uid() != uid {
                             tracing::warn!(
                                 "Skipping {} — owned by UID {} not {}",
-                                fallback.display(), meta.uid(), uid
+                                fallback.display(),
+                                meta.uid(),
+                                uid
                             );
                             false
                         } else {
@@ -427,10 +429,7 @@ impl ContainerStateManager {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Skipping {} — cannot stat: {}",
-                            fallback.display(), e
-                        );
+                        tracing::warn!("Skipping {} — cannot stat: {}", fallback.display(), e);
                         false
                     }
                 }

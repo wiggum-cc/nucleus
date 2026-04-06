@@ -298,7 +298,10 @@ mod tests {
         let expected_bytes = 1024 * 1024 * 1024u64;
         assert_eq!(limits.memory_bytes, Some(expected_bytes));
         // memory_high should be 90% of hard limit
-        assert_eq!(limits.memory_high, Some(expected_bytes - expected_bytes / 10));
+        assert_eq!(
+            limits.memory_high,
+            Some(expected_bytes - expected_bytes / 10)
+        );
     }
 
     #[test]
@@ -408,9 +411,17 @@ mod tests {
     #[test]
     fn test_cpu_cores_rejects_extreme_values() {
         // BUG-12: Extreme CPU core values must be rejected, not silently overflow
-        assert!(ResourceLimits::unlimited().with_cpu_cores(f64::NAN).is_err());
-        assert!(ResourceLimits::unlimited().with_cpu_cores(f64::INFINITY).is_err());
-        assert!(ResourceLimits::unlimited().with_cpu_cores(100_000.0).is_err(),
-            "CPU cores > 65536 must be rejected to prevent quota overflow");
+        assert!(ResourceLimits::unlimited()
+            .with_cpu_cores(f64::NAN)
+            .is_err());
+        assert!(ResourceLimits::unlimited()
+            .with_cpu_cores(f64::INFINITY)
+            .is_err());
+        assert!(
+            ResourceLimits::unlimited()
+                .with_cpu_cores(100_000.0)
+                .is_err(),
+            "CPU cores > 65536 must be rejected to prevent quota overflow"
+        );
     }
 }

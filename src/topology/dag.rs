@@ -248,7 +248,9 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("undefined") || err_msg.contains("unknown") || err_msg.contains("not found"),
+            err_msg.contains("undefined")
+                || err_msg.contains("unknown")
+                || err_msg.contains("not found"),
             "Error for missing dependency must mention 'undefined/unknown/not found', got: {}",
             err_msg
         );

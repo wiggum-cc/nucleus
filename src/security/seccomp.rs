@@ -719,8 +719,9 @@ impl SeccompManager {
 
     /// Syscalls that the built-in filter restricts at the argument level.
     /// Custom profiles allowing these without argument filters weaken security.
-    const ARG_FILTERED_SYSCALLS: &'static [&'static str] =
-        &["clone", "clone3", "execveat", "ioctl", "mprotect", "prctl", "socket"];
+    const ARG_FILTERED_SYSCALLS: &'static [&'static str] = &[
+        "clone", "clone3", "execveat", "ioctl", "mprotect", "prctl", "socket",
+    ];
 
     /// Warn when a custom seccomp profile allows security-critical syscalls
     /// without argument-level filtering.

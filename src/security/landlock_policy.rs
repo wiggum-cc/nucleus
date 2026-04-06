@@ -263,15 +263,27 @@ access = ["read", "write", "create", "remove"]
     #[test]
     fn test_all_except_execute_excludes_execute() {
         let flags = parse_access_flags(&["all_except_execute".into()]).unwrap();
-        assert!(!flags.contains(AccessFs::Execute), "all_except_execute must not include Execute");
-        assert!(flags.contains(AccessFs::WriteFile), "all_except_execute must include WriteFile");
-        assert!(flags.contains(AccessFs::ReadFile), "all_except_execute must include ReadFile");
+        assert!(
+            !flags.contains(AccessFs::Execute),
+            "all_except_execute must not include Execute"
+        );
+        assert!(
+            flags.contains(AccessFs::WriteFile),
+            "all_except_execute must include WriteFile"
+        );
+        assert!(
+            flags.contains(AccessFs::ReadFile),
+            "all_except_execute must include ReadFile"
+        );
     }
 
     #[test]
     fn test_all_includes_execute() {
         let flags = parse_access_flags(&["all".into()]).unwrap();
-        assert!(flags.contains(AccessFs::Execute), "all must include Execute");
+        assert!(
+            flags.contains(AccessFs::Execute),
+            "all must include Execute"
+        );
     }
 
     #[test]

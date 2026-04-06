@@ -137,14 +137,26 @@ mod tests {
                 '{' => depth += 1,
                 '}' => {
                     depth -= 1;
-                    if depth == 0 { fn_end = open + i + 1; break; }
+                    if depth == 0 {
+                        fn_end = open + i + 1;
+                        break;
+                    }
                 }
                 _ => {}
             }
         }
         let fn_body = &after[..fn_end];
-        assert!(fn_body.contains("MS_NOSUID"), "bind_mount_context must set MS_NOSUID");
-        assert!(fn_body.contains("MS_NODEV"), "bind_mount_context must set MS_NODEV");
-        assert!(fn_body.contains("MS_NOEXEC"), "bind_mount_context must set MS_NOEXEC");
+        assert!(
+            fn_body.contains("MS_NOSUID"),
+            "bind_mount_context must set MS_NOSUID"
+        );
+        assert!(
+            fn_body.contains("MS_NODEV"),
+            "bind_mount_context must set MS_NODEV"
+        );
+        assert!(
+            fn_body.contains("MS_NOEXEC"),
+            "bind_mount_context must set MS_NOEXEC"
+        );
     }
 }

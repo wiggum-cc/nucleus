@@ -279,10 +279,12 @@ mod tests {
     /// Extract the body of a function from source text by brace-matching,
     /// avoiding fragile hardcoded character-window offsets (SEC-MED-03).
     fn extract_fn_body<'a>(source: &'a str, fn_signature: &str) -> &'a str {
-        let fn_start = source.find(fn_signature)
+        let fn_start = source
+            .find(fn_signature)
             .unwrap_or_else(|| panic!("function '{}' not found in source", fn_signature));
         let after = &source[fn_start..];
-        let open = after.find('{')
+        let open = after
+            .find('{')
             .unwrap_or_else(|| panic!("no opening brace found for '{}'", fn_signature));
         let mut depth = 0u32;
         let mut end = open;
@@ -291,7 +293,10 @@ mod tests {
                 '{' => depth += 1,
                 '}' => {
                     depth -= 1;
-                    if depth == 0 { end = open + i + 1; break; }
+                    if depth == 0 {
+                        end = open + i + 1;
+                        break;
+                    }
                 }
                 _ => {}
             }
@@ -338,11 +343,13 @@ mod tests {
         let source = include_str!("landlock.rs");
         let fn_body = extract_fn_body(source, "fn apply_container_policy_with_mode");
         // Find the NotEnforced match arm within the function body
-        let not_enforced_start = fn_body.find("NotEnforced")
+        let not_enforced_start = fn_body
+            .find("NotEnforced")
             .expect("function must handle NotEnforced status");
         // Search from NotEnforced to the next match arm ('=>' after a '}')
         let rest = &fn_body[not_enforced_start..];
-        let arm_end = rest.find("RestrictionStatus::")
+        let arm_end = rest
+            .find("RestrictionStatus::")
             .unwrap_or(rest.len().min(500));
         let not_enforced_block = &rest[..arm_end];
         assert!(

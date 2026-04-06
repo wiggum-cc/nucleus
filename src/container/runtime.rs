@@ -1,21 +1,21 @@
 use crate::audit::{audit, audit_error, AuditEventType};
 use crate::container::{
-    ContainerConfig, ContainerState, ContainerStateManager, ContainerStateParams,
-    OciStatus, ServiceMode,
+    ContainerConfig, ContainerState, ContainerStateManager, ContainerStateParams, OciStatus,
+    ServiceMode,
 };
 use crate::error::{NucleusError, Result, StateTransition};
 use crate::filesystem::{
     audit_mounts, bind_mount_host_paths, bind_mount_rootfs, create_dev_nodes, create_minimal_fs,
-    mask_proc_paths, mount_procfs, mount_secrets, mount_secrets_inmemory,
-    snapshot_context_dir, switch_root, verify_context_manifest,
-    verify_rootfs_attestation, FilesystemState, LazyContextPopulator, TmpfsMount,
+    mask_proc_paths, mount_procfs, mount_secrets, mount_secrets_inmemory, mount_volumes,
+    snapshot_context_dir, switch_root, verify_context_manifest, verify_rootfs_attestation,
+    FilesystemState, LazyContextPopulator, TmpfsMount,
 };
-use crate::isolation::{NamespaceManager};
+use crate::isolation::NamespaceManager;
 use crate::network::{BridgeNetwork, NetworkMode};
 use crate::resources::Cgroup;
 use crate::security::{
-    CapabilityManager, GVisorRuntime, LandlockManager,
-    OciContainerState, OciHooks, SeccompManager, SeccompTraceReader, SecurityState,
+    CapabilityManager, GVisorRuntime, LandlockManager, OciContainerState, OciHooks, SeccompManager,
+    SeccompTraceReader, SecurityState,
 };
 use nix::sys::signal::{kill, Signal};
 use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
@@ -491,7 +491,10 @@ impl Container {
             bind_mount_host_paths(&container_root, is_rootless)?;
         }
 
-        // 7b. Write resolv.conf for bridge networking.
+        // 7b. Mount persistent or ephemeral volumes over the base filesystem.
+        mount_volumes(&container_root, &self.config.volumes)?;
+
+        // 7c. Write resolv.conf for bridge networking.
         // When rootfs is mounted, /etc is read-only, so we bind-mount a writable
         // resolv.conf over the top (same technique as secrets).
         if let NetworkMode::Bridge(ref bridge_config) = self.config.network {
@@ -502,7 +505,7 @@ impl Container {
             }
         }
 
-        // 7c. Mount secrets (in-memory tmpfs for production, bind-mount for agent mode)
+        // 7d. Mount secrets (in-memory tmpfs for production, bind-mount for agent mode)
         if self.config.service_mode == ServiceMode::Production {
             mount_secrets_inmemory(&container_root, &self.config.secrets)?;
         } else {

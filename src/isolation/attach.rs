@@ -232,7 +232,7 @@ impl ContainerAttach {
         let args: std::result::Result<Vec<CString>, _> = command
             .iter()
             .map(|arg| CString::new(arg.as_str()))
-        .collect();
+            .collect();
         let args =
             args.map_err(|e| NucleusError::AttachError(format!("Invalid argument: {}", e)))?;
 
@@ -335,7 +335,8 @@ impl NamespaceCommandRunner {
                 Ok(WaitStatus::StillAlive) => {
                     if let Some(limit) = timeout {
                         if start.elapsed() >= limit {
-                            let _ = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
+                            let _ =
+                                nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
                             let _ = waitpid(child, None);
                             return Ok(false);
                         }

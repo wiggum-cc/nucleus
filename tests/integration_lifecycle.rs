@@ -36,7 +36,8 @@ mod tests {
         let config = ContainerConfig::try_new(
             Some("test-echo".to_string()),
             vec!["/bin/echo".to_string(), "hello".to_string()],
-        ).unwrap()
+        )
+        .unwrap()
         .with_context(context_path)
         .with_limits(limits)
         .with_namespaces(NamespaceConfig::minimal())
@@ -62,7 +63,8 @@ mod tests {
                 "-c".to_string(),
                 "exit 0".to_string(),
             ],
-        ).unwrap()
+        )
+        .unwrap()
         .with_context(PathBuf::from("/tmp/test"))
         .with_namespaces(NamespaceConfig::minimal())
         .with_gvisor(false);
@@ -112,7 +114,8 @@ mod tests {
                 "-c".to_string(),
                 "test -c /dev/null && test -c /dev/zero && test -c /dev/random".to_string(),
             ],
-        ).unwrap()
+        )
+        .unwrap()
         .with_namespaces(NamespaceConfig::minimal())
         .with_trust_level(TrustLevel::Trusted);
 
@@ -138,7 +141,8 @@ mod tests {
                 "-c".to_string(),
                 "test $(hostname) = 'custom-hostname'".to_string(),
             ],
-        ).unwrap()
+        )
+        .unwrap()
         .with_namespaces(namespaces)
         .with_hostname(Some("custom-hostname".to_string()))
         .with_trust_level(TrustLevel::Trusted);
@@ -179,7 +183,8 @@ mod tests {
         let config = ContainerConfig::try_new(
             Some("test-full".to_string()),
             vec!["/bin/sh".to_string(), "/context/test.sh".to_string()],
-        ).unwrap()
+        )
+        .unwrap()
         .with_context(context_path)
         .with_limits(limits)
         .with_namespaces(namespaces)
@@ -197,8 +202,10 @@ mod tests {
     #[test]
     fn test_container_with_custom_hostname() {
         // Test hostname configuration
-        let config = ContainerConfig::try_new(Some("test".to_string()), vec!["/bin/sh".to_string()]).unwrap()
-            .with_hostname(Some("custom-host".to_string()));
+        let config =
+            ContainerConfig::try_new(Some("test".to_string()), vec!["/bin/sh".to_string()])
+                .unwrap()
+                .with_hostname(Some("custom-host".to_string()));
 
         assert_eq!(config.hostname, Some("custom-host".to_string()));
     }
@@ -209,15 +216,18 @@ mod tests {
         let config = ContainerConfig::try_new(
             Some("my-container".to_string()),
             vec!["/bin/sh".to_string()],
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(config.hostname, Some("my-container".to_string()));
     }
 
     #[test]
     fn test_container_rootless_config() {
-        let config = ContainerConfig::try_new(Some("test".to_string()), vec!["/bin/sh".to_string()]).unwrap()
-            .with_rootless();
+        let config =
+            ContainerConfig::try_new(Some("test".to_string()), vec!["/bin/sh".to_string()])
+                .unwrap()
+                .with_rootless();
 
         assert!(
             config.namespaces.user,
@@ -280,7 +290,8 @@ mod tests {
                  if unshare -U true 2>/dev/null; then exit 1; else exit 0; fi"
                     .to_string(),
             ],
-        ).unwrap()
+        )
+        .unwrap()
         .with_namespaces(NamespaceConfig::minimal())
         .with_trust_level(TrustLevel::Trusted);
 
@@ -311,7 +322,8 @@ mod tests {
         let config = ContainerConfig::try_new(
             Some("test-untrusted-host".to_string()),
             vec!["/bin/sh".to_string()],
-        ).unwrap()
+        )
+        .unwrap()
         .with_trust_level(TrustLevel::Untrusted)
         .with_network(NetworkMode::Host)
         .with_allow_host_network(true)
@@ -339,7 +351,8 @@ mod tests {
         let config = ContainerConfig::try_new(
             Some("test-untrusted-no-gvisor".to_string()),
             vec!["/bin/sh".to_string()],
-        ).unwrap()
+        )
+        .unwrap()
         .with_gvisor(false)
         .with_trust_level(TrustLevel::Untrusted)
         .with_namespaces(NamespaceConfig::minimal());

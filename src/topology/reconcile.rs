@@ -9,10 +9,13 @@
 use crate::container::{ContainerLifecycle, ContainerStateManager};
 use crate::error::{NucleusError, Result};
 use crate::isolation::{NamespaceCommandRunner, NamespaceProbe};
-use crate::topology::config::{ServiceDef, TopologyConfig};
+use crate::topology::config::{
+    parse_service_volume_mount, parse_volume_owner, ServiceDef, TopologyConfig, VolumeDef,
+};
 use crate::topology::dag::DependencyGraph;
 use std::collections::BTreeMap;
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -182,7 +185,13 @@ pub fn execute_reconcile(
                         service_name
                     ))
                 })?;
-                let args = build_service_run_args(svc, &container_name, desired_hash)?;
+                let args = build_service_run_args(
+                    config,
+                    service_name,
+                    svc,
+                    &container_name,
+                    desired_hash,
+                )?;
 
                 // Spawn the container as a background process
                 // Fail hard if current_exe() fails instead of falling back to
@@ -226,7 +235,54 @@ pub fn execute_reconcile(
     Ok(())
 }
 
+fn prepare_persistent_volume(volume_name: &str, volume_def: &VolumeDef) -> Result<PathBuf> {
+    let path = PathBuf::from(volume_def.path.as_ref().ok_or_else(|| {
+        NucleusError::ConfigError(format!(
+            "Persistent volume '{}' must define path",
+            volume_name
+        ))
+    })?);
+
+    if !path.is_absolute() {
+        return Err(NucleusError::ConfigError(format!(
+            "Persistent volume '{}' path must be absolute: {:?}",
+            volume_name, path
+        )));
+    }
+
+    std::fs::create_dir_all(&path).map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Failed to create persistent volume '{}' at {:?}: {}",
+            volume_name, path, e
+        ))
+    })?;
+
+    if let Some(owner) = &volume_def.owner {
+        let (uid, gid) = parse_volume_owner(owner)?;
+        nix::unistd::chown(
+            &path,
+            Some(nix::unistd::Uid::from_raw(uid)),
+            Some(nix::unistd::Gid::from_raw(gid)),
+        )
+        .map_err(|e| {
+            NucleusError::ConfigError(format!(
+                "Failed to set owner {} on persistent volume '{}' at {:?}: {}",
+                owner, volume_name, path, e
+            ))
+        })?;
+    }
+
+    std::fs::canonicalize(&path).map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Failed to canonicalize persistent volume '{}' at {:?}: {}",
+            volume_name, path, e
+        ))
+    })
+}
+
 fn build_service_run_args(
+    config: &TopologyConfig,
+    service_name: &str,
     svc: &ServiceDef,
     container_name: &str,
     desired_hash: u64,
@@ -275,6 +331,47 @@ fn build_service_run_args(
     for pf in &svc.port_forwards {
         args.push("-p".to_string());
         args.push(pf.clone());
+    }
+
+    for spec in &svc.volumes {
+        let mount = parse_service_volume_mount(spec)?;
+        let volume_def = config.volumes.get(&mount.volume).ok_or_else(|| {
+            NucleusError::ConfigError(format!(
+                "Service '{}' references unknown volume '{}'",
+                service_name, mount.volume
+            ))
+        })?;
+        match volume_def.volume_type.as_str() {
+            "persistent" => {
+                let host_path = prepare_persistent_volume(&mount.volume, volume_def)?;
+                args.push("--volume".to_string());
+                args.push(format!(
+                    "{}:{}:{}",
+                    host_path.to_string_lossy(),
+                    mount.dest.to_string_lossy(),
+                    if mount.read_only { "ro" } else { "rw" }
+                ));
+            }
+            "ephemeral" => {
+                args.push("--tmpfs".to_string());
+                let mut spec = mount.dest.to_string_lossy().to_string();
+                if let Some(size) = &volume_def.size {
+                    spec.push(':');
+                    spec.push_str(size);
+                }
+                if mount.read_only {
+                    spec.push(':');
+                    spec.push_str("ro");
+                }
+                args.push(spec);
+            }
+            other => {
+                return Err(NucleusError::ConfigError(format!(
+                    "Volume '{}' for service '{}' has unsupported type '{}'",
+                    mount.volume, service_name, other
+                )));
+            }
+        }
     }
 
     // C-2: Write secrets to a secure temp file instead of passing via CLI args.
@@ -614,12 +711,57 @@ memory = "256M"
 "#;
         let config = TopologyConfig::from_toml(toml).unwrap();
         let svc = config.services.get("web").unwrap();
-        let args = build_service_run_args(svc, "test-web", 42).unwrap();
+        let args = build_service_run_args(&config, "web", svc, "test-web", 42).unwrap();
 
         assert!(args
             .windows(2)
             .any(|pair| { pair[0] == "--topology-config-hash" && pair[1] == "42" }));
         assert!(args.iter().any(|arg| arg == "--quiet-id"));
+    }
+
+    #[test]
+    fn test_build_service_run_args_include_bind_and_tmpfs_volumes() {
+        let persistent_dir = tempfile::TempDir::new().unwrap();
+        let persistent_path = persistent_dir.path().join("db-data");
+        let toml = format!(
+            r#"
+name = "test"
+
+[volumes.db-data]
+volume_type = "persistent"
+path = "{}"
+
+[volumes.cache]
+volume_type = "ephemeral"
+size = "64M"
+
+[services.db]
+rootfs = "/nix/store/db"
+command = ["postgres"]
+memory = "1G"
+volumes = [
+  "db-data:/var/lib/postgresql/data",
+  "cache:/var/cache/postgresql:ro"
+]
+"#,
+            persistent_path.display()
+        );
+        let config = TopologyConfig::from_toml(&toml).unwrap();
+        let svc = config.services.get("db").unwrap();
+        let args = build_service_run_args(&config, "db", svc, "test-db", 7).unwrap();
+
+        assert!(
+            persistent_path.exists(),
+            "persistent volume path must be created"
+        );
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--volume"
+                && pair[1].contains(":/var/lib/postgresql/data:rw")
+                && pair[1].starts_with(persistent_path.to_string_lossy().as_ref())
+        }));
+        assert!(args
+            .windows(2)
+            .any(|pair| { pair[0] == "--tmpfs" && pair[1] == "/var/cache/postgresql:64M:ro" }));
     }
 
     #[test]

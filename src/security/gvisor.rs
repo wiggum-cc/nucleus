@@ -424,7 +424,10 @@ impl GVisorRuntime {
 
         // Use a hardcoded PATH for the runsc supervisor process to prevent
         // host PATH from leaking into the gVisor environment.
-        push("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string())?;
+        push(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+        )?;
         let runtime_dir = runtime_dir.to_string_lossy().to_string();
         push("TMPDIR", runtime_dir.clone())?;
         push("XDG_RUNTIME_DIR", runtime_dir)?;
@@ -548,7 +551,8 @@ mod tests {
         let rt = GVisorRuntime::with_path("/fake/runsc".to_string());
         let tmp = tempfile::tempdir().unwrap();
         let env = rt.exec_environment(tmp.path()).unwrap();
-        let path_entry = env.iter()
+        let path_entry = env
+            .iter()
             .find(|e| e.to_str().is_ok_and(|s| s.starts_with("PATH=")))
             .expect("exec_environment must set PATH");
         let path_val = path_entry.to_str().unwrap();
@@ -558,8 +562,7 @@ mod tests {
             path_val
         );
         assert_eq!(
-            path_val,
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            path_val, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "exec_environment PATH must be the standard hardcoded value"
         );
     }

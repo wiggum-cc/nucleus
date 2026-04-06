@@ -937,6 +937,54 @@ impl OciConfig {
         Ok(self)
     }
 
+    /// Add bind or tmpfs volume mounts.
+    pub fn with_volume_mounts(mut self, volumes: &[crate::container::VolumeMount]) -> Result<Self> {
+        use crate::container::VolumeSource;
+
+        for volume in volumes {
+            let dest = normalize_container_destination(&volume.dest)?;
+            match &volume.source {
+                VolumeSource::Bind { source } => {
+                    let mut options = vec![
+                        "bind".to_string(),
+                        "nosuid".to_string(),
+                        "nodev".to_string(),
+                    ];
+                    if volume.read_only {
+                        options.push("ro".to_string());
+                    }
+                    self.mounts.push(OciMount {
+                        destination: dest.to_string_lossy().to_string(),
+                        source: source.to_string_lossy().to_string(),
+                        mount_type: "bind".to_string(),
+                        options,
+                    });
+                }
+                VolumeSource::Tmpfs { size } => {
+                    let mut options = vec![
+                        "nosuid".to_string(),
+                        "nodev".to_string(),
+                        "mode=0755".to_string(),
+                    ];
+                    if volume.read_only {
+                        options.push("ro".to_string());
+                    }
+                    if let Some(size) = size {
+                        options.push(format!("size={}", size));
+                    }
+                    self.mounts.push(OciMount {
+                        destination: dest.to_string_lossy().to_string(),
+                        source: "tmpfs".to_string(),
+                        mount_type: "tmpfs".to_string(),
+                        options,
+                    });
+                }
+            }
+        }
+
+        Ok(self)
+    }
+
     /// Bind mount the host context directory into the container.
     ///
     /// The gVisor integration path expects `/context` to be writable so test
@@ -1376,6 +1424,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_volume_mounts_include_bind_and_tmpfs_options() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None)
+            .with_volume_mounts(&[
+                crate::container::VolumeMount {
+                    source: crate::container::VolumeSource::Bind {
+                        source: tmp.path().to_path_buf(),
+                    },
+                    dest: std::path::PathBuf::from("/var/lib/app"),
+                    read_only: true,
+                },
+                crate::container::VolumeMount {
+                    source: crate::container::VolumeSource::Tmpfs {
+                        size: Some("64M".to_string()),
+                    },
+                    dest: std::path::PathBuf::from("/var/cache/app"),
+                    read_only: false,
+                },
+            ])
+            .unwrap();
+
+        assert!(config.mounts.iter().any(|mount| {
+            mount.destination == "/var/lib/app"
+                && mount.mount_type == "bind"
+                && mount.options.contains(&"ro".to_string())
+        }));
+        assert!(config.mounts.iter().any(|mount| {
+            mount.destination == "/var/cache/app"
+                && mount.mount_type == "tmpfs"
+                && mount.options.contains(&"size=64M".to_string())
+        }));
     }
 
     #[test]

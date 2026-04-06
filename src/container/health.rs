@@ -140,7 +140,10 @@ impl Container {
         // preventing SIGTERM to a recycled PID.
         let expected_ticks = read_start_ticks(pid);
         if expected_ticks == 0 {
-            warn!("Health check: could not read start_ticks for PID {}, aborting", pid);
+            warn!(
+                "Health check: could not read start_ticks for PID {}, aborting",
+                pid
+            );
             return;
         }
 
@@ -195,7 +198,10 @@ impl Container {
                         if read_start_ticks(pid) == expected_ticks {
                             let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
                         } else {
-                            warn!("Health check: PID {} was recycled, not sending SIGTERM", pid);
+                            warn!(
+                                "Health check: PID {} was recycled, not sending SIGTERM",
+                                pid
+                            );
                         }
                         return;
                     }
@@ -209,7 +215,10 @@ impl Container {
                     if read_start_ticks(pid) == expected_ticks {
                         let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
                     } else {
-                        warn!("Health check: PID {} was recycled, not sending SIGTERM", pid);
+                        warn!(
+                            "Health check: PID {} was recycled, not sending SIGTERM",
+                            pid
+                        );
                     }
                     return;
                 }

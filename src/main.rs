@@ -4,13 +4,13 @@ use nucleus::container::{
     parse_signal, validate_container_name, validate_hostname, Container, ContainerConfig,
     ContainerLifecycle, ContainerState, ContainerStateManager, ContainerStateParams, HealthCheck,
     KernelLockdownMode, OciStatus, ReadinessProbe, SeccompMode, SecretMount, ServiceMode,
-    TrustLevel,
+    TrustLevel, VolumeMount, VolumeSource,
 };
+use nucleus::error::{NucleusError, Result};
 use nucleus::filesystem::ContextMode;
 use nucleus::isolation::{ContainerAttach, NamespaceConfig};
 use nucleus::network::{BridgeConfig, EgressPolicy, NetworkMode, PortForward};
 use nucleus::resources::{IoDeviceLimit, ResourceLimits, ResourceStats};
-use nucleus::error::{NucleusError, Result};
 use nucleus::security::GVisorPlatform;
 use nucleus::topology::{
     execute_reconcile, plan_reconcile, DependencyGraph, ReconcileAction, TopologyConfig,
@@ -81,7 +81,7 @@ enum Commands {
 
         /// Container runtime: gvisor or native
         #[arg(long, default_value = "gvisor")]
-        runtime: String,  // Cannot use ValueEnum: gvisor triggers extra logic
+        runtime: String, // Cannot use ValueEnum: gvisor triggers extra logic
 
         /// Internal: suppress printing the container ID before execution
         #[arg(long, hide = true)]
@@ -178,6 +178,14 @@ enum Commands {
         /// Mount a secret file: SOURCE:DEST (repeatable)
         #[arg(long = "secret")]
         secrets: Vec<String>,
+
+        /// Mount a host path as a bind volume: SOURCE:DEST[:ro|rw] (repeatable)
+        #[arg(long = "volume")]
+        volumes: Vec<String>,
+
+        /// Mount a tmpfs volume: DEST[:SIZE][:ro|rw] (repeatable)
+        #[arg(long = "tmpfs")]
+        tmpfs: Vec<String>,
 
         /// Set environment variable: KEY=VALUE (repeatable)
         #[arg(short = 'e', long = "env")]
@@ -707,6 +715,8 @@ fn main() -> Result<()> {
             health_retries,
             health_start_period,
             secrets,
+            volumes,
+            tmpfs,
             env_vars,
             sd_notify,
             readiness_exec,
@@ -732,7 +742,9 @@ fn main() -> Result<()> {
             command,
         } => {
             if command.is_empty() {
-                return Err(NucleusError::ConfigError("No command specified".to_string()));
+                return Err(NucleusError::ConfigError(
+                    "No command specified".to_string(),
+                ));
             }
 
             if let Some(ref n) = name {
@@ -802,7 +814,10 @@ fn main() -> Result<()> {
                     NetworkMode::Bridge(bridge_config)
                 }
                 other => {
-                    return Err(NucleusError::ConfigError(format!("Unknown network mode: {}. Use none, host, or bridge.", other)));
+                    return Err(NucleusError::ConfigError(format!(
+                        "Unknown network mode: {}. Use none, host, or bridge.",
+                        other
+                    )));
                 }
             };
 
@@ -885,7 +900,9 @@ fn main() -> Result<()> {
                     if let Some(log_path) = seccomp_log {
                         config = config.with_seccomp_trace_log(PathBuf::from(log_path));
                     } else {
-                        return Err(NucleusError::ConfigError("--seccomp-log is required when --seccomp-mode=trace".to_string()));
+                        return Err(NucleusError::ConfigError(
+                            "--seccomp-log is required when --seccomp-mode=trace".to_string(),
+                        ));
                     }
                 }
             }
@@ -927,7 +944,8 @@ fn main() -> Result<()> {
                 if probe_count > 1 {
                     return Err(NucleusError::ConfigError(
                         "Only one readiness probe type may be set \
-                         (--readiness-exec, --readiness-tcp, --readiness-sd-notify)".to_string()
+                         (--readiness-exec, --readiness-tcp, --readiness-sd-notify)"
+                            .to_string(),
                     ));
                 }
                 if let Some(cmd) = readiness_exec {
@@ -957,7 +975,10 @@ fn main() -> Result<()> {
             for spec in &secrets {
                 let parts: Vec<&str> = spec.splitn(2, ':').collect();
                 if parts.len() != 2 {
-                    return Err(NucleusError::ConfigError(format!("Invalid secret format '{}', expected SOURCE:DEST", spec)));
+                    return Err(NucleusError::ConfigError(format!(
+                        "Invalid secret format '{}', expected SOURCE:DEST",
+                        spec
+                    )));
                 }
                 // Canonicalize source path to resolve symlinks and prevent
                 // path traversal (e.g., "../../etc/shadow:...").
@@ -974,23 +995,91 @@ fn main() -> Result<()> {
                 });
             }
 
+            // Bind volumes
+            for spec in &volumes {
+                let parts: Vec<&str> = spec.split(':').collect();
+                let (source_raw, dest_raw, read_only) = match parts.as_slice() {
+                    [source, dest] => (*source, *dest, false),
+                    [source, dest, mode] if *mode == "ro" => (*source, *dest, true),
+                    [source, dest, mode] if *mode == "rw" => (*source, *dest, false),
+                    _ => {
+                        return Err(NucleusError::ConfigError(format!(
+                            "Invalid volume format '{}', expected SOURCE:DEST[:ro|rw]",
+                            spec
+                        )));
+                    }
+                };
+                let source = std::fs::canonicalize(source_raw).map_err(|e| {
+                    NucleusError::ConfigError(format!(
+                        "Volume source '{}' cannot be resolved: {}",
+                        source_raw, e
+                    ))
+                })?;
+                config = config.with_volume(VolumeMount {
+                    source: VolumeSource::Bind { source },
+                    dest: PathBuf::from(dest_raw),
+                    read_only,
+                });
+            }
+
+            // Tmpfs volumes
+            for spec in &tmpfs {
+                let parts: Vec<&str> = spec.split(':').collect();
+                let (dest, size, read_only) = match parts.as_slice() {
+                    [dest] => (*dest, None, false),
+                    [dest, mode] if *mode == "ro" => (*dest, None, true),
+                    [dest, mode] if *mode == "rw" => (*dest, None, false),
+                    [dest, size] => (*dest, Some((*size).to_string()), false),
+                    [dest, size, mode] if *mode == "ro" => (*dest, Some((*size).to_string()), true),
+                    [dest, size, mode] if *mode == "rw" => {
+                        (*dest, Some((*size).to_string()), false)
+                    }
+                    _ => {
+                        return Err(NucleusError::ConfigError(format!(
+                            "Invalid tmpfs format '{}', expected DEST[:SIZE][:ro|rw]",
+                            spec
+                        )));
+                    }
+                };
+                if dest.is_empty() {
+                    return Err(NucleusError::ConfigError(format!(
+                        "Invalid tmpfs format '{}', expected DEST[:SIZE][:ro|rw]",
+                        spec
+                    )));
+                }
+                config = config.with_volume(VolumeMount {
+                    source: VolumeSource::Tmpfs { size },
+                    dest: PathBuf::from(dest),
+                    read_only,
+                });
+            }
+
             // Environment variables
             for spec in &env_vars {
                 if let Some((key, value)) = spec.split_once('=') {
                     config = config.with_env(key.to_string(), value.to_string());
                 } else {
-                    return Err(NucleusError::ConfigError(format!("Invalid env var format '{}', expected KEY=VALUE", spec)));
+                    return Err(NucleusError::ConfigError(format!(
+                        "Invalid env var format '{}', expected KEY=VALUE",
+                        spec
+                    )));
                 }
             }
 
             // OCI lifecycle hooks
             if let Some(hooks_path) = hooks {
                 let hooks_json = std::fs::read_to_string(&hooks_path).map_err(|e| {
-                    NucleusError::ConfigError(format!("Failed to read hooks file '{}': {}", hooks_path, e))
+                    NucleusError::ConfigError(format!(
+                        "Failed to read hooks file '{}': {}",
+                        hooks_path, e
+                    ))
                 })?;
                 let oci_hooks: nucleus::security::OciHooks = serde_json::from_str(&hooks_json)
                     .map_err(|e| {
-                        NucleusError::ConfigError(format!("Failed to parse hooks file '{}': {}", hooks_path, e))
+                        NucleusError::ConfigError(format!(
+                            "Failed to parse hooks file '{}': {}",
+                            hooks_path, e
+                        ))
                     })?;
                 config.hooks = Some(oci_hooks);
             }
@@ -1124,9 +1213,7 @@ fn main() -> Result<()> {
 
         Commands::Seccomp(seccomp_cmd) => match seccomp_cmd {
             SeccompCommands::Generate { trace_file, output } => {
-                let profile = nucleus::security::generate_from_trace(
-                    &PathBuf::from(&trace_file),
-                )?;
+                let profile = nucleus::security::generate_from_trace(&PathBuf::from(&trace_file))?;
                 let json = serde_json::to_string_pretty(&profile)?;
 
                 if let Some(out_path) = output {
@@ -1145,9 +1232,6 @@ fn main() -> Result<()> {
         },
     }
 }
-
-
-
 
 #[cfg(test)]
 mod tests {

@@ -147,13 +147,19 @@ impl CriuRuntime {
 
         let output = cmd.output().map_err(|e| {
             // Abort: Dumping -> None
-            self.state = self.state.transition(CheckpointState::None).unwrap_or(self.state);
+            self.state = self
+                .state
+                .transition(CheckpointState::None)
+                .unwrap_or(self.state);
             NucleusError::CheckpointError(format!("Failed to run criu dump: {}", e))
         })?;
 
         if !output.status.success() {
             // Abort: Dumping -> None
-            self.state = self.state.transition(CheckpointState::None).unwrap_or(self.state);
+            self.state = self
+                .state
+                .transition(CheckpointState::None)
+                .unwrap_or(self.state);
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(NucleusError::CheckpointError(format!(
                 "criu dump failed: {}",
@@ -221,13 +227,19 @@ impl CriuRuntime {
             .output()
             .map_err(|e| {
                 // Abort: Restoring -> None
-                self.state = self.state.transition(CheckpointState::None).unwrap_or(self.state);
+                self.state = self
+                    .state
+                    .transition(CheckpointState::None)
+                    .unwrap_or(self.state);
                 NucleusError::CheckpointError(format!("Failed to run criu restore: {}", e))
             })?;
 
         if !output.status.success() {
             // Abort: Restoring -> None
-            self.state = self.state.transition(CheckpointState::None).unwrap_or(self.state);
+            self.state = self
+                .state
+                .transition(CheckpointState::None)
+                .unwrap_or(self.state);
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(NucleusError::CheckpointError(format!(
                 "criu restore failed: {}",
@@ -319,10 +331,7 @@ impl CriuRuntime {
     fn reject_symlink_path(path: &Path, label: &str) -> Result<()> {
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_symlink() => Err(
-                NucleusError::CheckpointError(format!(
-                    "Refusing symlink {} {:?}",
-                    label, path
-                )),
+                NucleusError::CheckpointError(format!("Refusing symlink {} {:?}", label, path)),
             ),
             Ok(_) | Err(_) => Ok(()),
         }
@@ -362,7 +371,10 @@ mod tests {
         assert_eq!(CriuRuntime::parse_pidfile("  5678  \n"), Some(5678));
         // Error messages should NOT parse as PIDs
         assert_eq!(CriuRuntime::parse_pidfile("Error code: 255 (EPERM)"), None);
-        assert_eq!(CriuRuntime::parse_pidfile("restored successfully pid=5678"), None);
+        assert_eq!(
+            CriuRuntime::parse_pidfile("restored successfully pid=5678"),
+            None
+        );
         assert_eq!(CriuRuntime::parse_pidfile(""), None);
         assert_eq!(CriuRuntime::parse_pidfile("no pid here"), None);
     }
