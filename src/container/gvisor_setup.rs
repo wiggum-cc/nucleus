@@ -44,6 +44,7 @@ impl Container {
 
         oci_config = oci_config.with_resources(&self.config.limits);
         oci_config = oci_config.with_namespace_config(&self.config.namespaces);
+        oci_config = oci_config.with_process_identity(&self.config.process_identity);
 
         // Inject user-configured environment variables
         if !self.config.environment.is_empty() {
@@ -82,8 +83,12 @@ impl Container {
         if !self.config.secrets.is_empty() && self.config.service_mode == ServiceMode::Production {
             let secret_stage_dir = Self::gvisor_secret_stage_dir(&self.config.id);
             Self::mount_gvisor_secret_stage_tmpfs(&secret_stage_dir)?;
-            let staged_secrets =
-                Self::stage_gvisor_secret_files(&secret_stage_dir, &self.config.secrets)?;
+            Self::apply_secret_dir_identity(&secret_stage_dir, &self.config.process_identity)?;
+            let staged_secrets = Self::stage_gvisor_secret_files(
+                &secret_stage_dir,
+                &self.config.secrets,
+                &self.config.process_identity,
+            )?;
             oci_config =
                 oci_config.with_inmemory_secret_mounts(&secret_stage_dir, &staged_secrets)?;
         } else if !self.config.secrets.is_empty() {
@@ -249,9 +254,52 @@ impl Container {
         })
     }
 
+    fn apply_secret_dir_identity(
+        path: &std::path::Path,
+        identity: &crate::container::ProcessIdentity,
+    ) -> Result<()> {
+        if identity.is_root() {
+            return Ok(());
+        }
+
+        nix::unistd::chown(
+            path,
+            Some(nix::unistd::Uid::from_raw(identity.uid)),
+            Some(nix::unistd::Gid::from_raw(identity.gid)),
+        )
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to set secret directory owner on {:?} to {}:{}: {}",
+                path, identity.uid, identity.gid, e
+            ))
+        })
+    }
+
+    fn apply_secret_file_identity(
+        path: &std::path::Path,
+        identity: &crate::container::ProcessIdentity,
+    ) -> Result<()> {
+        if identity.is_root() {
+            return Ok(());
+        }
+
+        nix::unistd::chown(
+            path,
+            Some(nix::unistd::Uid::from_raw(identity.uid)),
+            Some(nix::unistd::Gid::from_raw(identity.gid)),
+        )
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to set secret owner on {:?} to {}:{}: {}",
+                path, identity.uid, identity.gid, e
+            ))
+        })
+    }
+
     pub(super) fn stage_gvisor_secret_files(
         stage_dir: &std::path::Path,
         secrets: &[crate::container::SecretMount],
+        identity: &crate::container::ProcessIdentity,
     ) -> Result<Vec<crate::container::SecretMount>> {
         let mut staged = Vec::with_capacity(secrets.len());
 
@@ -299,6 +347,8 @@ impl Container {
                     ))
                 })?;
             }
+
+            Self::apply_secret_file_identity(&staged_source, identity)?;
 
             zeroize::Zeroize::zeroize(&mut content);
 

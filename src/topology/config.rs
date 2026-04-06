@@ -115,6 +115,18 @@ pub struct ServiceDef {
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
 
+    /// Workload user name or numeric uid.
+    #[serde(default)]
+    pub user: Option<String>,
+
+    /// Workload group name or numeric gid.
+    #[serde(default)]
+    pub group: Option<String>,
+
+    /// Supplementary workload groups (names or numeric gids).
+    #[serde(default)]
+    pub additional_groups: Vec<String>,
+
     /// Secret mounts (format: "source:dest")
     #[serde(default)]
     pub secrets: Vec<String>,

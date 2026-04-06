@@ -1359,6 +1359,34 @@ mod tests {
     }
 
     #[test]
+    fn test_user_namespace_rejects_unmapped_process_identity() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_rootless()
+            .with_process_identity(ProcessIdentity {
+                uid: 1000,
+                gid: 1000,
+                additional_gids: Vec::new(),
+            });
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("not mapped"));
+    }
+
+    #[test]
+    fn test_user_namespace_rejects_supplementary_groups() {
+        let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])
+            .with_rootless()
+            .with_process_identity(ProcessIdentity {
+                uid: 0,
+                gid: 0,
+                additional_gids: vec![1],
+            });
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("Supplementary groups"));
+    }
+
+    #[test]
     fn test_native_runtime_disables_gvisor() {
         // --runtime native must explicitly disable gVisor and set Trusted trust level
         let cfg = ContainerConfig::new(None, vec!["/bin/sh".to_string()])

@@ -25,6 +25,9 @@ mod tests {
             using_gvisor: false,
             rootless: true,
             cgroup_path: Some("/sys/fs/cgroup/nucleus-abc123def456".to_string()),
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: Vec::new(),
         })
     }
 

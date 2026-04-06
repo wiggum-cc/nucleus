@@ -29,6 +29,7 @@ impl Container {
         probe: &crate::container::ReadinessProbe,
         rootless: bool,
         using_gvisor: bool,
+        process_identity: &crate::container::ProcessIdentity,
         notify_socket: Option<&str>,
     ) -> Result<()> {
         use crate::container::ReadinessProbe;
@@ -53,6 +54,7 @@ impl Container {
                     rootless,
                     using_gvisor,
                     NamespaceProbe::Exec(command.clone()),
+                    Some(process_identity),
                     Some(std::time::Duration::from_secs(5)),
                 )?,
                 ReadinessProbe::TcpPort(port) => NamespaceCommandRunner::run(
@@ -60,6 +62,7 @@ impl Container {
                     rootless,
                     using_gvisor,
                     NamespaceProbe::TcpConnect(*port),
+                    None,
                     Some(std::time::Duration::from_secs(3)),
                 )?,
                 ReadinessProbe::SdNotify => {
@@ -121,6 +124,7 @@ impl Container {
         rootless: bool,
         using_gvisor: bool,
         hc: &crate::container::HealthCheck,
+        process_identity: &crate::container::ProcessIdentity,
         cancel: &std::sync::atomic::AtomicBool,
     ) {
         // BUG-18: Use cancellable sleep so we exit promptly on container stop.
@@ -171,6 +175,7 @@ impl Container {
                 rootless,
                 using_gvisor,
                 NamespaceProbe::Exec(hc.command.clone()),
+                Some(process_identity),
                 Some(hc.timeout),
             ) {
                 Ok(true) => {

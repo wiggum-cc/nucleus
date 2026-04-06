@@ -6,7 +6,7 @@
 //! 3. Starts new/changed containers in dependency order
 //! 4. Leaves unchanged containers running
 
-use crate::container::{ContainerLifecycle, ContainerStateManager};
+use crate::container::{ContainerLifecycle, ContainerStateManager, ProcessIdentity};
 use crate::error::{NucleusError, Result};
 use crate::isolation::{NamespaceCommandRunner, NamespaceProbe};
 use crate::topology::config::{
@@ -387,6 +387,21 @@ fn build_service_run_args(
         args.push(format!("{}={}", key, value));
     }
 
+    if let Some(user) = &svc.user {
+        args.push("--user".to_string());
+        args.push(user.clone());
+    }
+
+    if let Some(group) = &svc.group {
+        args.push("--group".to_string());
+        args.push(group.clone());
+    }
+
+    for group in &svc.additional_groups {
+        args.push("--additional-group".to_string());
+        args.push(group.clone());
+    }
+
     if let Some(ref hc) = svc.health_check {
         args.push("--health-cmd".to_string());
         args.push(hc.clone());
@@ -530,7 +545,17 @@ fn wait_for_healthy(
             )));
         }
 
-        if health_check_passes(state.pid, state.rootless, state.using_gvisor, health_cmd)? {
+        if health_check_passes(
+            state.pid,
+            state.rootless,
+            state.using_gvisor,
+            &ProcessIdentity {
+                uid: state.process_uid,
+                gid: state.process_gid,
+                additional_gids: state.additional_gids.clone(),
+            },
+            health_cmd,
+        )? {
             info!("Service {} is healthy", container_name);
             return Ok(());
         }
@@ -581,6 +606,7 @@ fn health_check_passes(
     pid: u32,
     rootless: bool,
     using_gvisor: bool,
+    process_identity: &ProcessIdentity,
     command: &str,
 ) -> Result<bool> {
     validate_health_check_command(command)?;
@@ -594,6 +620,7 @@ fn health_check_passes(
             "-c".to_string(),
             command.to_string(),
         ]),
+        Some(process_identity),
         Some(Duration::from_secs(5)),
     )
 }
@@ -661,6 +688,9 @@ memory = "256M"
             using_gvisor: false,
             rootless: false,
             cgroup_path: None,
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: Vec::new(),
         });
         state.config_hash = config.service_config_hash("web");
         state_mgr.save_state(&state).unwrap();
@@ -852,6 +882,9 @@ memory = "256M"
             using_gvisor: false,
             rootless: false,
             cgroup_path: None,
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: Vec::new(),
         });
         state_mgr.save_state(&state).unwrap();
 

@@ -75,6 +75,18 @@ pub struct ContainerState {
     #[serde(default)]
     pub creator_uid: u32,
 
+    /// Effective uid of the workload process inside the container.
+    #[serde(default)]
+    pub process_uid: u32,
+
+    /// Effective gid of the workload process inside the container.
+    #[serde(default)]
+    pub process_gid: u32,
+
+    /// Supplementary gids of the workload process inside the container.
+    #[serde(default)]
+    pub additional_gids: Vec<u32>,
+
     /// Process start time in clock ticks (from /proc/`<pid>`/stat field 22)
     /// Used to detect PID reuse in is_running()
     #[serde(default)]
@@ -108,6 +120,9 @@ pub struct ContainerStateParams {
     pub using_gvisor: bool,
     pub rootless: bool,
     pub cgroup_path: Option<String>,
+    pub process_uid: u32,
+    pub process_gid: u32,
+    pub additional_gids: Vec<u32>,
 }
 
 impl ContainerState {
@@ -133,6 +148,9 @@ impl ContainerState {
             cgroup_path: params.cgroup_path,
             config_hash: None,
             creator_uid: nix::unistd::Uid::effective().as_raw(),
+            process_uid: params.process_uid,
+            process_gid: params.process_gid,
+            additional_gids: params.additional_gids,
             start_ticks,
             status: OciStatus::Creating,
             bundle_path: None,
@@ -700,6 +718,9 @@ mod tests {
             using_gvisor: false,
             rootless: false,
             cgroup_path: Some("/sys/fs/cgroup/nucleus-test".to_string()),
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: Vec::new(),
         });
 
         assert_eq!(state.id, "test");
@@ -723,6 +744,9 @@ mod tests {
             using_gvisor: false,
             rootless: false,
             cgroup_path: None,
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: Vec::new(),
         });
 
         mgr.save_state(&state).unwrap();
@@ -747,6 +771,9 @@ mod tests {
             using_gvisor: false,
             rootless: false,
             cgroup_path: None,
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: Vec::new(),
         });
 
         mgr.save_state(&state).unwrap();
@@ -770,6 +797,9 @@ mod tests {
             using_gvisor: false,
             rootless: false,
             cgroup_path: None,
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: Vec::new(),
         });
 
         let state2 = ContainerState::new(ContainerStateParams {
@@ -782,6 +812,9 @@ mod tests {
             using_gvisor: false,
             rootless: false,
             cgroup_path: None,
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: Vec::new(),
         });
 
         mgr.save_state(&state1).unwrap();
@@ -805,6 +838,9 @@ mod tests {
             using_gvisor: false,
             rootless: false,
             cgroup_path: None,
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: Vec::new(),
         });
         mgr.save_state(&state).unwrap();
 
@@ -840,6 +876,9 @@ mod tests {
             using_gvisor: false,
             rootless: false,
             cgroup_path: None,
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: Vec::new(),
         });
         mgr.save_state(&state).unwrap();
 
@@ -870,6 +909,9 @@ mod tests {
             using_gvisor: false,
             rootless: false,
             cgroup_path: None,
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: Vec::new(),
         });
         mgr.save_state(&state).unwrap();
 
@@ -900,6 +942,9 @@ mod tests {
             using_gvisor: false,
             rootless: false,
             cgroup_path: None,
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: Vec::new(),
         });
 
         // Pre-create a symlink at the temp path to simulate an attack
@@ -929,6 +974,9 @@ mod tests {
             using_gvisor: false,
             rootless: false,
             cgroup_path: None,
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: Vec::new(),
         });
         // Force start_ticks to 0 to simulate failed read
         state.start_ticks = 0;

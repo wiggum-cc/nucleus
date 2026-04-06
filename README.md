@@ -364,6 +364,8 @@ in
       enable = true;
       command = [ "/bin/sigid-proxy" "--config" "/etc/sigid/proxy.toml" ];
       rootfs = proxyRootfs;
+      user = "sigid-proxy";
+      group = "sigid-proxy";
 
       # Resource limits (required in production mode)
       memory = "1G";
@@ -435,9 +437,11 @@ in
 }
 ```
 
-Writable bind volumes are automatically added to the generated systemd unit's `ReadWritePaths`. When `createHostPath = true`, the NixOS module creates the host directory with `systemd-tmpfiles` before the container starts.
+Writable bind volumes are automatically added to the generated systemd unit's `ReadWritePaths`. When `createHostPath = true`, the NixOS module creates the host directory with `systemd-tmpfiles` before the container starts. If the container declares a workload `user`/`group`, those become the default tmpfiles owner for new writable paths unless the volume overrides them.
 
 Credentials declared via `credentials = [ ... ]` use systemd's credential pipeline (`LoadCredential` or `LoadCredentialEncrypted`) and are mounted into the container through Nucleus's secret path. The CLI flag `--systemd-credential NAME:DEST` resolves `NAME` from `CREDENTIALS_DIRECTORY` at runtime.
+
+Set `user`, `group`, and optional `supplementaryGroups` on a NixOS container definition when the workload should run as a dedicated service account instead of root.
 
 ### Topology Services
 
@@ -468,6 +472,7 @@ For each enabled container, the module creates a systemd service:
 - **Restart**: `on-failure` with 5s backoff
 - **Logging**: stdout/stderr captured to journald with `SyslogIdentifier=nucleus-<name>`
 - **Command**: `nucleus run --service-mode production ...` with all configured options
+- **Workload identity**: Nucleus itself starts as root for setup, then drops the container workload to the configured `user` / `group` before exec
 - **Hardening**: `ProtectSystem=strict`, `ProtectHome=true` at the systemd level (defense-in-depth)
 
 ### Building a Rootfs
@@ -495,6 +500,8 @@ This produces a Nix store path containing `/bin`, `/lib`, `/etc`, etc. from the 
 
 **Do not pass secrets via `-e` / `--env`.** Environment variables are visible in `/proc/<pid>/environ` to any process that can read it (mitigated by `hidepid=2` in production mode, but not in agent mode). Use `--secret` instead — secrets are mounted on an in-memory tmpfs at `/run/secrets` with volatile source buffer zeroing.
 
+**Privilege dropping is explicit.** Nucleus must start with elevated privileges to create namespaces, mount filesystems, and configure cgroups/networking. Use `--user` / `--group` (or the NixOS module's `user` / `group` options) so the workload itself does not continue running as root after setup. In production mode, staged secrets under `/run/secrets` are re-owned to that workload identity.
+
 **Agent mode is not hardened.** By design, agent mode applies several security mechanisms on a best-effort basis: seccomp and Landlock failures are warn-and-continue (with `--allow-degraded-security`), chroot fallback is available (with `--allow-chroot-fallback`), bridge DNS defaults to public resolvers (`8.8.8.8`), and cgroup creation failures are non-fatal. Operators requiring strict isolation should use production mode, which makes all of these fatal.
 
 ## Production Mode vs Agent Mode
@@ -511,6 +518,7 @@ This produces a Nix store path containing `/bin`, `/lib`, `/etc`, etc. from the 
 | Egress policy | Optional | Deny-all default (fatal on apply failure) |
 | Memory limit | Optional | Required |
 | PID 1 init | Direct exec | Mini-init with zombie reaping + signal forwarding |
+| Workload uid/gid | Root by default | Configurable post-setup drop via `--user` / `--group` |
 | Secrets | Bind mount | In-memory tmpfs with volatile zeroing |
 | /proc | Mounted normally | `hidepid=2` (hides other processes) |
 | Mount audit | Skipped | Post-setup flag verification (fatal) |

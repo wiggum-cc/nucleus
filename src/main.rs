@@ -3,8 +3,8 @@ use nucleus::checkpoint::CriuRuntime;
 use nucleus::container::{
     parse_signal, validate_container_name, validate_hostname, Container, ContainerConfig,
     ContainerLifecycle, ContainerState, ContainerStateManager, ContainerStateParams, HealthCheck,
-    KernelLockdownMode, OciStatus, ReadinessProbe, SeccompMode, SecretMount, ServiceMode,
-    TrustLevel, VolumeMount, VolumeSource,
+    KernelLockdownMode, OciStatus, ProcessIdentity, ReadinessProbe, SeccompMode, SecretMount,
+    ServiceMode, TrustLevel, VolumeMount, VolumeSource,
 };
 use nucleus::error::{NucleusError, Result};
 use nucleus::filesystem::ContextMode;
@@ -797,6 +797,9 @@ fn main() -> Result<()> {
                 using_gvisor: metadata.using_gvisor,
                 rootless: metadata.rootless,
                 cgroup_path: None, // cgroup path unknown after restore
+                process_uid: 0,
+                process_gid: 0,
+                additional_gids: Vec::new(),
             });
             state_mgr.save_state(&state)?;
             info!(
@@ -1451,5 +1454,35 @@ mod tests {
         let err = resolve_systemd_credential_source("../db-password").unwrap_err();
         assert!(err.to_string().contains("Invalid systemd credential name"));
         std::env::remove_var("CREDENTIALS_DIRECTORY");
+    }
+
+    #[test]
+    fn test_resolve_process_identity_named_user_defaults_primary_group() {
+        let identity = resolve_process_identity(Some("root"), None, &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.uid, 0);
+        assert_eq!(identity.gid, 0);
+        assert!(identity.additional_gids.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_process_identity_numeric_user_requires_group() {
+        let err = resolve_process_identity(Some("1000"), None, &[]).unwrap_err();
+        assert!(err.to_string().contains("explicit --group"));
+    }
+
+    #[test]
+    fn test_resolve_process_identity_deduplicates_additional_groups() {
+        let identity = resolve_process_identity(
+            Some("123"),
+            Some("456"),
+            &["456".to_string(), "789".to_string(), "789".to_string()],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(identity.uid, 123);
+        assert_eq!(identity.gid, 456);
+        assert_eq!(identity.additional_gids, vec![789]);
     }
 }

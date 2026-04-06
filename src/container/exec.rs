@@ -35,16 +35,10 @@ impl Container {
         }
 
         setgid(Gid::from_raw(identity.gid)).map_err(|e| {
-            NucleusError::ExecError(format!(
-                "Failed to switch to gid {}: {}",
-                identity.gid, e
-            ))
+            NucleusError::ExecError(format!("Failed to switch to gid {}: {}", identity.gid, e))
         })?;
         setuid(Uid::from_raw(identity.uid)).map_err(|e| {
-            NucleusError::ExecError(format!(
-                "Failed to switch to uid {}: {}",
-                identity.uid, e
-            ))
+            NucleusError::ExecError(format!("Failed to switch to uid {}: {}", identity.uid, e))
         })?;
 
         info!(

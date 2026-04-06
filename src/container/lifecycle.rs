@@ -298,6 +298,9 @@ mod tests {
             using_gvisor: false,
             rootless: true,
             cgroup_path: None,
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: Vec::new(),
         });
         // Override creator to match current caller for this test.
         let mut state = state;

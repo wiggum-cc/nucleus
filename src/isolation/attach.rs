@@ -1,4 +1,4 @@
-use crate::container::ContainerState;
+use crate::container::{ContainerState, ProcessIdentity};
 use crate::error::{NucleusError, Result};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{fork, ForkResult, Pid};
@@ -283,6 +283,7 @@ impl NamespaceCommandRunner {
         rootless: bool,
         using_gvisor: bool,
         probe: NamespaceProbe,
+        process_identity: Option<&ProcessIdentity>,
         timeout: Option<Duration>,
     ) -> Result<bool> {
         if using_gvisor {
@@ -298,25 +299,36 @@ impl NamespaceCommandRunner {
         })? {
             ForkResult::Parent { child } => Self::wait_for_probe(child, timeout),
             ForkResult::Child => {
-                let exit_code = match Self::enter_and_run(&ns_fds, probe) {
-                    Ok(true) => 0,
-                    Ok(false) => 1,
-                    Err(e) => {
-                        eprintln!("Namespace helper failed: {}", e);
-                        125
-                    }
-                };
+                let exit_code =
+                    match Self::enter_and_run(&ns_fds, probe, process_identity, rootless) {
+                        Ok(true) => 0,
+                        Ok(false) => 1,
+                        Err(e) => {
+                            eprintln!("Namespace helper failed: {}", e);
+                            125
+                        }
+                    };
                 std::process::exit(exit_code);
             }
         }
     }
 
-    fn enter_and_run(ns_fds: &[(String, File)], probe: NamespaceProbe) -> Result<bool> {
+    fn enter_and_run(
+        ns_fds: &[(String, File)],
+        probe: NamespaceProbe,
+        process_identity: Option<&ProcessIdentity>,
+        rootless: bool,
+    ) -> Result<bool> {
         ContainerAttach::enter_namespaces(ns_fds)?;
         ContainerAttach::apply_exec_hardening()?;
 
         match probe {
             NamespaceProbe::Exec(command) => {
+                if let Some(identity) = process_identity {
+                    crate::container::Container::apply_process_identity_to_current_process(
+                        identity, rootless,
+                    )?;
+                }
                 let env = ContainerAttach::default_exec_env()?;
                 ContainerAttach::exec_with_env(&command, &env)?;
                 unreachable!()

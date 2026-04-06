@@ -270,6 +270,9 @@ impl Container {
                     using_gvisor: config.use_gvisor,
                     rootless: config.user_ns_config.is_some(),
                     cgroup_path,
+                    process_uid: config.process_identity.uid,
+                    process_gid: config.process_identity.gid,
+                    additional_gids: config.process_identity.additional_gids.clone(),
                 });
                 state.config_hash = config.config_hash;
                 state.bundle_path = config.rootfs_path.as_ref().map(|p| p.display().to_string());
@@ -519,7 +522,11 @@ impl Container {
 
         // 7d. Mount secrets (in-memory tmpfs for production, bind-mount for agent mode)
         if self.config.service_mode == ServiceMode::Production {
-            mount_secrets_inmemory(&container_root, &self.config.secrets)?;
+            mount_secrets_inmemory(
+                &container_root,
+                &self.config.secrets,
+                &self.config.process_identity,
+            )?;
         } else {
             mount_secrets(&container_root, &self.config.secrets)?;
         }
@@ -967,6 +974,7 @@ impl CreatedContainer {
                 probe,
                 config.user_ns_config.is_some(),
                 config.use_gvisor,
+                &config.process_identity,
                 notify_socket.as_deref(),
             )?;
         }
@@ -980,6 +988,7 @@ impl CreatedContainer {
                 let container_name = config.name.clone();
                 let rootless = config.user_ns_config.is_some();
                 let using_gvisor = config.use_gvisor;
+                let process_identity = config.process_identity.clone();
                 let cancel = cancel_flag.clone();
                 Some(std::thread::spawn(move || {
                     Container::health_check_loop(
@@ -988,6 +997,7 @@ impl CreatedContainer {
                         rootless,
                         using_gvisor,
                         &hc,
+                        &process_identity,
                         &cancel,
                     );
                 }))
@@ -1250,6 +1260,7 @@ mod tests {
                 dest: std::path::PathBuf::from("/etc/app/secret.txt"),
                 mode: 0o400,
             }],
+            &crate::container::ProcessIdentity::root(),
         )
         .unwrap();
 

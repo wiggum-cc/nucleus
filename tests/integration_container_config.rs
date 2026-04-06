@@ -406,6 +406,9 @@ mod tests {
             using_gvisor: false,
             rootless: false,
             cgroup_path: None,
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: Vec::new(),
         });
 
         // Uptime should be very small (just created)
@@ -428,6 +431,9 @@ mod tests {
             using_gvisor: true,
             rootless: false,
             cgroup_path: Some("/sys/fs/cgroup/nucleus-abc123".to_string()),
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: Vec::new(),
         });
 
         let json = serde_json::to_string(&state).unwrap();

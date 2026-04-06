@@ -22,6 +22,30 @@ let
         '';
       };
 
+      user = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          User name or numeric UID to run the workload as after Nucleus completes
+          namespace, mount, and cgroup setup.
+        '';
+      };
+
+      group = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          Group name or numeric GID to run the workload as after setup.
+          When omitted, Nucleus uses the primary group for a named user.
+        '';
+      };
+
+      supplementaryGroups = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = "Supplementary groups (names or numeric GIDs) for the workload process.";
+      };
+
       memory = mkOption {
         type = types.str;
         example = "512M";
@@ -230,14 +254,20 @@ let
               description = "Mode to use when createHostPath = true.";
             };
             user = mkOption {
-              type = types.str;
-              default = "root";
-              description = "Owner user to use when createHostPath = true.";
+              type = types.nullOr types.str;
+              default = null;
+              description = ''
+                Owner user to use when createHostPath = true.
+                Defaults to the container's `user`, or `root` when unset.
+              '';
             };
             group = mkOption {
-              type = types.str;
-              default = "root";
-              description = "Owner group to use when createHostPath = true.";
+              type = types.nullOr types.str;
+              default = null;
+              description = ''
+                Owner group to use when createHostPath = true.
+                Defaults to the container's `group`, or `root` when unset.
+              '';
             };
           };
         });
@@ -359,6 +389,9 @@ let
           "--rootfs" (e (toString containerCfg.rootfs))
           "--name" (e name)
         ]
+        ++ lib.optionals (containerCfg.user != null) [ "--user" (e containerCfg.user) ]
+        ++ lib.optionals (containerCfg.group != null) [ "--group" (e containerCfg.group) ]
+        ++ (lib.concatMap (g: [ "--additional-group" (e g) ]) containerCfg.supplementaryGroups)
         ++ lib.optionals (containerCfg.cpus != null) [ "--cpus" (e (toString containerCfg.cpus)) ]
         ++ optional (containerCfg.runtime == "gvisor") "--runtime gvisor"
         ++ optional (containerCfg.runtime == "gvisor") "--gvisor-platform"
@@ -511,7 +544,12 @@ in
     systemd.tmpfiles.rules = lib.concatMap
       (containerCfg:
         map
-          (v: "d ${v.source} ${v.directoryMode} ${v.user} ${v.group} -")
+          (v:
+            let
+              ownerUser = if v.user != null then v.user else if containerCfg.user != null then containerCfg.user else "root";
+              ownerGroup = if v.group != null then v.group else if containerCfg.group != null then containerCfg.group else "root";
+            in
+            "d ${v.source} ${v.directoryMode} ${ownerUser} ${ownerGroup} -")
           (lib.filter (v: v.createHostPath) containerCfg.volumes)
       )
       (lib.attrValues (lib.filterAttrs (_: c: c.enable) cfg.containers));

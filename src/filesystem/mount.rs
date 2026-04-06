@@ -940,6 +940,7 @@ pub fn mount_secrets(root: &Path, secrets: &[crate::container::SecretMount]) -> 
 pub fn mount_secrets_inmemory(
     root: &Path,
     secrets: &[crate::container::SecretMount],
+    identity: &crate::container::ProcessIdentity,
 ) -> Result<()> {
     if secrets.is_empty() {
         return Ok(());
@@ -970,8 +971,24 @@ pub fn mount_secrets_inmemory(
         )));
     }
 
+    if !identity.is_root() {
+        nix::unistd::chown(
+            &secrets_dir,
+            Some(nix::unistd::Uid::from_raw(identity.uid)),
+            Some(nix::unistd::Gid::from_raw(identity.gid)),
+        )
+        .map_err(|e| {
+            let _ = nix::mount::umount2(&secrets_dir, nix::mount::MntFlags::MNT_DETACH);
+            let _ = std::fs::remove_dir_all(&secrets_dir);
+            NucleusError::FilesystemError(format!(
+                "Failed to set /run/secrets owner to {}:{}: {}",
+                identity.uid, identity.gid, e
+            ))
+        })?;
+    }
+
     // Rollback: unmount tmpfs and remove dir if any secret fails
-    let result = mount_secrets_inmemory_inner(&secrets_dir, root, secrets);
+    let result = mount_secrets_inmemory_inner(&secrets_dir, root, secrets, identity);
     if let Err(ref e) = result {
         let _ = nix::mount::umount2(&secrets_dir, nix::mount::MntFlags::MNT_DETACH);
         let _ = std::fs::remove_dir_all(&secrets_dir);
@@ -989,6 +1006,7 @@ fn mount_secrets_inmemory_inner(
     secrets_dir: &Path,
     root: &Path,
     secrets: &[crate::container::SecretMount],
+    identity: &crate::container::ProcessIdentity,
 ) -> Result<()> {
     for secret in secrets {
         if !secret.source.exists() {
@@ -1032,6 +1050,20 @@ fn mount_secrets_inmemory_inner(
                 NucleusError::FilesystemError(format!(
                     "Failed to set permissions on secret {:?}: {}",
                     dest, e
+                ))
+            })?;
+        }
+
+        if !identity.is_root() {
+            nix::unistd::chown(
+                &dest,
+                Some(nix::unistd::Uid::from_raw(identity.uid)),
+                Some(nix::unistd::Gid::from_raw(identity.gid)),
+            )
+            .map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to set permissions owner on secret {:?} to {}:{}: {}",
+                    dest, identity.uid, identity.gid, e
                 ))
             })?;
         }

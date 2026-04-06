@@ -1473,6 +1473,21 @@ mod tests {
     }
 
     #[test]
+    fn test_oci_config_with_process_identity() {
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None).with_process_identity(
+            &crate::container::ProcessIdentity {
+                uid: 1001,
+                gid: 1002,
+                additional_gids: vec![1003, 1004],
+            },
+        );
+
+        assert_eq!(config.process.user.uid, 1001);
+        assert_eq!(config.process.user.gid, 1002);
+        assert_eq!(config.process.user.additional_gids, Some(vec![1003, 1004]));
+    }
+
+    #[test]
     fn test_oci_config_uses_hardcoded_path_not_host() {
         // C-3: PATH must be a hardcoded minimal value, never the host's PATH.
         // This prevents leaking host filesystem layout into the container.
