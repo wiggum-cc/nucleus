@@ -891,6 +891,18 @@ impl OciConfig {
         self
     }
 
+    /// Set the process identity for the OCI workload.
+    pub fn with_process_identity(mut self, identity: &crate::container::ProcessIdentity) -> Self {
+        self.process.user.uid = identity.uid;
+        self.process.user.gid = identity.gid;
+        self.process.user.additional_gids = if identity.additional_gids.is_empty() {
+            None
+        } else {
+            Some(identity.additional_gids.clone())
+        };
+        self
+    }
+
     /// Add a read-only bind mount of an in-memory secret staging directory at
     /// `/run/secrets`, plus compatibility bind mounts for each staged secret to
     /// its requested container destination.

@@ -118,6 +118,39 @@ pub struct SecretMount {
     pub mode: u32,
 }
 
+/// Runtime identity for the workload process inside the container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    /// Primary user ID for the workload process.
+    pub uid: u32,
+    /// Primary group ID for the workload process.
+    pub gid: u32,
+    /// Supplementary group IDs for the workload process.
+    pub additional_gids: Vec<u32>,
+}
+
+impl ProcessIdentity {
+    /// Root identity (the historical default).
+    pub fn root() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            additional_gids: Vec::new(),
+        }
+    }
+
+    /// Returns true when the workload keeps the default root identity.
+    pub fn is_root(&self) -> bool {
+        self.uid == 0 && self.gid == 0 && self.additional_gids.is_empty()
+    }
+}
+
+impl Default for ProcessIdentity {
+    fn default() -> Self {
+        Self::root()
+    }
+}
+
 /// Source backing for a volume mount.
 #[derive(Debug, Clone)]
 pub enum VolumeSource {
@@ -224,6 +257,9 @@ pub struct ContainerConfig {
 
     /// Environment variables to pass to the container process.
     pub environment: Vec<(String, String)>,
+
+    /// Runtime uid/gid and supplementary groups for the workload process.
+    pub process_identity: ProcessIdentity,
 
     /// Desired topology config hash for reconciliation change detection.
     pub config_hash: Option<u64>,
@@ -337,6 +373,7 @@ impl ContainerConfig {
             secrets: Vec::new(),
             volumes: Vec::new(),
             environment: Vec::new(),
+            process_identity: ProcessIdentity::default(),
             config_hash: None,
             sd_notify: false,
             required_kernel_lockdown: None,
@@ -499,6 +536,12 @@ impl ContainerConfig {
     #[must_use]
     pub fn with_env(mut self, key: String, value: String) -> Self {
         self.environment.push((key, value));
+        self
+    }
+
+    #[must_use]
+    pub fn with_process_identity(mut self, identity: ProcessIdentity) -> Self {
+        self.process_identity = identity;
         self
     }
 
@@ -696,6 +739,40 @@ impl ContainerConfig {
 
     /// Validate runtime-specific feature support.
     pub fn validate_runtime_support(&self) -> crate::error::Result<()> {
+        if let Some(user_ns_config) = &self.user_ns_config {
+            if !self.process_identity.additional_gids.is_empty() {
+                return Err(crate::error::NucleusError::ConfigError(
+                    "Supplementary groups are unsupported with user namespaces because \
+                     /proc/self/setgroups is denied"
+                        .to_string(),
+                ));
+            }
+
+            let uid_mapped = user_ns_config.uid_mappings.iter().any(|mapping| {
+                self.process_identity.uid >= mapping.container_id
+                    && self.process_identity.uid
+                        < mapping.container_id.saturating_add(mapping.count)
+            });
+            if !uid_mapped {
+                return Err(crate::error::NucleusError::ConfigError(format!(
+                    "Process uid {} is not mapped in the configured user namespace",
+                    self.process_identity.uid
+                )));
+            }
+
+            let gid_mapped = user_ns_config.gid_mappings.iter().any(|mapping| {
+                self.process_identity.gid >= mapping.container_id
+                    && self.process_identity.gid
+                        < mapping.container_id.saturating_add(mapping.count)
+            });
+            if !gid_mapped {
+                return Err(crate::error::NucleusError::ConfigError(format!(
+                    "Process gid {} is not mapped in the configured user namespace",
+                    self.process_identity.gid
+                )));
+            }
+        }
+
         if self.seccomp_mode == SeccompMode::Trace && self.seccomp_trace_log.is_none() {
             return Err(crate::error::NucleusError::ConfigError(
                 "Seccomp trace mode requires --seccomp-log / seccomp_trace_log".to_string(),

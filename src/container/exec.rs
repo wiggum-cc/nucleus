@@ -1,15 +1,60 @@
 use crate::audit::{audit, AuditEventType};
+use crate::container::ProcessIdentity;
 use crate::error::{NucleusError, Result};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
 use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::{fork, ForkResult, Pid};
+use nix::unistd::{fork, setgid, setgroups, setuid, ForkResult, Gid, Pid, Uid};
 use std::ffi::CString;
 use tracing::{debug, error, info};
 
 use super::runtime::Container;
 
 impl Container {
+    pub(crate) fn apply_process_identity_to_current_process(
+        identity: &ProcessIdentity,
+        inside_user_namespace: bool,
+    ) -> Result<()> {
+        if identity.is_root() {
+            return Ok(());
+        }
+
+        if !inside_user_namespace {
+            let groups: Vec<Gid> = identity
+                .additional_gids
+                .iter()
+                .copied()
+                .map(Gid::from_raw)
+                .collect();
+            setgroups(&groups).map_err(|e| {
+                NucleusError::ExecError(format!(
+                    "Failed to set supplementary groups to {:?}: {}",
+                    identity.additional_gids, e
+                ))
+            })?;
+        }
+
+        setgid(Gid::from_raw(identity.gid)).map_err(|e| {
+            NucleusError::ExecError(format!(
+                "Failed to switch to gid {}: {}",
+                identity.gid, e
+            ))
+        })?;
+        setuid(Uid::from_raw(identity.uid)).map_err(|e| {
+            NucleusError::ExecError(format!(
+                "Failed to switch to uid {}: {}",
+                identity.uid, e
+            ))
+        })?;
+
+        info!(
+            "Applied workload identity uid={} gid={} supplementary_gids={:?}",
+            identity.uid, identity.gid, identity.additional_gids
+        );
+
+        Ok(())
+    }
+
     /// Execute the target command.
     ///
     /// This runs in the child process after fork, after all security setup is complete.
@@ -19,6 +64,11 @@ impl Container {
         }
 
         info!("Executing command: {:?}", self.config.command);
+
+        Self::apply_process_identity_to_current_process(
+            &self.config.process_identity,
+            self.config.user_ns_config.is_some(),
+        )?;
 
         let program = CString::new(self.config.command[0].as_str())
             .map_err(|e| NucleusError::ExecError(format!("Invalid program name: {}", e)))?;
@@ -86,6 +136,11 @@ impl Container {
             AuditEventType::InitSupervisorStarted,
             "PID 1 init supervisor for zombie reaping and signal forwarding",
         );
+
+        Self::apply_process_identity_to_current_process(
+            &self.config.process_identity,
+            self.config.user_ns_config.is_some(),
+        )?;
 
         match unsafe { fork() }? {
             ForkResult::Parent { child } => {

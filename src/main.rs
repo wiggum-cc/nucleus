@@ -62,6 +62,73 @@ fn resolve_systemd_credential_source(name: &str) -> Result<PathBuf> {
     Ok(source)
 }
 
+fn resolve_uid_spec(spec: &str) -> Result<(u32, Option<u32>)> {
+    if let Ok(uid) = spec.parse::<u32>() {
+        return Ok((uid, None));
+    }
+
+    let user = nix::unistd::User::from_name(spec)
+        .map_err(|e| {
+            NucleusError::ConfigError(format!("Failed to resolve user '{}': {}", spec, e))
+        })?
+        .ok_or_else(|| NucleusError::ConfigError(format!("Unknown user '{}'", spec)))?;
+
+    Ok((user.uid.as_raw(), Some(user.gid.as_raw())))
+}
+
+fn resolve_gid_spec(spec: &str) -> Result<u32> {
+    if let Ok(gid) = spec.parse::<u32>() {
+        return Ok(gid);
+    }
+
+    let group = nix::unistd::Group::from_name(spec)
+        .map_err(|e| {
+            NucleusError::ConfigError(format!("Failed to resolve group '{}': {}", spec, e))
+        })?
+        .ok_or_else(|| NucleusError::ConfigError(format!("Unknown group '{}'", spec)))?;
+
+    Ok(group.gid.as_raw())
+}
+
+fn resolve_process_identity(
+    user: Option<&str>,
+    group: Option<&str>,
+    additional_groups: &[String],
+) -> Result<Option<ProcessIdentity>> {
+    if user.is_none() && group.is_none() && additional_groups.is_empty() {
+        return Ok(None);
+    }
+
+    let user = user.ok_or_else(|| {
+        NucleusError::ConfigError(
+            "--group/--additional-group require --user to be set as well".to_string(),
+        )
+    })?;
+    let (uid, default_gid) = resolve_uid_spec(user)?;
+    let gid = match group {
+        Some(group) => resolve_gid_spec(group)?,
+        None => default_gid.ok_or_else(|| {
+            NucleusError::ConfigError(
+                "Numeric --user values require an explicit --group".to_string(),
+            )
+        })?,
+    };
+
+    let mut resolved_additional_gids = Vec::new();
+    for group in additional_groups {
+        let resolved = resolve_gid_spec(group)?;
+        if resolved != gid && !resolved_additional_gids.contains(&resolved) {
+            resolved_additional_gids.push(resolved);
+        }
+    }
+
+    Ok(Some(ProcessIdentity {
+        uid,
+        gid,
+        additional_gids: resolved_additional_gids,
+    }))
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "nucleus")]
 #[command(about = "Extremely lightweight Docker alternative for agents", long_about = None)]
@@ -134,6 +201,18 @@ enum Commands {
         /// Run in rootless mode with user namespace
         #[arg(long)]
         rootless: bool,
+
+        /// User name or numeric UID to run the workload as after setup
+        #[arg(long)]
+        user: Option<String>,
+
+        /// Group name or numeric GID to run the workload as after setup
+        #[arg(long)]
+        group: Option<String>,
+
+        /// Supplementary group name or numeric GID (repeatable)
+        #[arg(long = "additional-group")]
+        additional_groups: Vec<String>,
 
         /// Path to OCI bundle directory (requires gVisor). Replaces --oci flag.
         #[arg(long)]
@@ -742,6 +821,9 @@ fn main() -> Result<()> {
             runtime,
             quiet_id,
             rootless,
+            user,
+            group,
+            additional_groups,
             bundle,
             pid_file,
             console_socket,
@@ -929,6 +1011,16 @@ fn main() -> Result<()> {
             if rootless {
                 info!("Enabling rootless mode");
                 config = config.with_rootless();
+            }
+
+            if let Some(identity) =
+                resolve_process_identity(user.as_deref(), group.as_deref(), &additional_groups)?
+            {
+                info!(
+                    "Running workload as uid={} gid={} supplementary_gids={:?}",
+                    identity.uid, identity.gid, identity.additional_gids
+                );
+                config = config.with_process_identity(identity);
             }
 
             // Rootfs path

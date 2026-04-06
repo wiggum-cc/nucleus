@@ -419,6 +419,8 @@ let
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
 
+      path = lib.optionals (containerCfg.runtime == "gvisor") [ pkgs.gvisor ];
+
       serviceConfig = {
         Type = if containerCfg.sdNotify then "notify" else "simple";
         ExecStart = "${cfg.package}/bin/nucleus run ${nucleusArgs} -- ${commandStr}";
