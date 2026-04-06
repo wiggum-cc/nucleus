@@ -3,8 +3,8 @@ use nucleus::checkpoint::CriuRuntime;
 use nucleus::container::{
     parse_signal, validate_container_name, validate_hostname, Container, ContainerConfig,
     ContainerLifecycle, ContainerState, ContainerStateManager, ContainerStateParams, HealthCheck,
-    KernelLockdownMode, OciStatus, ProcessIdentity, ReadinessProbe, SeccompMode, SecretMount,
-    ServiceMode, TrustLevel, VolumeMount, VolumeSource,
+    KernelLockdownMode, NetworkModeArg, OciStatus, ProcessIdentity, ReadinessProbe,
+    RuntimeSelection, SeccompMode, SecretMount, ServiceMode, TrustLevel, VolumeMount, VolumeSource,
 };
 use nucleus::error::{NucleusError, Result};
 use nucleus::filesystem::ContextMode;
@@ -192,7 +192,7 @@ enum Commands {
 
         /// Container runtime: gvisor or native
         #[arg(long, default_value = "gvisor")]
-        runtime: String, // Cannot use ValueEnum: gvisor triggers extra logic
+        runtime: RuntimeSelection,
 
         /// Internal: suppress printing the container ID before execution
         #[arg(long, hide = true)]
@@ -228,7 +228,7 @@ enum Commands {
 
         /// Network mode: none, host, or bridge (default: none)
         #[arg(long, default_value = "none")]
-        network: String,
+        network: NetworkModeArg,
 
         /// Explicitly allow host network mode (dangerous: weakens isolation)
         #[arg(long)]
@@ -925,11 +925,10 @@ fn main() -> Result<()> {
                 info!("Swap enabled");
             }
 
-            // Parse network mode (can't use ValueEnum due to Bridge(BridgeConfig) variant)
-            let net_mode = match network.as_str() {
-                "none" => NetworkMode::None,
-                "host" => NetworkMode::Host,
-                "bridge" => {
+            let net_mode = match network {
+                NetworkModeArg::None => NetworkMode::None,
+                NetworkModeArg::Host => NetworkMode::Host,
+                NetworkModeArg::Bridge => {
                     // Production mode requires explicit DNS to avoid silent empty resolv.conf
                     if service_mode == ServiceMode::Production && dns.is_empty() {
                         return Err(NucleusError::ConfigError(
@@ -947,12 +946,6 @@ fn main() -> Result<()> {
                         bridge_config.port_forwards.push(pf);
                     }
                     NetworkMode::Bridge(bridge_config)
-                }
-                other => {
-                    return Err(NucleusError::ConfigError(format!(
-                        "Unknown network mode: {}. Use none, host, or bridge.",
-                        other
-                    )));
                 }
             };
 
@@ -999,7 +992,7 @@ fn main() -> Result<()> {
                 config = config.with_hostname(Some(host));
             }
 
-            config = config.apply_runtime_selection(&runtime, bundle.is_some())?;
+            config = config.apply_runtime_selection(runtime, bundle.is_some())?;
 
             // OCI bundle directory override
             if let Some(ref bundle_dir) = bundle {
@@ -1184,17 +1177,29 @@ fn main() -> Result<()> {
                 });
             }
 
-            // Tmpfs volumes
+            // Tmpfs volumes — format: DEST[:SIZE][:ro|rw]
+            // SIZE must match a numeric-with-suffix pattern (e.g. "64M", "1G", "512k").
             for spec in &tmpfs {
                 let parts: Vec<&str> = spec.split(':').collect();
+                let is_mode = |s: &str| s == "ro" || s == "rw";
+                let is_size = |s: &str| {
+                    s.trim_end_matches(|c: char| c.is_ascii_alphabetic())
+                        .parse::<u64>()
+                        .is_ok()
+                };
                 let (dest, size, read_only) = match parts.as_slice() {
                     [dest] => (*dest, None, false),
-                    [dest, mode] if *mode == "ro" => (*dest, None, true),
-                    [dest, mode] if *mode == "rw" => (*dest, None, false),
-                    [dest, size] => (*dest, Some((*size).to_string()), false),
-                    [dest, size, mode] if *mode == "ro" => (*dest, Some((*size).to_string()), true),
-                    [dest, size, mode] if *mode == "rw" => {
-                        (*dest, Some((*size).to_string()), false)
+                    [dest, flag] if is_mode(flag) => (*dest, None, *flag == "ro"),
+                    [dest, sz] if is_size(sz) => (*dest, Some((*sz).to_string()), false),
+                    [dest, sz, flag] if is_size(sz) && is_mode(flag) => {
+                        (*dest, Some((*sz).to_string()), *flag == "ro")
+                    }
+                    [_dest, bad] => {
+                        return Err(NucleusError::ConfigError(format!(
+                            "Invalid tmpfs second field '{}' in '{}': \
+                             expected a size (e.g. 64M) or mode (ro|rw)",
+                            bad, spec
+                        )));
                     }
                     _ => {
                         return Err(NucleusError::ConfigError(format!(
@@ -1217,8 +1222,29 @@ fn main() -> Result<()> {
             }
 
             // Environment variables
+            const DANGEROUS_ENV_VARS: &[&str] = &[
+                "LD_PRELOAD",
+                "LD_LIBRARY_PATH",
+                "LD_AUDIT",
+                "LD_DEBUG",
+                "LD_PROFILE",
+            ];
             for spec in &env_vars {
                 if let Some((key, value)) = spec.split_once('=') {
+                    if DANGEROUS_ENV_VARS.contains(&key) {
+                        if service_mode == ServiceMode::Production {
+                            return Err(NucleusError::ConfigError(format!(
+                                "Environment variable '{}' is blocked in production mode \
+                                 (dynamic linker injection risk)",
+                                key
+                            )));
+                        }
+                        tracing::warn!(
+                            "Passing dynamic-linker variable '{}' into container \
+                             (injection risk if workload uses shell scripts)",
+                            key
+                        );
+                    }
                     config = config.with_env(key.to_string(), value.to_string());
                 } else {
                     return Err(NucleusError::ConfigError(format!(
@@ -1407,9 +1433,10 @@ mod tests {
 
     #[test]
     fn test_native_runtime_disables_gvisor() {
-        #[allow(deprecated)]
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
-        let config = config.apply_runtime_selection("native", false).unwrap();
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap();
+        let config = config
+            .apply_runtime_selection(RuntimeSelection::Native, false)
+            .unwrap();
         assert!(
             !config.use_gvisor,
             "native runtime selection must disable gVisor"
@@ -1423,9 +1450,10 @@ mod tests {
 
     #[test]
     fn test_native_runtime_rejects_bundle_flag() {
-        #[allow(deprecated)]
-        let config = ContainerConfig::new(None, vec!["/bin/sh".to_string()]);
-        let err = config.apply_runtime_selection("native", true).unwrap_err();
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap();
+        let err = config
+            .apply_runtime_selection(RuntimeSelection::Native, true)
+            .unwrap_err();
         assert!(
             err.to_string().contains("requires gVisor"),
             "native runtime with --bundle must be rejected explicitly"

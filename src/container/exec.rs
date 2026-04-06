@@ -165,8 +165,14 @@ impl Container {
                 );
                 let sig_stop_clone = sig_stop.clone();
                 let sig_thread = std::thread::spawn(move || {
-                    while !sig_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    loop {
                         if let Ok(signal) = sigset.wait() {
+                            // Check the stop flag *after* waking so that the
+                            // wake-up signal is not forwarded to the child
+                            // during shutdown.
+                            if sig_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
                             let _ = kill(child_pid, signal);
                         }
                     }

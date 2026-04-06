@@ -114,9 +114,12 @@ pub fn normalize_container_destination(dest: &Path) -> Result<PathBuf> {
 /// Resolve a validated container destination under a host-side root directory.
 pub fn resolve_container_destination(root: &Path, dest: &Path) -> Result<PathBuf> {
     let normalized = normalize_container_destination(dest)?;
-    let relative = normalized
-        .strip_prefix("/")
-        .expect("normalized container destination is always absolute");
+    let relative = normalized.strip_prefix("/").map_err(|_| {
+        NucleusError::ConfigError(format!(
+            "Container destination is not absolute after normalization: {:?}",
+            normalized
+        ))
+    })?;
     Ok(root.join(relative))
 }
 

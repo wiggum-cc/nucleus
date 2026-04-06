@@ -167,6 +167,43 @@ impl CapabilityManager {
     pub fn is_dropped(&self) -> bool {
         self.dropped
     }
+
+    /// Verify that namespace-creating capabilities are actually absent from
+    /// the effective set. This is a runtime guard for the clone3 seccomp
+    /// invariant: clone3 cannot be argument-filtered at the BPF level, so
+    /// we rely on CAP_SYS_ADMIN (et al.) being dropped to prevent namespace
+    /// creation. If the check fails in production mode, it returns an error;
+    /// otherwise it emits a warning.
+    pub fn verify_no_namespace_caps(production: bool) -> Result<()> {
+        use caps::Capability;
+        let ns_caps = [
+            Capability::CAP_SYS_ADMIN,
+            Capability::CAP_NET_ADMIN,
+            Capability::CAP_SYS_PTRACE,
+        ];
+        let effective = caps::read(None, CapSet::Effective).map_err(|e| {
+            NucleusError::CapabilityError(format!("Failed to read effective caps: {}", e))
+        })?;
+        let mut leaked = Vec::new();
+        for cap in &ns_caps {
+            if effective.contains(cap) {
+                leaked.push(format!("{:?}", cap));
+            }
+        }
+        if !leaked.is_empty() {
+            let msg = format!(
+                "SEC-CLONE3: namespace-creating capabilities still present after drop: [{}]. \
+                 clone3 syscall is allowed without argument filtering — these caps \
+                 must be absent to prevent namespace escape.",
+                leaked.join(", ")
+            );
+            if production {
+                return Err(NucleusError::CapabilityError(msg));
+            }
+            tracing::warn!("{}", msg);
+        }
+        Ok(())
+    }
 }
 
 impl Default for CapabilityManager {

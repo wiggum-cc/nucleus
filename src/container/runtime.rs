@@ -702,6 +702,13 @@ impl Container {
             }
         }
 
+        // 12c. Verify that namespace-creating capabilities are truly gone before
+        // installing seccomp. clone3 is allowed without argument filtering, so this
+        // is the sole guard against namespace escape via clone3.
+        CapabilityManager::verify_no_namespace_caps(
+            self.config.service_mode == ServiceMode::Production,
+        )?;
+
         // 13. Apply seccomp filter (trace, profile-from-file, or built-in allowlist)
         // Security: CapabilitiesDropped -> SeccompApplied
         use crate::container::config::SeccompMode;
@@ -868,8 +875,14 @@ impl Container {
             .name("sig-forward".to_string())
             .spawn(move || {
                 // The thread owns unblock_set and uses it for sigwait.
-                while !stop_clone.load(Ordering::Relaxed) {
+                loop {
                     if let Ok(signal) = unblock_set.wait() {
+                        // Check the stop flag *after* waking so that the
+                        // wake-up signal (SIGUSR1) is not forwarded to the
+                        // child during shutdown.
+                        if stop_clone.load(Ordering::Relaxed) {
+                            break;
+                        }
                         let _ = kill(child, signal);
                     }
                 }
