@@ -160,9 +160,15 @@ impl Container {
 
                 // Spawn a thread to forward signals to the child
                 let child_pid = child;
+                let sig_stop = std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                );
+                let sig_stop_clone = sig_stop.clone();
                 let sig_thread = std::thread::spawn(move || {
-                    while let Ok(signal) = sigset.wait() {
-                        let _ = kill(child_pid, signal);
+                    while !sig_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Ok(signal) = sigset.wait() {
+                            let _ = kill(child_pid, signal);
+                        }
                     }
                 });
 
@@ -201,9 +207,11 @@ impl Container {
                     }
                 };
 
-                // Drop the signal-forwarding thread cleanly before exiting.
-                // It will unblock once there are no more signals to wait on.
-                drop(sig_thread);
+                // Stop the signal-forwarding thread before exiting.
+                sig_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                // Send ourselves a blocked signal to unblock the sigwait() call.
+                let _ = kill(Pid::this(), Signal::SIGUSR1);
+                let _ = sig_thread.join();
                 std::process::exit(workload_exit);
             }
             ForkResult::Child => {

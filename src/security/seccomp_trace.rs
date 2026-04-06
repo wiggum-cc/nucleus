@@ -82,6 +82,15 @@ impl SeccompTraceReader {
     }
 }
 
+impl Drop for SeccompTraceReader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Main recording loop — reads /dev/kmsg and extracts SECCOMP records.
 fn record_loop(pid: u32, output_path: &Path, stop: &AtomicBool) -> Result<()> {
     let mut syscalls: BTreeMap<i64, u64> = BTreeMap::new();

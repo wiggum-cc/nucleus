@@ -399,6 +399,46 @@ impl BridgeNetwork {
         Ok(())
     }
 
+    /// Best-effort cleanup for use in Drop. Performs the same teardown as
+    /// `cleanup()` but ignores all errors and skips the state transition
+    /// (which requires ownership).
+    fn cleanup_best_effort(&mut self) {
+        if self.state == NetworkState::Cleaned {
+            return;
+        }
+
+        Self::release_allocated_ip(&self.container_id);
+
+        for pf in &self.config.port_forwards {
+            let _ = self.cleanup_port_forward(pf);
+        }
+
+        let _ = Self::run_cmd(
+            "iptables",
+            &[
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-s",
+                &self.config.subnet,
+                "-j",
+                "MASQUERADE",
+            ],
+        );
+
+        let _ = Self::run_cmd("ip", &["link", "del", &self.veth_host]);
+
+        if let Some(ref prev) = self.prev_ip_forward {
+            if prev == "0" {
+                let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", "0");
+            }
+        }
+
+        self.state = NetworkState::Cleaned;
+        debug!("Bridge network cleaned up (best-effort via drop)");
+    }
+
     /// Detect and remove orphaned iptables rules from previous Nucleus runs.
     ///
     /// Checks for stale MASQUERADE rules referencing the nucleus subnet that
@@ -905,6 +945,12 @@ impl BridgeNetwork {
 
         info!("Bind-mounted resolv.conf for bridge networking (rootfs mode, staging)");
         Ok(())
+    }
+}
+
+impl Drop for BridgeNetwork {
+    fn drop(&mut self) {
+        self.cleanup_best_effort();
     }
 }
 

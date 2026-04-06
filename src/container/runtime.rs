@@ -24,6 +24,9 @@ use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, pipe, read, write, ForkResult, Pid};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 use tempfile::Builder;
 use tracing::{debug, error, info, info_span, warn};
 
@@ -251,95 +254,115 @@ impl Container {
                 drop(ready_write);
                 info!("Forked child process: {}", child);
 
-                let target_pid = Self::wait_for_namespace_ready(&ready_read, child)?;
+                // Use a closure so that on any error we kill the child process
+                // instead of leaving it orphaned and blocked on the exec FIFO.
+                let parent_setup = || -> Result<CreatedContainer> {
+                    let target_pid = Self::wait_for_namespace_ready(&ready_read, child)?;
 
-                let cgroup_path = cgroup_opt
-                    .as_ref()
-                    .map(|_| format!("/sys/fs/cgroup/{}", cgroup_name));
-                let cpu_millicores = config
-                    .limits
-                    .cpu_quota_us
-                    .map(|quota| (quota * 1000) / config.limits.cpu_period_us);
-                let mut state = ContainerState::new(ContainerStateParams {
-                    id: config.id.clone(),
-                    name: config.name.clone(),
-                    pid: target_pid,
-                    command: config.command.clone(),
-                    memory_limit: config.limits.memory_bytes,
-                    cpu_limit: cpu_millicores,
-                    using_gvisor: config.use_gvisor,
-                    rootless: config.user_ns_config.is_some(),
-                    cgroup_path,
-                    process_uid: config.process_identity.uid,
-                    process_gid: config.process_identity.gid,
-                    additional_gids: config.process_identity.additional_gids.clone(),
-                });
-                state.config_hash = config.config_hash;
-                state.bundle_path = config.rootfs_path.as_ref().map(|p| p.display().to_string());
+                    let cgroup_path = cgroup_opt
+                        .as_ref()
+                        .map(|_| format!("/sys/fs/cgroup/{}", cgroup_name));
+                    let cpu_millicores = config
+                        .limits
+                        .cpu_quota_us
+                        .map(|quota| (quota * 1000) / config.limits.cpu_period_us);
+                    let mut state = ContainerState::new(ContainerStateParams {
+                        id: config.id.clone(),
+                        name: config.name.clone(),
+                        pid: target_pid,
+                        command: config.command.clone(),
+                        memory_limit: config.limits.memory_bytes,
+                        cpu_limit: cpu_millicores,
+                        using_gvisor: config.use_gvisor,
+                        rootless: config.user_ns_config.is_some(),
+                        cgroup_path,
+                        process_uid: config.process_identity.uid,
+                        process_gid: config.process_identity.gid,
+                        additional_gids: config.process_identity.additional_gids.clone(),
+                    });
+                    state.config_hash = config.config_hash;
+                    state.bundle_path =
+                        config.rootfs_path.as_ref().map(|p| p.display().to_string());
 
-                let mut bridge_net: Option<BridgeNetwork> = None;
-                let trace_reader = Self::maybe_start_seccomp_trace_reader(&config, target_pid)?;
+                    let mut bridge_net: Option<BridgeNetwork> = None;
+                    let trace_reader =
+                        Self::maybe_start_seccomp_trace_reader(&config, target_pid)?;
 
-                // Transition: Creating -> Created
-                state.status = OciStatus::Created;
-                state_mgr.save_state(&state)?;
+                    // Transition: Creating -> Created
+                    state.status = OciStatus::Created;
+                    state_mgr.save_state(&state)?;
 
-                // Write PID file (OCI --pid-file)
-                if let Some(ref pid_path) = config.pid_file {
-                    std::fs::write(pid_path, target_pid.to_string()).map_err(|e| {
-                        NucleusError::ConfigError(format!(
-                            "Failed to write pid-file '{}': {}",
-                            pid_path.display(),
-                            e
-                        ))
-                    })?;
-                    info!("Wrote PID {} to {}", target_pid, pid_path.display());
-                }
+                    // Write PID file (OCI --pid-file)
+                    if let Some(ref pid_path) = config.pid_file {
+                        std::fs::write(pid_path, target_pid.to_string()).map_err(|e| {
+                            NucleusError::ConfigError(format!(
+                                "Failed to write pid-file '{}': {}",
+                                pid_path.display(),
+                                e
+                            ))
+                        })?;
+                        info!("Wrote PID {} to {}", target_pid, pid_path.display());
+                    }
 
-                if let Some(ref mut cgroup) = cgroup_opt {
-                    cgroup.attach_process(target_pid)?;
-                }
+                    if let Some(ref mut cgroup) = cgroup_opt {
+                        cgroup.attach_process(target_pid)?;
+                    }
 
-                if let NetworkMode::Bridge(ref bridge_config) = config.network {
-                    match BridgeNetwork::setup_with_id(target_pid, bridge_config, &config.id) {
-                        Ok(net) => {
-                            if let Some(ref egress) = config.egress_policy {
-                                if let Err(e) = net.apply_egress_policy(target_pid, egress) {
-                                    if config.service_mode == ServiceMode::Production {
-                                        return Err(NucleusError::NetworkError(format!(
-                                            "Failed to apply egress policy: {}",
-                                            e
-                                        )));
+                    if let NetworkMode::Bridge(ref bridge_config) = config.network {
+                        match BridgeNetwork::setup_with_id(
+                            target_pid,
+                            bridge_config,
+                            &config.id,
+                        ) {
+                            Ok(net) => {
+                                if let Some(ref egress) = config.egress_policy {
+                                    if let Err(e) =
+                                        net.apply_egress_policy(target_pid, egress)
+                                    {
+                                        if config.service_mode == ServiceMode::Production {
+                                            return Err(NucleusError::NetworkError(format!(
+                                                "Failed to apply egress policy: {}",
+                                                e
+                                            )));
+                                        }
+                                        warn!("Failed to apply egress policy: {}", e);
                                     }
-                                    warn!("Failed to apply egress policy: {}", e);
                                 }
+                                bridge_net = Some(net);
                             }
-                            bridge_net = Some(net);
-                        }
-                        Err(e) => {
-                            if config.service_mode == ServiceMode::Production {
-                                return Err(e);
+                            Err(e) => {
+                                if config.service_mode == ServiceMode::Production {
+                                    return Err(e);
+                                }
+                                warn!("Failed to set up bridge networking: {}", e);
                             }
-                            warn!("Failed to set up bridge networking: {}", e);
                         }
                     }
-                }
 
-                info!(
-                    "Container {} created (child pid {}), waiting for start",
-                    config.id, target_pid
-                );
+                    info!(
+                        "Container {} created (child pid {}), waiting for start",
+                        config.id, target_pid
+                    );
 
-                Ok(CreatedContainer {
-                    config,
-                    state_mgr,
-                    state,
-                    child,
-                    cgroup_opt,
-                    bridge_net,
-                    trace_reader,
-                    exec_fifo_path: exec_fifo,
-                    _lifecycle_span: lifecycle_span.clone(),
+                    Ok(CreatedContainer {
+                        config,
+                        state_mgr,
+                        state,
+                        child,
+                        cgroup_opt,
+                        bridge_net,
+                        trace_reader,
+                        exec_fifo_path: exec_fifo,
+                        _lifecycle_span: lifecycle_span.clone(),
+                    })
+                };
+
+                parent_setup().map_err(|e| {
+                    // Kill the child so it doesn't remain orphaned and blocked
+                    // on the exec FIFO.
+                    let _ = kill(child, Signal::SIGKILL);
+                    let _ = waitpid(child, None);
+                    e
                 })
             }
             ForkResult::Child => {
@@ -816,7 +839,12 @@ impl Container {
     }
 
     /// Forward selected signals to child process using sigwait (no async signal handlers).
-    pub(super) fn setup_signal_forwarding_static(child: Pid) -> Result<()> {
+    ///
+    /// Returns a stop flag and join handle. Set the flag to `true` and join
+    /// the handle to cleanly shut down the forwarding thread.
+    pub(super) fn setup_signal_forwarding_static(
+        child: Pid,
+    ) -> Result<(Arc<AtomicBool>, JoinHandle<()>)> {
         let mut set = SigSet::empty();
         for signal in [
             Signal::SIGTERM,
@@ -829,18 +857,43 @@ impl Container {
             set.add(signal);
         }
 
-        pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&set), None).map_err(|e| {
+        let unblock_set = set;
+        pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&unblock_set), None).map_err(|e| {
             NucleusError::ExecError(format!("Failed to block forwarded signals: {}", e))
         })?;
 
-        std::thread::spawn(move || {
-            while let Ok(signal) = set.wait() {
-                let _ = kill(child, signal);
-            }
-        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let handle = std::thread::Builder::new()
+            .name("sig-forward".to_string())
+            .spawn(move || {
+                // The thread owns unblock_set and uses it for sigwait.
+                while !stop_clone.load(Ordering::Relaxed) {
+                    if let Ok(signal) = unblock_set.wait() {
+                        let _ = kill(child, signal);
+                    }
+                }
+            })
+            .map_err(|e| {
+                // Restore the signal mask so the caller isn't left with
+                // signals permanently blocked.
+                let mut restore = SigSet::empty();
+                for signal in [
+                    Signal::SIGTERM,
+                    Signal::SIGINT,
+                    Signal::SIGHUP,
+                    Signal::SIGQUIT,
+                    Signal::SIGUSR1,
+                    Signal::SIGUSR2,
+                ] {
+                    restore.add(signal);
+                }
+                let _ = pthread_sigmask(SigmaskHow::SIG_UNBLOCK, Some(&restore), None);
+                NucleusError::ExecError(format!("Failed to spawn signal thread: {}", e))
+            })?;
 
         info!("Signal forwarding configured");
-        Ok(())
+        Ok((stop, handle))
     }
 
     /// Wait for child process to exit
@@ -959,7 +1012,14 @@ impl CreatedContainer {
         let target_pid = self.state.pid;
         let child = self.child;
 
-        Container::setup_signal_forwarding_static(Pid::from_raw(target_pid as i32))?;
+        let (sig_stop, sig_handle) =
+            Container::setup_signal_forwarding_static(Pid::from_raw(target_pid as i32))?;
+
+        // Guard ensures signal thread is stopped on any exit path (including early ? returns).
+        let mut sig_guard = SignalThreadGuard {
+            stop: Some(sig_stop),
+            handle: Some(sig_handle),
+        };
 
         // Run readiness probe before declaring service ready
         if let Some(ref probe) = config.readiness_probe {
@@ -980,7 +1040,7 @@ impl CreatedContainer {
         }
 
         // Start health check thread if configured
-        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_flag = Arc::new(AtomicBool::new(false));
         let health_handle = if let Some(ref hc) = config.health_check {
             if !hc.command.is_empty() {
                 let hc = hc.clone();
@@ -1006,6 +1066,12 @@ impl CreatedContainer {
             }
         } else {
             None
+        };
+
+        // Guard ensures health check thread is cancelled on any exit path.
+        let mut health_guard = HealthThreadGuard {
+            cancel: Some(cancel_flag),
+            handle: health_handle,
         };
 
         // Run poststart hooks (after user process started, in parent)
@@ -1034,13 +1100,10 @@ impl CreatedContainer {
             Ok(exit_code)
         })();
 
-        // Cancel health check thread immediately regardless of run_result.
-        // This ensures the health thread stops even if readiness_probe or
-        // wait_for_child_static fails, preventing nsenter calls into a dead container.
-        cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(handle) = health_handle {
-            let _ = handle.join();
-        }
+        // Explicitly stop threads (guards would do this on drop too, but
+        // explicit teardown keeps ordering visible).
+        health_guard.stop();
+        sig_guard.stop();
 
         // Run poststop hooks (best-effort)
         if let Some(ref hooks) = config.hooks {
@@ -1114,6 +1177,54 @@ impl CreatedContainer {
                 Err(e)
             }
         }
+    }
+}
+
+/// RAII guard that stops the signal-forwarding thread on drop.
+struct SignalThreadGuard {
+    stop: Option<Arc<AtomicBool>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl SignalThreadGuard {
+    fn stop(&mut self) {
+        if let Some(flag) = self.stop.take() {
+            flag.store(true, Ordering::Relaxed);
+            // Unblock the sigwait() call so the thread can observe the stop flag.
+            let _ = kill(Pid::this(), Signal::SIGUSR1);
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for SignalThreadGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// RAII guard that cancels the health-check thread on drop.
+struct HealthThreadGuard {
+    cancel: Option<Arc<AtomicBool>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl HealthThreadGuard {
+    fn stop(&mut self) {
+        if let Some(flag) = self.cancel.take() {
+            flag.store(true, Ordering::Relaxed);
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for HealthThreadGuard {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
