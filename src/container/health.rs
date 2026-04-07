@@ -102,8 +102,25 @@ impl Container {
     }
 
     /// Send a notification to the systemd notify socket.
+    ///
+    /// The socket path is validated to prevent writing to arbitrary Unix sockets:
+    /// only abstract sockets (`@...`) and absolute paths under `/run/` are accepted.
     pub(super) fn send_sd_notify(socket_path: &str, message: &str) -> Result<()> {
         use std::os::unix::net::UnixDatagram;
+
+        let is_abstract = socket_path.starts_with('@');
+        let is_safe_path =
+            socket_path.starts_with("/run/") || socket_path.starts_with("/var/run/");
+        let has_traversal = socket_path.contains("/../")
+            || socket_path.ends_with("/..")
+            || socket_path.contains('\0');
+
+        if (!is_abstract && !is_safe_path) || has_traversal {
+            return Err(NucleusError::ExecError(format!(
+                "Refusing sd_notify to untrusted socket path: {}",
+                socket_path
+            )));
+        }
 
         let sock = UnixDatagram::unbound().map_err(|e| {
             NucleusError::ExecError(format!("Failed to create notify socket: {}", e))
@@ -164,6 +181,16 @@ impl Container {
                 return;
             }
 
+            // Verify the PID still belongs to our container (guard against recycling)
+            // before sending any signal, by comparing start_ticks.
+            let current_ticks = read_start_ticks(pid);
+            if current_ticks != expected_ticks {
+                debug!(
+                    "Health check: PID {} was recycled (start_ticks {} -> {}), stopping",
+                    pid, expected_ticks, current_ticks
+                );
+                return;
+            }
             // Check if the container process is still alive using signal 0
             if kill(Pid::from_raw(pid as i32), None).is_err() {
                 debug!("Health check: container process {} gone, stopping", pid);

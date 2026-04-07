@@ -349,6 +349,10 @@ pub struct ContainerConfig {
 
     /// Override OCI bundle directory path (OCI --bundle).
     pub bundle_dir: Option<PathBuf>,
+
+    /// Override root directory for state storage (--root).
+    /// When set, ContainerStateManager uses this instead of the default.
+    pub state_root: Option<PathBuf>,
 }
 
 /// Seccomp operating mode.
@@ -415,6 +419,7 @@ impl ContainerConfig {
             pid_file: None,
             console_socket: None,
             bundle_dir: None,
+            state_root: None,
         })
     }
 
@@ -675,6 +680,11 @@ impl ContainerConfig {
         self
     }
 
+    pub fn with_state_root(mut self, root: PathBuf) -> Self {
+        self.state_root = Some(root);
+        self
+    }
+
     /// Validate that production mode invariants are satisfied.
     /// Called before container startup when service_mode == Production.
     pub fn validate_production_mode(&self) -> crate::error::Result<()> {
@@ -715,7 +725,7 @@ impl ContainerConfig {
 
         // Canonicalize to resolve symlinks before validating the prefix,
         // preventing symlink-based bypasses (e.g. /nix/store/evil -> /etc).
-        let rootfs_path = std::fs::canonicalize(&rootfs_path).map_err(|e| {
+        let rootfs_path = std::fs::canonicalize(rootfs_path).map_err(|e| {
             crate::error::NucleusError::ConfigError(format!(
                 "Failed to canonicalize rootfs path '{}': {}",
                 rootfs_path.display(),

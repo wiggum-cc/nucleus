@@ -44,8 +44,14 @@ impl CriuRuntime {
         })
     }
 
-    /// Validate a binary path for safe execution
+    /// Validate a binary path for safe execution.
+    ///
+    /// Checks permissions (not world/group-writable) and ownership (must be
+    /// owned by root or the effective UID) to prevent execution of tampered
+    /// binaries.
     fn validate_binary(path: &Path) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
         let metadata = fs::metadata(path).map_err(|e| {
             NucleusError::CheckpointError(format!("Cannot stat criu binary {:?}: {}", path, e))
         })?;
@@ -60,6 +66,14 @@ impl CriuRuntime {
             return Err(NucleusError::CheckpointError(format!(
                 "criu binary {:?} is not executable",
                 path
+            )));
+        }
+        let owner_uid = metadata.uid();
+        let euid = nix::unistd::Uid::effective().as_raw();
+        if owner_uid != 0 && owner_uid != euid {
+            return Err(NucleusError::CheckpointError(format!(
+                "criu binary {:?} is owned by UID {} (expected root or euid {}), refusing to execute",
+                path, owner_uid, euid
             )));
         }
         Ok(())

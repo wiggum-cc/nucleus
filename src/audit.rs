@@ -147,13 +147,62 @@ impl AuditEvent {
 
     /// Emit this event to the audit log via tracing.
     pub fn emit(&self) {
-        let json = serde_json::to_string(self).unwrap_or_else(|_| format!("{:?}", self));
+        let json = serde_json::to_string(self).unwrap_or_else(|_| {
+            // Avoid Debug format which could leak sensitive fields;
+            // emit only the non-sensitive event envelope.
+            format!(
+                r#"{{"timestamp":"{}","container_id":"{}","event_type":"{:?}","detail":"[serialization failed]","is_error":{}}}"#,
+                self.timestamp, self.container_id, self.event_type, self.is_error
+            )
+        });
         if self.is_error {
             tracing::error!(target: "nucleus::audit", "{}", json);
         } else {
             tracing::info!(target: "nucleus::audit", "{}", json);
         }
     }
+}
+
+/// Redact command-line arguments that may contain secrets.
+///
+/// Replaces values following flags whose names suggest sensitive content
+/// (e.g. `--password`, `--token`, `--secret`, `--key`, `--auth`) with
+/// `[REDACTED]`, and redacts arguments that look like inline `KEY=VALUE`
+/// assignments for those same patterns.
+pub fn redact_command(args: &[String]) -> Vec<String> {
+    const SENSITIVE: &[&str] = &[
+        "password", "passwd", "token", "secret", "key", "auth", "credential", "api-key",
+        "apikey", "api_key", "access-token", "private-key",
+    ];
+
+    fn is_sensitive_flag(s: &str) -> bool {
+        let lower = s.to_ascii_lowercase();
+        let name = lower.trim_start_matches('-');
+        SENSITIVE.iter().any(|pat| name.contains(pat))
+    }
+
+    let mut out = Vec::with_capacity(args.len());
+    let mut redact_next = false;
+    for arg in args {
+        if redact_next {
+            out.push("[REDACTED]".to_string());
+            redact_next = false;
+            continue;
+        }
+        if is_sensitive_flag(arg) {
+            out.push(arg.clone());
+            redact_next = true;
+        } else if let Some((k, _)) = arg.split_once('=') {
+            if is_sensitive_flag(k) {
+                out.push(format!("{}=[REDACTED]", k));
+            } else {
+                out.push(arg.clone());
+            }
+        } else {
+            out.push(arg.clone());
+        }
+    }
+    out
 }
 
 /// Convenience function to emit an audit event.

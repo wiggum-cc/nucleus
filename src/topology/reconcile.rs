@@ -112,6 +112,7 @@ pub fn execute_reconcile(
     plan: &ReconcilePlan,
     state_mgr: &ContainerStateManager,
     stop_timeout: u64,
+    state_root: Option<&std::path::Path>,
 ) -> Result<()> {
     let graph = DependencyGraph::resolve(config)?;
 
@@ -191,6 +192,7 @@ pub fn execute_reconcile(
                     svc,
                     &container_name,
                     desired_hash,
+                    state_root,
                 )?;
 
                 // Spawn the container as a background process
@@ -286,9 +288,17 @@ fn build_service_run_args(
     svc: &ServiceDef,
     container_name: &str,
     desired_hash: u64,
+    state_root: Option<&std::path::Path>,
 ) -> Result<Vec<String>> {
-    let mut args = vec![
-        "nucleus".to_string(),
+    let mut args = vec!["nucleus".to_string()];
+
+    // Propagate --root so the child uses the same state directory
+    if let Some(root) = state_root {
+        args.push("--root".to_string());
+        args.push(root.to_string_lossy().to_string());
+    }
+
+    args.extend([
         "create".to_string(),
         "--service-mode".to_string(),
         "production".to_string(),
@@ -311,7 +321,7 @@ fn build_service_run_args(
         } else {
             "bridge".to_string()
         },
-    ];
+    ]);
 
     for dns in &svc.dns {
         args.push("--dns".to_string());
@@ -374,12 +384,11 @@ fn build_service_run_args(
         }
     }
 
-    // C-2: Write secrets to a secure temp file instead of passing via CLI args.
-    // Secrets on the command line are visible in /proc/<pid>/cmdline to any user.
-    if !svc.secrets.is_empty() {
-        let secrets_file = write_secrets_file(container_name, &svc.secrets)?;
-        args.push("--secrets-file".to_string());
-        args.push(secrets_file);
+    // Pass each secret as a separate --secret SOURCE:DEST flag,
+    // matching the CLI parser's expected format.
+    for secret in &svc.secrets {
+        args.push("--secret".to_string());
+        args.push(secret.clone());
     }
 
     for (key, value) in &svc.environment {
@@ -414,17 +423,43 @@ fn build_service_run_args(
         args.push("gvisor".to_string());
     }
 
-    // Write hooks to a temp file and pass via --hooks flag
+    // Write hooks to a secure temp file and pass via --hooks flag.
+    // Fail-closed: if the hooks file cannot be written, refuse to start
+    // the service without its configured hooks.
     if let Some(ref hooks) = svc.hooks {
         if !hooks.is_empty() {
-            if let Ok(hooks_json) = serde_json::to_string(hooks) {
-                let hooks_path =
-                    std::env::temp_dir().join(format!("nucleus-hooks-{}.json", container_name));
-                if std::fs::write(&hooks_path, hooks_json).is_ok() {
-                    args.push("--hooks".to_string());
-                    args.push(hooks_path.to_string_lossy().to_string());
-                }
-            }
+            let hooks_json = serde_json::to_string(hooks).map_err(|e| {
+                NucleusError::ConfigError(format!(
+                    "Failed to serialize hooks for {}: {}",
+                    container_name, e
+                ))
+            })?;
+            let hooks_path =
+                std::env::temp_dir().join(format!("nucleus-hooks-{}.json", container_name));
+            // Remove any pre-existing file/symlink to avoid following attacker-planted links,
+            // then create exclusively with restrictive permissions.
+            let _ = std::fs::remove_file(&hooks_path);
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&hooks_path)
+                .map_err(|e| {
+                    NucleusError::ConfigError(format!(
+                        "Failed to create hooks file for {}: {}",
+                        container_name, e
+                    ))
+                })?;
+            use std::io::Write;
+            let mut writer = std::io::BufWriter::new(file);
+            writer.write_all(hooks_json.as_bytes()).map_err(|e| {
+                NucleusError::ConfigError(format!(
+                    "Failed to write hooks file for {}: {}",
+                    container_name, e
+                ))
+            })?;
+            args.push("--hooks".to_string());
+            args.push(hooks_path.to_string_lossy().to_string());
         }
     }
 
@@ -432,47 +467,6 @@ fn build_service_run_args(
     args.push("--".to_string());
     args.extend(svc.command.clone());
     Ok(args)
-}
-
-/// Write secrets to a secure temp file (mode 0o600) and return the path.
-///
-/// The child process reads secrets from this file instead of receiving them
-/// via CLI arguments, which would be visible in /proc/<pid>/cmdline.
-fn write_secrets_file(container_name: &str, secrets: &[String]) -> Result<String> {
-    let secrets_path = std::env::temp_dir().join(format!("nucleus-secrets-{}.txt", container_name));
-
-    // Open with restrictive permissions (owner read/write only)
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&secrets_path)
-        .map_err(|e| {
-            NucleusError::ConfigError(format!(
-                "Failed to create secrets file for {}: {}",
-                container_name, e
-            ))
-        })?;
-
-    use std::io::Write;
-    let mut writer = std::io::BufWriter::new(file);
-    for secret in secrets {
-        writeln!(writer, "{}", secret).map_err(|e| {
-            NucleusError::ConfigError(format!(
-                "Failed to write secrets file for {}: {}",
-                container_name, e
-            ))
-        })?;
-    }
-    writer.flush().map_err(|e| {
-        NucleusError::ConfigError(format!(
-            "Failed to flush secrets file for {}: {}",
-            container_name, e
-        ))
-    })?;
-
-    Ok(secrets_path.to_string_lossy().to_string())
 }
 
 fn post_start_wait(graph: &DependencyGraph, service_name: &str) -> PostStartWait {
@@ -741,7 +735,7 @@ memory = "256M"
 "#;
         let config = TopologyConfig::from_toml(toml).unwrap();
         let svc = config.services.get("web").unwrap();
-        let args = build_service_run_args(&config, "web", svc, "test-web", 42).unwrap();
+        let args = build_service_run_args(&config, "web", svc, "test-web", 42, None).unwrap();
 
         assert!(args
             .windows(2)
@@ -778,7 +772,7 @@ volumes = [
         );
         let config = TopologyConfig::from_toml(&toml).unwrap();
         let svc = config.services.get("db").unwrap();
-        let args = build_service_run_args(&config, "db", svc, "test-db", 7).unwrap();
+        let args = build_service_run_args(&config, "db", svc, "test-db", 7, None).unwrap();
 
         assert!(
             persistent_path.exists(),

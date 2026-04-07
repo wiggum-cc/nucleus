@@ -143,6 +143,9 @@ fn container_state_serde(c: &mut Criterion) {
             using_gvisor: false,
             rootless: true,
             cgroup_path: Some("/sys/fs/cgroup/nucleus-bench".to_string()),
+            process_uid: 0,
+            process_gid: 0,
+            additional_gids: vec![],
         });
 
         b.iter(|| {

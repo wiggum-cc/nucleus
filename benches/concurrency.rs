@@ -244,6 +244,9 @@ fn concurrent_state_serde(c: &mut Criterion) {
                                 using_gvisor: false,
                                 rootless: true,
                                 cgroup_path: Some(format!("/sys/fs/cgroup/nucleus-bench-{i}")),
+                                process_uid: 0,
+                                process_gid: 0,
+                                additional_gids: vec![],
                             })
                         })
                         .collect(),
@@ -298,6 +301,9 @@ fn concurrent_state_file_io(c: &mut Criterion) {
                                     using_gvisor: false,
                                     rootless: true,
                                     cgroup_path: None,
+                                    process_uid: 0,
+                                    process_gid: 0,
+                                    additional_gids: vec![],
                                 })
                             })
                             .collect();

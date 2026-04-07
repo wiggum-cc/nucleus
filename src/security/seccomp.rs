@@ -361,6 +361,17 @@ impl SeccompManager {
         // filter is installed. If capability dropping is bypassed, clone3 becomes
         // an unfiltered path to namespace creation. This is a known single point
         // of failure — see CapabilityManager::drop_all() which must run first.
+        //
+        // Verify the invariant: CAP_SYS_ADMIN must not be in the effective set.
+        // CAP_SYS_ADMIN = capability bit 21
+        if Self::has_effective_cap(21) {
+            return Err(NucleusError::SeccompError(
+                "SECURITY: CAP_SYS_ADMIN is still in the effective capability set. \
+                 Capabilities must be dropped before installing seccomp filters \
+                 (clone3 is allowed unconditionally)."
+                    .to_string(),
+            ));
+        }
         rules.insert(libc::SYS_clone3, Vec::new());
 
         // clone: allow but deny namespace-creating flags to prevent nested namespace creation
@@ -741,6 +752,23 @@ impl SeccompManager {
                 }
             }
         }
+    }
+
+    /// Check whether a capability is in the current thread's effective set
+    /// by reading /proc/self/status (CapEff line).
+    fn has_effective_cap(cap: i32) -> bool {
+        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+            // If we can't read, assume worst case for safety.
+            return true;
+        };
+        for line in status.lines() {
+            if let Some(hex) = line.strip_prefix("CapEff:\t") {
+                if let Ok(eff) = u64::from_str_radix(hex.trim(), 16) {
+                    return eff & (1u64 << cap) != 0;
+                }
+            }
+        }
+        true // assume worst case
     }
 
     /// Check if seccomp filter has been applied

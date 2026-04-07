@@ -440,6 +440,33 @@ impl OciHooks {
                 phase, hook.path
             )));
         }
+
+        // Restrict hooks to trusted system directories. Hooks execute in
+        // the parent process before security hardening (by OCI spec), so
+        // they must come from locations that unprivileged users cannot write to.
+        const TRUSTED_HOOK_PREFIXES: &[&str] = &[
+            "/usr/bin/",
+            "/usr/sbin/",
+            "/usr/lib/",
+            "/usr/libexec/",
+            "/usr/local/bin/",
+            "/usr/local/sbin/",
+            "/usr/local/libexec/",
+            "/bin/",
+            "/sbin/",
+            "/nix/store/",
+            "/opt/",
+        ];
+        if !TRUSTED_HOOK_PREFIXES
+            .iter()
+            .any(|prefix| hook.path.starts_with(prefix))
+        {
+            return Err(NucleusError::HookError(format!(
+                "{} hook path '{}' is not under a trusted directory ({:?})",
+                phase, hook.path, TRUSTED_HOOK_PREFIXES
+            )));
+        }
+
         // Use symlink_metadata (lstat) instead of .exists() to avoid
         // following symlinks in the existence check. Reject symlinked hooks
         // to prevent a TOCTOU swap between the check and exec.
@@ -493,6 +520,12 @@ impl OciHooks {
         #[cfg(not(test))]
         unsafe {
             cmd.pre_exec(|| {
+                // Prevent the hook from gaining privileges via setuid/setgid
+                // binaries or file capabilities. This must be set before exec.
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+
                 let rlim_nproc = libc::rlimit {
                     rlim_cur: 1024,
                     rlim_max: 1024,

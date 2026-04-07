@@ -719,7 +719,7 @@ fn main() -> Result<()> {
                     to: "created".to_string(),
                 });
             }
-            Container::trigger_start(&state.id)?;
+            Container::trigger_start(&state.id, state_root.clone())?;
             println!("{}", state.id);
             Ok(())
         }
@@ -1269,18 +1269,11 @@ fn main() -> Result<()> {
             for spec in &env_vars {
                 if let Some((key, value)) = spec.split_once('=') {
                     if DANGEROUS_ENV_VARS.contains(&key) {
-                        if service_mode == ServiceMode::Production {
-                            return Err(NucleusError::ConfigError(format!(
-                                "Environment variable '{}' is blocked in production mode \
-                                 (dynamic linker injection risk)",
-                                key
-                            )));
-                        }
-                        tracing::warn!(
-                            "Passing dynamic-linker variable '{}' into container \
-                             (injection risk if workload uses shell scripts)",
+                        return Err(NucleusError::ConfigError(format!(
+                            "Environment variable '{}' is blocked (dynamic linker injection risk). \
+                             This restriction applies in all modes.",
                             key
-                        );
+                        )));
                     }
                     config = config.with_env(key.to_string(), value.to_string());
                 } else {
@@ -1331,6 +1324,11 @@ fn main() -> Result<()> {
                     pid
                 };
                 config = config.with_pid_file(canonical);
+            }
+
+            // Propagate --root to the container so it uses the correct state directory
+            if let Some(ref root) = state_root {
+                config = config.with_state_root(root.clone());
             }
 
             if !quiet_id {
@@ -1389,7 +1387,7 @@ fn main() -> Result<()> {
                 let plan = plan_reconcile(&config, &state_mgr)?;
 
                 println!("Bringing up topology '{}'...", config.name);
-                execute_reconcile(&config, &plan, &state_mgr, timeout)?;
+                execute_reconcile(&config, &plan, &state_mgr, timeout, state_root.as_deref())?;
                 println!("Topology '{}' is up", config.name);
                 Ok(())
             }

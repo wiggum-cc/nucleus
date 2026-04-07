@@ -57,7 +57,10 @@ impl Container {
             return Err(NucleusError::ExecError("No command specified".to_string()));
         }
 
-        info!("Executing command: {:?}", self.config.command);
+        info!(
+            "Executing command: {:?}",
+            crate::audit::redact_command(&self.config.command)
+        );
 
         Self::apply_process_identity_to_current_process(
             &self.config.process_identity,
@@ -87,14 +90,32 @@ impl Container {
                 .map_err(|e| NucleusError::ExecError(format!("Invalid environment HOME: {}", e)))?,
         ];
 
-        // Pass through sd_notify socket if enabled
+        // Pass through sd_notify socket if enabled.
+        // Validate the socket path to prevent the container from communicating
+        // with arbitrary host systemd sockets.
         if self.config.sd_notify {
             if let Ok(notify_socket) = std::env::var("NOTIFY_SOCKET") {
-                env.push(
-                    CString::new(format!("NOTIFY_SOCKET={}", notify_socket)).map_err(|e| {
-                        NucleusError::ExecError(format!("Invalid NOTIFY_SOCKET: {}", e))
-                    })?,
-                );
+                // Only allow abstract sockets (@...) or absolute paths under /run/
+                let is_abstract = notify_socket.starts_with('@');
+                let is_safe_path = notify_socket.starts_with("/run/")
+                    || notify_socket.starts_with("/var/run/");
+                let has_traversal = notify_socket.contains("/../")
+                    || notify_socket.ends_with("/..")
+                    || notify_socket.contains('\0');
+
+                if (is_abstract || is_safe_path) && !has_traversal {
+                    env.push(
+                        CString::new(format!("NOTIFY_SOCKET={}", notify_socket)).map_err(
+                            |e| NucleusError::ExecError(format!("Invalid NOTIFY_SOCKET: {}", e)),
+                        )?,
+                    );
+                } else {
+                    debug!(
+                        "Refusing to pass NOTIFY_SOCKET={} into container: \
+                         only abstract sockets or /run/ paths are allowed",
+                        notify_socket
+                    );
+                }
             }
         }
 

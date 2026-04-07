@@ -99,7 +99,7 @@ impl Container {
             AuditEventType::ContainerStart,
             format!(
                 "command={:?} mode={:?} runtime={}",
-                self.config.command,
+                crate::audit::redact_command(&self.config.command),
                 self.config.service_mode,
                 if self.config.use_gvisor {
                     "gvisor"
@@ -148,8 +148,8 @@ impl Container {
             config.network = NetworkMode::None;
         }
 
-        // Create state manager
-        let state_mgr = ContainerStateManager::new()?;
+        // Create state manager, honoring --root override if set
+        let state_mgr = ContainerStateManager::new_with_root(config.state_root.clone())?;
 
         // Enforce name uniqueness among running containers
         if let Ok(all_states) = state_mgr.list_states() {
@@ -383,8 +383,8 @@ impl Container {
 
     /// Trigger a previously-created container to start by opening its exec FIFO.
     /// Used by the CLI `start` command.
-    pub fn trigger_start(container_id: &str) -> Result<()> {
-        let state_mgr = ContainerStateManager::new()?;
+    pub fn trigger_start(container_id: &str, state_root: Option<PathBuf>) -> Result<()> {
+        let state_mgr = ContainerStateManager::new_with_root(state_root)?;
         let fifo_path = state_mgr.exec_fifo_path(container_id)?;
         if !fifo_path.exists() {
             return Err(NucleusError::ConfigError(format!(
@@ -492,9 +492,19 @@ impl Container {
 
         // 4. Mount tmpfs as container root
         // Filesystem: Unmounted -> Mounted
+        // Use a private runtime directory instead of /tmp to avoid symlink
+        // attacks and information disclosure on multi-user systems.
+        let runtime_base = if nix::unistd::Uid::effective().is_root() {
+            std::path::PathBuf::from("/run/nucleus")
+        } else {
+            dirs::runtime_dir()
+                .map(|d| d.join("nucleus"))
+                .unwrap_or_else(std::env::temp_dir)
+        };
+        let _ = std::fs::create_dir_all(&runtime_base);
         let runtime_dir = Builder::new()
             .prefix("nucleus-runtime-")
-            .tempdir_in("/tmp")
+            .tempdir_in(&runtime_base)
             .map_err(|e| {
                 NucleusError::FilesystemError(format!("Failed to create runtime dir: {}", e))
             })?;

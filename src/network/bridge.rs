@@ -91,8 +91,19 @@ impl BridgeNetwork {
             &["link", "set", &veth_container, "netns", &pid.to_string()],
         )?;
 
-        // 5. Configure container interface (inside container netns via nsenter)
+        // 5. Configure container interface (inside container netns via nsenter).
+        // Capture the process start time from /proc to detect PID recycling
+        // between the caller passing the PID and our nsenter invocations.
         let pid_str = pid.to_string();
+        let start_ticks = Self::read_pid_start_ticks(pid);
+        if start_ticks == 0 {
+            drop(rollback);
+            return Err(NucleusError::NetworkError(format!(
+                "Cannot read start_ticks for PID {} — process may have exited",
+                pid
+            )));
+        }
+
         Self::run_cmd(
             "nsenter",
             &[
@@ -125,6 +136,16 @@ impl BridgeNetwork {
             &["-t", &pid_str, "-n", "ip", "link", "set", "lo", "up"],
         )?;
 
+        // Verify PID was not recycled during nsenter operations
+        let current_ticks = Self::read_pid_start_ticks(pid);
+        if current_ticks != start_ticks {
+            drop(rollback);
+            return Err(NucleusError::NetworkError(format!(
+                "PID {} was recycled during network setup (start_ticks changed: {} -> {})",
+                pid, start_ticks, current_ticks
+            )));
+        }
+
         // 6. Set default route in container
         let gateway = Self::gateway_from_subnet(&config.subnet);
         Self::run_cmd(
@@ -151,11 +172,14 @@ impl BridgeNetwork {
         rollback.nat_added = true;
 
         // 8. Enable IP forwarding (save previous value for restore on cleanup)
-        let prev_ip_forward = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        rollback.prev_ip_forward = Some(prev_ip_forward);
+        let prev_ip_forward = match std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward") {
+            Ok(v) => Some(v.trim().to_string()),
+            Err(e) => {
+                warn!("Could not read ip_forward state (will not restore on cleanup): {}", e);
+                None
+            }
+        };
+        rollback.prev_ip_forward = prev_ip_forward;
         std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").map_err(|e| {
             NucleusError::NetworkError(format!("Failed to enable IP forwarding: {}", e))
         })?;
@@ -598,9 +622,7 @@ impl BridgeNetwork {
         subnet: &str,
         requested_ip: Option<&str>,
     ) -> Result<String> {
-        std::fs::create_dir_all(alloc_dir).map_err(|e| {
-            NucleusError::NetworkError(format!("Failed to create IP alloc dir: {}", e))
-        })?;
+        Self::ensure_alloc_dir(alloc_dir)?;
         let lock_path = alloc_dir.join(".lock");
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
@@ -666,9 +688,7 @@ impl BridgeNetwork {
         container_id: &str,
         ip: &str,
     ) -> Result<()> {
-        std::fs::create_dir_all(alloc_dir).map_err(|e| {
-            NucleusError::NetworkError(format!("Failed to create IP alloc dir: {}", e))
-        })?;
+        Self::ensure_alloc_dir(alloc_dir)?;
         let path = alloc_dir.join(format!("{}.ip", container_id));
         std::fs::write(&path, ip).map_err(|e| {
             NucleusError::NetworkError(format!("Failed to record IP allocation: {}", e))
@@ -687,6 +707,33 @@ impl BridgeNetwork {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Create the IP allocation directory with restrictive permissions (0700)
+    /// and reject symlinked paths to prevent symlink attacks.
+    fn ensure_alloc_dir(alloc_dir: &std::path::Path) -> Result<()> {
+        std::fs::create_dir_all(alloc_dir).map_err(|e| {
+            NucleusError::NetworkError(format!("Failed to create IP alloc dir: {}", e))
+        })?;
+        // Reject if the final path component is a symlink
+        if let Ok(meta) = std::fs::symlink_metadata(alloc_dir) {
+            if meta.file_type().is_symlink() {
+                return Err(NucleusError::NetworkError(format!(
+                    "IP alloc dir {:?} is a symlink, refusing to use",
+                    alloc_dir
+                )));
+            }
+        }
+        // Restrict permissions to owner-only
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(alloc_dir, perms).map_err(|e| {
+            NucleusError::NetworkError(format!(
+                "Failed to set permissions on IP alloc dir {:?}: {}",
+                alloc_dir, e
+            ))
+        })?;
+        Ok(())
+    }
+
     fn ip_alloc_dir() -> std::path::PathBuf {
         if nix::unistd::Uid::effective().is_root() {
             std::path::PathBuf::from("/var/run/nucleus/ip-alloc")
@@ -700,6 +747,24 @@ impl BridgeNetwork {
                         .unwrap_or_else(|| std::path::PathBuf::from("/var/run/nucleus/ip-alloc"))
                 })
         }
+    }
+
+    /// Read the start time (field 22) from /proc/<pid>/stat to detect PID recycling.
+    /// Returns 0 if the process does not exist or the field cannot be parsed.
+    fn read_pid_start_ticks(pid: u32) -> u64 {
+        let stat_path = format!("/proc/{}/stat", pid);
+        if let Ok(content) = std::fs::read_to_string(&stat_path) {
+            // Field 22 is starttime. The comm field (2) may contain spaces/parens,
+            // so find the last ')' and count fields from there.
+            if let Some(after_comm) = content.rfind(')') {
+                return content[after_comm + 2..]
+                    .split_whitespace()
+                    .nth(19) // field 22 is 20th after the ')' + state field
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+        0
     }
 
     /// Get gateway IP from subnet (first usable address)
@@ -721,27 +786,74 @@ impl BridgeNetwork {
             .unwrap_or(24)
     }
 
-    /// Resolve a system binary to an absolute path when running as root.
-    /// When unprivileged, falls back to bare name (PATH-based resolution).
-    fn resolve_bin(name: &str) -> String {
-        if nix::unistd::Uid::effective().is_root() {
-            let search_dirs: &[&str] = match name {
-                "ip" => &["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"],
-                "iptables" => &["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"],
-                "nsenter" => &["/usr/bin/nsenter", "/usr/sbin/nsenter", "/bin/nsenter"],
-                _ => &[],
-            };
-            for path in search_dirs {
-                if std::path::Path::new(path).exists() {
-                    return path.to_string();
+    /// Resolve a system binary to a validated absolute path.
+    ///
+    /// When running as root, searches known sysadmin paths and validates
+    /// ownership and permissions before use. When unprivileged, uses
+    /// `which`-style PATH resolution but still validates the result.
+    /// Returns an error if no valid binary is found.
+    fn resolve_bin(name: &str) -> Result<String> {
+        let search_dirs: &[&str] = match name {
+            "ip" => &["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"],
+            "iptables" => &["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"],
+            "nsenter" => &["/usr/bin/nsenter", "/usr/sbin/nsenter", "/bin/nsenter"],
+            _ => &[],
+        };
+
+        for path in search_dirs {
+            let p = std::path::Path::new(path);
+            if p.exists() {
+                Self::validate_network_binary(p, name)?;
+                return Ok(path.to_string());
+            }
+        }
+
+        // Fallback: resolve via PATH, but validate the result
+        if let Ok(output) = Command::new("which").arg(name).output() {
+            if output.status.success() {
+                let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !resolved.is_empty() {
+                    let p = std::path::Path::new(&resolved);
+                    Self::validate_network_binary(p, name)?;
+                    return Ok(resolved);
                 }
             }
         }
-        name.to_string()
+
+        Err(NucleusError::NetworkError(format!(
+            "Required binary '{}' not found or failed validation",
+            name
+        )))
+    }
+
+    /// Validate a network binary's ownership and permissions.
+    /// Rejects binaries that are group/world-writable or not owned by root/euid.
+    fn validate_network_binary(path: &std::path::Path, name: &str) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let meta = std::fs::metadata(path).map_err(|e| {
+            NucleusError::NetworkError(format!("Cannot stat {}: {}", name, e))
+        })?;
+        let mode = meta.mode();
+        if mode & 0o022 != 0 {
+            return Err(NucleusError::NetworkError(format!(
+                "Binary '{}' at {:?} is writable by group/others (mode {:o}), refusing to execute",
+                name, path, mode
+            )));
+        }
+        let owner = meta.uid();
+        let euid = nix::unistd::Uid::effective().as_raw();
+        if owner != 0 && owner != euid {
+            return Err(NucleusError::NetworkError(format!(
+                "Binary '{}' at {:?} owned by UID {} (expected root or euid {}), refusing to execute",
+                name, path, owner, euid
+            )));
+        }
+        Ok(())
     }
 
     fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
-        let resolved = Self::resolve_bin(program);
+        let resolved = Self::resolve_bin(program)?;
         let output = Command::new(&resolved).args(args).output().map_err(|e| {
             NucleusError::NetworkError(format!("Failed to run {} {:?}: {}", resolved, args, e))
         })?;
@@ -803,7 +915,7 @@ impl BridgeNetwork {
     }
 
     fn is_ip_in_use(ip: &str) -> Result<bool> {
-        let ip_bin = Self::resolve_bin("ip");
+        let ip_bin = Self::resolve_bin("ip")?;
         let output = Command::new(&ip_bin)
             .args(["-4", "addr", "show"])
             .output()

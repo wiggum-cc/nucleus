@@ -75,16 +75,16 @@ impl BridgeConfig {
 
         // Subnet: must be valid IPv4 CIDR
         validate_ipv4_cidr(&self.subnet)
-            .map_err(|e| crate::error::NucleusError::NetworkError(e))?;
+            .map_err(crate::error::NucleusError::NetworkError)?;
 
         // Container IP (if specified)
         if let Some(ref ip) = self.container_ip {
-            validate_ipv4_addr(ip).map_err(|e| crate::error::NucleusError::NetworkError(e))?;
+            validate_ipv4_addr(ip).map_err(crate::error::NucleusError::NetworkError)?;
         }
 
         // DNS servers
         for dns in &self.dns {
-            validate_ipv4_addr(dns).map_err(|e| crate::error::NucleusError::NetworkError(e))?;
+            validate_ipv4_addr(dns).map_err(crate::error::NucleusError::NetworkError)?;
         }
 
         Ok(())

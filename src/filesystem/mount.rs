@@ -236,7 +236,7 @@ pub fn create_dev_nodes(dev_path: &Path, include_tty: bool) -> Result<()> {
 
     for (name, dev_type, major, minor) in devices {
         let path = dev_path.join(name);
-        let mode = Mode::from_bits_truncate(0o666);
+        let mode = Mode::from_bits_truncate(0o660);
         let dev = makedev(major, minor);
 
         match mknod(&path, dev_type, mode, dev) {
@@ -540,8 +540,8 @@ pub fn mount_volumes(root: &Path, volumes: &[crate::container::VolumeMount]) -> 
 
                 let mount_data = size
                     .as_ref()
-                    .map(|value| format!("size={},mode=0755", value))
-                    .unwrap_or_else(|| "mode=0755".to_string());
+                    .map(|value| format!("size={},mode=0700", value))
+                    .unwrap_or_else(|| "mode=0700".to_string());
 
                 let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
                 if volume.read_only {

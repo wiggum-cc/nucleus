@@ -272,6 +272,24 @@ impl TopologyConfig {
             ));
         }
 
+        // Validate topology name and all service keys use safe characters,
+        // preventing path traversal when they are used in temp-file paths
+        // (e.g. /tmp/nucleus-hooks-{topology}-{service}.json).
+        crate::container::validate_container_name(&self.name).map_err(|_| {
+            crate::error::NucleusError::ConfigError(format!(
+                "Topology name '{}' contains invalid characters (allowed: a-zA-Z0-9, '-', '_', '.')",
+                self.name
+            ))
+        })?;
+        for service_name in self.services.keys() {
+            crate::container::validate_container_name(service_name).map_err(|_| {
+                crate::error::NucleusError::ConfigError(format!(
+                    "Service name '{}' contains invalid characters (allowed: a-zA-Z0-9, '-', '_', '.')",
+                    service_name
+                ))
+            })?;
+        }
+
         if self.services.is_empty() {
             return Err(crate::error::NucleusError::ConfigError(
                 "Topology must have at least one service".to_string(),
