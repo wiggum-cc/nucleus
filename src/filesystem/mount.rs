@@ -1,7 +1,12 @@
 use crate::error::{NucleusError, Result};
+use nix::fcntl::{open, OFlag};
 use nix::mount::{mount, MsFlags};
-use nix::sys::stat::{makedev, mknod, Mode, SFlag};
+use nix::sys::stat::{fstat, makedev, mknod, Mode, SFlag};
 use nix::unistd::chroot;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, info, warn};
 
@@ -121,6 +126,35 @@ pub fn resolve_container_destination(root: &Path, dest: &Path) -> Result<PathBuf
         ))
     })?;
     Ok(root.join(relative))
+}
+
+pub(crate) fn read_regular_file_nofollow(path: &Path) -> Result<Vec<u8>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to open file {:?} with O_NOFOLLOW: {}",
+                path, e
+            ))
+        })?;
+
+    let metadata = file.metadata().map_err(|e| {
+        NucleusError::FilesystemError(format!("Failed to stat file {:?}: {}", path, e))
+    })?;
+    if !metadata.is_file() {
+        return Err(NucleusError::FilesystemError(format!(
+            "Expected regular file for {:?}, found non-file source",
+            path
+        )));
+    }
+
+    let mut content = Vec::new();
+    file.read_to_end(&mut content).map_err(|e| {
+        NucleusError::FilesystemError(format!("Failed to read file {:?}: {}", path, e))
+    })?;
+    Ok(content)
 }
 
 /// Audit all mounts in the container's mount namespace.
@@ -924,21 +958,33 @@ pub fn mount_secrets(root: &Path, secrets: &[crate::container::SecretMount]) -> 
     info!("Mounting {} secret(s) into container", secrets.len());
 
     for secret in secrets {
-        // M1: Use O_PATH|O_NOFOLLOW to get an FD that refuses symlinks,
-        // then fstat to confirm the source is a regular file/dir.
-        // This closes the TOCTOU gap between check and mount.
-        let meta = std::fs::symlink_metadata(&secret.source).map_err(|_| {
+        let source_fd = open(
+            &secret.source,
+            OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| {
             NucleusError::FilesystemError(format!(
-                "Secret source does not exist: {:?}",
-                secret.source
+                "Failed to open secret source {:?} with O_NOFOLLOW: {}",
+                secret.source, e
             ))
         })?;
-        if meta.file_type().is_symlink() {
+        let source_stat = fstat(&source_fd).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to stat secret source {:?}: {}",
+                secret.source, e
+            ))
+        })?;
+        let source_kind = SFlag::from_bits_truncate(source_stat.st_mode);
+        let source_is_file = source_kind == SFlag::S_IFREG;
+        let source_is_dir = source_kind == SFlag::S_IFDIR;
+        if !source_is_file && !source_is_dir {
             return Err(NucleusError::FilesystemError(format!(
-                "Secret source {:?} is a symlink; refusing to mount (TOCTOU mitigation)",
+                "Secret source {:?} must be a regular file or directory",
                 secret.source
             )));
         }
+        let source_fd_path = PathBuf::from(format!("/proc/self/fd/{}", source_fd.as_raw_fd()));
 
         // Destination inside container root
         let dest = resolve_container_destination(root, &secret.dest)?;
@@ -954,7 +1000,7 @@ pub fn mount_secrets(root: &Path, secrets: &[crate::container::SecretMount]) -> 
         }
 
         // Create mount point file
-        if secret.source.is_file() {
+        if source_is_file {
             std::fs::write(&dest, "").map_err(|e| {
                 NucleusError::FilesystemError(format!(
                     "Failed to create secret mount point {:?}: {}",
@@ -972,7 +1018,7 @@ pub fn mount_secrets(root: &Path, secrets: &[crate::container::SecretMount]) -> 
 
         // Bind mount read-only
         mount(
-            Some(secret.source.as_path()),
+            Some(source_fd_path.as_path()),
             &dest,
             None::<&str>,
             MsFlags::MS_BIND,
@@ -1005,7 +1051,7 @@ pub fn mount_secrets(root: &Path, secrets: &[crate::container::SecretMount]) -> 
         })?;
 
         // Apply configured file permissions on the mount point
-        if secret.source.is_file() {
+        if source_is_file {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(secret.mode);
             if let Err(e) = std::fs::set_permissions(&dest, perms) {
@@ -1102,22 +1148,7 @@ fn mount_secrets_inmemory_inner(
     identity: &crate::container::ProcessIdentity,
 ) -> Result<()> {
     for secret in secrets {
-        // Use symlink_metadata (lstat) to check existence without following
-        // symlinks, preventing TOCTOU via symlink swap before the read.
-        if std::fs::symlink_metadata(&secret.source).is_err() {
-            return Err(NucleusError::FilesystemError(format!(
-                "Secret source does not exist: {:?}",
-                secret.source
-            )));
-        }
-
-        // Read secret content from host
-        let mut content = std::fs::read(&secret.source).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to read secret {:?}: {}",
-                secret.source, e
-            ))
-        })?;
+        let mut content = read_regular_file_nofollow(&secret.source)?;
 
         // Determine destination path inside the secrets tmpfs
         let dest = resolve_container_destination(secrets_dir, &secret.dest)?;
@@ -1179,14 +1210,12 @@ fn mount_secrets_inmemory_inner(
                 })?;
             }
 
-            if secret.source.is_file() {
-                std::fs::write(&container_dest, "").map_err(|e| {
-                    NucleusError::FilesystemError(format!(
-                        "Failed to create secret mount point {:?}: {}",
-                        container_dest, e
-                    ))
-                })?;
-            }
+            std::fs::write(&container_dest, "").map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to create secret mount point {:?}: {}",
+                    container_dest, e
+                ))
+            })?;
 
             mount(
                 Some(dest.as_path()),
@@ -1234,6 +1263,7 @@ fn mount_secrets_inmemory_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn test_proc_mask_includes_sysrq_trigger() {
@@ -1279,5 +1309,30 @@ mod tests {
                 path
             );
         }
+    }
+
+    #[test]
+    fn test_read_regular_file_nofollow_reads_regular_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("secret.txt");
+        std::fs::write(&path, "supersecret").unwrap();
+
+        let content = read_regular_file_nofollow(&path).unwrap();
+        assert_eq!(content, b"supersecret");
+    }
+
+    #[test]
+    fn test_read_regular_file_nofollow_rejects_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.txt");
+        let link = temp.path().join("secret-link");
+        std::fs::write(&target, "supersecret").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let err = read_regular_file_nofollow(&link).unwrap_err();
+        assert!(
+            err.to_string().contains("O_NOFOLLOW"),
+            "symlink reads must fail via O_NOFOLLOW"
+        );
     }
 }

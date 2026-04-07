@@ -66,7 +66,8 @@
         inherit (pkgs) lib;
 
         gvisorRuntimePkgs = lib.optionals pkgs.stdenv.isLinux [ pkgs.gvisor ];
-        gvisorRuntimePath = lib.makeBinPath gvisorRuntimePkgs;
+        networkRuntimePkgs = lib.optionals pkgs.stdenv.isLinux [ pkgs.iptables ];
+        runtimePath = lib.makeBinPath (gvisorRuntimePkgs ++ networkRuntimePkgs);
 
         rustToolchain = pkgs.rust-bin.stable.latest.default;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
@@ -80,7 +81,7 @@
         commonArgs = {
           inherit src;
           pname = "nucleus";
-          version = "0.3.1";
+          version = "0.3.2";
           strictDeps = true;
 
           nativeBuildInputs = [
@@ -103,7 +104,7 @@
           nativeCheckInputs = gvisorRuntimePkgs;
           nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ];
           postFixup = lib.optionalString pkgs.stdenv.isLinux ''
-            wrapProgram $out/bin/nucleus --prefix PATH : "${gvisorRuntimePath}"
+            wrapProgram $out/bin/nucleus --prefix PATH : "${runtimePath}"
           '';
         }) else null;
 
@@ -157,19 +158,19 @@
           my-crate-fmt = craneLib.cargoFmt {
             inherit src;
             pname = "nucleus";
-            version = "0.3.1";
+            version = "0.3.2";
           };
 
           my-crate-audit = craneLib.cargoAudit {
             inherit src advisory-db;
             pname = "nucleus";
-            version = "0.3.1";
+            version = "0.3.2";
           };
 
           my-crate-deny = craneLib.cargoDeny {
             inherit src;
             pname = "nucleus";
-            version = "0.3.1";
+            version = "0.3.2";
           };
 
           my-crate-nextest = craneLib.cargoNextest (commonArgs // {

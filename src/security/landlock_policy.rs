@@ -149,8 +149,14 @@ impl LandlockPolicy {
                 Ok(true)
             }
             RulesetStatus::PartiallyEnforced => {
-                info!("Landlock custom policy partially enforced");
-                Ok(true)
+                if best_effort {
+                    info!("Landlock custom policy partially enforced");
+                    Ok(true)
+                } else {
+                    Err(NucleusError::LandlockError(
+                        "Landlock custom policy only partially enforced; strict mode requires full target ABI support".to_string(),
+                    ))
+                }
             }
             RulesetStatus::NotEnforced => {
                 if best_effort {

@@ -1,7 +1,12 @@
+use super::{netlink, netns};
 use crate::error::{NucleusError, Result, StateTransition};
 use crate::network::config::{BridgeConfig, EgressPolicy, PortForward};
 use crate::network::NetworkState;
+use std::fs::OpenOptions;
+use std::net::Ipv4Addr;
 use std::os::fd::FromRawFd;
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::process::Command;
 use tracing::{debug, info, warn};
@@ -17,6 +22,27 @@ pub struct BridgeNetwork {
 }
 
 impl BridgeNetwork {
+    fn open_dev_urandom() -> Result<std::fs::File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open("/dev/urandom")
+            .map_err(|e| {
+                NucleusError::NetworkError(format!("Failed to open /dev/urandom: {}", e))
+            })?;
+
+        let metadata = file.metadata().map_err(|e| {
+            NucleusError::NetworkError(format!("Failed to stat /dev/urandom: {}", e))
+        })?;
+        if !metadata.file_type().is_char_device() {
+            return Err(NucleusError::NetworkError(
+                "/dev/urandom is not a character device".to_string(),
+            ));
+        }
+
+        Ok(file)
+    }
+
     /// Set up bridge networking for a container
     ///
     /// Creates bridge, veth pair, assigns IPs, enables NAT.
@@ -63,38 +89,19 @@ impl BridgeNetwork {
         Self::ensure_bridge_for(&config.bridge_name, &config.subnet)?;
 
         // 2. Create veth pair
-        Self::run_cmd(
-            "ip",
-            &[
-                "link",
-                "add",
-                &veth_host,
-                "type",
-                "veth",
-                "peer",
-                "name",
-                &veth_container,
-            ],
-        )?;
+        netlink::create_veth(&veth_host, &veth_container)?;
         rollback.veth_created = true;
 
         // 3. Attach host end to bridge
-        Self::run_cmd(
-            "ip",
-            &["link", "set", &veth_host, "master", &config.bridge_name],
-        )?;
-        Self::run_cmd("ip", &["link", "set", &veth_host, "up"])?;
+        netlink::set_link_master(&veth_host, &config.bridge_name)?;
+        netlink::set_link_up(&veth_host)?;
 
         // 4. Move container end to container's network namespace
-        Self::run_cmd(
-            "ip",
-            &["link", "set", &veth_container, "netns", &pid.to_string()],
-        )?;
+        netlink::set_link_netns(&veth_container, pid)?;
 
-        // 5. Configure container interface (inside container netns via nsenter).
+        // 5. Configure container interface (inside container netns via setns).
         // Capture the process start time from /proc to detect PID recycling
-        // between the caller passing the PID and our nsenter invocations.
-        let pid_str = pid.to_string();
+        // between the caller passing the PID and our netns operations.
         let start_ticks = Self::read_pid_start_ticks(pid);
         if start_ticks == 0 {
             drop(rollback);
@@ -104,39 +111,20 @@ impl BridgeNetwork {
             )));
         }
 
-        Self::run_cmd(
-            "nsenter",
-            &[
-                "-t",
-                &pid_str,
-                "-n",
-                "ip",
-                "addr",
-                "add",
-                &format!("{}/{}", container_ip, prefix),
-                "dev",
-                &veth_container,
-            ],
-        )?;
-        Self::run_cmd(
-            "nsenter",
-            &[
-                "-t",
-                &pid_str,
-                "-n",
-                "ip",
-                "link",
-                "set",
-                &veth_container,
-                "up",
-            ],
-        )?;
-        Self::run_cmd(
-            "nsenter",
-            &["-t", &pid_str, "-n", "ip", "link", "set", "lo", "up"],
-        )?;
+        let container_addr: Ipv4Addr = container_ip.parse().map_err(|e| {
+            NucleusError::NetworkError(format!("invalid container IP '{}': {}", container_ip, e))
+        })?;
+        {
+            let vc = veth_container.clone();
+            netns::in_netns(pid, move || {
+                netlink::add_addr(&vc, container_addr, prefix)?;
+                netlink::set_link_up(&vc)?;
+                netlink::set_link_up("lo")?;
+                Ok(())
+            })?;
+        }
 
-        // Verify PID was not recycled during nsenter operations
+        // Verify PID was not recycled during netns operations
         let current_ticks = Self::read_pid_start_ticks(pid);
         if current_ticks != start_ticks {
             drop(rollback);
@@ -148,12 +136,10 @@ impl BridgeNetwork {
 
         // 6. Set default route in container
         let gateway = Self::gateway_from_subnet(&config.subnet);
-        Self::run_cmd(
-            "nsenter",
-            &[
-                "-t", &pid_str, "-n", "ip", "route", "add", "default", "via", &gateway,
-            ],
-        )?;
+        let gateway_addr: Ipv4Addr = gateway.parse().map_err(|e| {
+            NucleusError::NetworkError(format!("invalid gateway IP '{}': {}", gateway, e))
+        })?;
+        netns::in_netns(pid, move || netlink::add_default_route(gateway_addr))?;
 
         // 7. Enable NAT (masquerade) on the host
         Self::run_cmd(
@@ -225,35 +211,21 @@ impl BridgeNetwork {
                 .map_err(|e| NucleusError::NetworkError(format!("Invalid egress CIDR: {}", e)))?;
         }
 
-        let pid_str = pid.to_string();
+        let ipt = Self::resolve_bin("iptables")?;
 
         // M15: Set DROP policy BEFORE flushing rules to avoid a window where
         // all egress is unrestricted. The order is: DROP -> flush -> add rules.
-        Self::run_cmd(
-            "nsenter",
-            &["-t", &pid_str, "-n", "iptables", "-P", "OUTPUT", "DROP"],
-        )?;
+        netns::exec_in_netns(pid, &ipt, &["-P", "OUTPUT", "DROP"])?;
         // Flush any existing OUTPUT rules to prevent duplication on repeated calls
-        Self::run_cmd(
-            "nsenter",
-            &["-t", &pid_str, "-n", "iptables", "-F", "OUTPUT"],
-        )?;
+        netns::exec_in_netns(pid, &ipt, &["-F", "OUTPUT"])?;
 
         // Default policy: drop all OUTPUT (except established/related and loopback)
-        Self::run_cmd(
-            "nsenter",
-            &[
-                "-t", &pid_str, "-n", "iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT",
-            ],
-        )?;
+        netns::exec_in_netns(pid, &ipt, &["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"])?;
 
-        Self::run_cmd(
-            "nsenter",
+        netns::exec_in_netns(
+            pid,
+            &ipt,
             &[
-                "-t",
-                &pid_str,
-                "-n",
-                "iptables",
                 "-A",
                 "OUTPUT",
                 "-m",
@@ -268,18 +240,18 @@ impl BridgeNetwork {
         // Allow DNS to configured resolvers (only when policy permits it)
         if policy.allow_dns {
             for dns in &self.config.dns {
-                Self::run_cmd(
-                    "nsenter",
+                netns::exec_in_netns(
+                    pid,
+                    &ipt,
                     &[
-                        "-t", &pid_str, "-n", "iptables", "-A", "OUTPUT", "-p", "udp", "-d", dns,
-                        "--dport", "53", "-j", "ACCEPT",
+                        "-A", "OUTPUT", "-p", "udp", "-d", dns, "--dport", "53", "-j", "ACCEPT",
                     ],
                 )?;
-                Self::run_cmd(
-                    "nsenter",
+                netns::exec_in_netns(
+                    pid,
+                    &ipt,
                     &[
-                        "-t", &pid_str, "-n", "iptables", "-A", "OUTPUT", "-p", "tcp", "-d", dns,
-                        "--dport", "53", "-j", "ACCEPT",
+                        "-A", "OUTPUT", "-p", "tcp", "-d", dns, "--dport", "53", "-j", "ACCEPT",
                     ],
                 )?;
             }
@@ -288,53 +260,26 @@ impl BridgeNetwork {
         // Allow traffic to each permitted CIDR
         for cidr in &policy.allowed_cidrs {
             if policy.allowed_tcp_ports.is_empty() && policy.allowed_udp_ports.is_empty() {
-                // Allow all ports to this CIDR
-                Self::run_cmd(
-                    "nsenter",
-                    &[
-                        "-t", &pid_str, "-n", "iptables", "-A", "OUTPUT", "-d", cidr, "-j",
-                        "ACCEPT",
-                    ],
-                )?;
+                netns::exec_in_netns(pid, &ipt, &["-A", "OUTPUT", "-d", cidr, "-j", "ACCEPT"])?;
             } else {
                 for port in &policy.allowed_tcp_ports {
-                    Self::run_cmd(
-                        "nsenter",
+                    let port_s = port.to_string();
+                    netns::exec_in_netns(
+                        pid,
+                        &ipt,
                         &[
-                            "-t",
-                            &pid_str,
-                            "-n",
-                            "iptables",
-                            "-A",
-                            "OUTPUT",
-                            "-p",
-                            "tcp",
-                            "-d",
-                            cidr,
-                            "--dport",
-                            &port.to_string(),
-                            "-j",
+                            "-A", "OUTPUT", "-p", "tcp", "-d", cidr, "--dport", &port_s, "-j",
                             "ACCEPT",
                         ],
                     )?;
                 }
                 for port in &policy.allowed_udp_ports {
-                    Self::run_cmd(
-                        "nsenter",
+                    let port_s = port.to_string();
+                    netns::exec_in_netns(
+                        pid,
+                        &ipt,
                         &[
-                            "-t",
-                            &pid_str,
-                            "-n",
-                            "iptables",
-                            "-A",
-                            "OUTPUT",
-                            "-p",
-                            "udp",
-                            "-d",
-                            cidr,
-                            "--dport",
-                            &port.to_string(),
-                            "-j",
+                            "-A", "OUTPUT", "-p", "udp", "-d", cidr, "--dport", &port_s, "-j",
                             "ACCEPT",
                         ],
                     )?;
@@ -344,13 +289,10 @@ impl BridgeNetwork {
 
         // Log denied packets (rate-limited)
         if policy.log_denied {
-            Self::run_cmd(
-                "nsenter",
+            netns::exec_in_netns(
+                pid,
+                &ipt,
                 &[
-                    "-t",
-                    &pid_str,
-                    "-n",
-                    "iptables",
                     "-A",
                     "OUTPUT",
                     "-m",
@@ -366,10 +308,7 @@ impl BridgeNetwork {
         }
 
         // Drop everything else
-        Self::run_cmd(
-            "nsenter",
-            &["-t", &pid_str, "-n", "iptables", "-P", "OUTPUT", "DROP"],
-        )?;
+        netns::exec_in_netns(pid, &ipt, &["-P", "OUTPUT", "DROP"])?;
 
         info!(
             "Egress policy applied: {} allowed CIDRs",
@@ -412,7 +351,7 @@ impl BridgeNetwork {
         );
 
         // Delete veth pair (deleting one end removes both)
-        let _ = Self::run_cmd("ip", &["link", "del", &self.veth_host]);
+        let _ = netlink::del_link(&self.veth_host);
 
         // Restore previous ip_forward state if we changed it
         if let Some(ref prev) = self.prev_ip_forward {
@@ -457,7 +396,7 @@ impl BridgeNetwork {
             ],
         );
 
-        let _ = Self::run_cmd("ip", &["link", "del", &self.veth_host]);
+        let _ = netlink::del_link(&self.veth_host);
 
         if let Some(ref prev) = self.prev_ip_forward {
             if prev == "0" {
@@ -518,29 +457,18 @@ impl BridgeNetwork {
     }
 
     fn ensure_bridge_for(bridge_name: &str, subnet: &str) -> Result<()> {
-        // Check if bridge exists
-        if Self::run_cmd("ip", &["link", "show", bridge_name]).is_ok() {
+        if netlink::link_exists(bridge_name) {
             return Ok(());
         }
 
-        // Create bridge
-        Self::run_cmd(
-            "ip",
-            &["link", "add", "name", bridge_name, "type", "bridge"],
-        )?;
+        netlink::create_bridge(bridge_name)?;
 
         let gateway = Self::gateway_from_subnet(subnet);
-        Self::run_cmd(
-            "ip",
-            &[
-                "addr",
-                "add",
-                &format!("{}/{}", gateway, Self::subnet_prefix(subnet)),
-                "dev",
-                bridge_name,
-            ],
-        )?;
-        Self::run_cmd("ip", &["link", "set", bridge_name, "up"])?;
+        let gateway_addr: Ipv4Addr = gateway.parse().map_err(|e| {
+            NucleusError::NetworkError(format!("invalid bridge gateway '{}': {}", gateway, e))
+        })?;
+        netlink::add_addr(bridge_name, gateway_addr, Self::subnet_prefix(subnet))?;
+        netlink::set_link_up(bridge_name)?;
 
         info!("Created bridge {}", bridge_name);
         Ok(())
@@ -593,11 +521,10 @@ impl BridgeNetwork {
         // 128 bytes gives ~125 valid candidates (byte < 253), making exhaustion
         // in a populated subnet far less likely than the previous 32-byte buffer.
         let mut rand_buf = [0u8; 128];
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut rand_buf))
-            .map_err(|e| {
-                NucleusError::NetworkError(format!("Failed to read /dev/urandom: {}", e))
-            })?;
+        let mut urandom = Self::open_dev_urandom()?;
+        std::io::Read::read_exact(&mut urandom, &mut rand_buf).map_err(|e| {
+            NucleusError::NetworkError(format!("Failed to read /dev/urandom: {}", e))
+        })?;
         for &byte in &rand_buf {
             // Rejection sampling: discard values that would cause modulo bias
             if byte >= 253 {
@@ -824,9 +751,7 @@ impl BridgeNetwork {
     /// Returns an error if no valid binary is found.
     fn resolve_bin(name: &str) -> Result<String> {
         let search_dirs: &[&str] = match name {
-            "ip" => &["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"],
             "iptables" => &["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"],
-            "nsenter" => &["/usr/bin/nsenter", "/usr/sbin/nsenter", "/bin/nsenter"],
             _ => &[],
         };
 
@@ -944,24 +869,10 @@ impl BridgeNetwork {
     }
 
     fn is_ip_in_use(ip: &str) -> Result<bool> {
-        let ip_bin = Self::resolve_bin("ip")?;
-        let output = Command::new(&ip_bin)
-            .args(["-4", "addr", "show"])
-            .output()
-            .map_err(|e| {
-                NucleusError::NetworkError(format!("Failed to inspect host IPs: {}", e))
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(NucleusError::NetworkError(format!(
-                "ip -4 addr show failed: {}",
-                stderr.trim()
-            )));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(stdout.contains(&format!(" {}/", ip)))
+        let addr: Ipv4Addr = ip
+            .parse()
+            .map_err(|e| NucleusError::NetworkError(format!("invalid IP '{}': {}", ip, e)))?;
+        netlink::is_addr_in_use(&addr)
     }
 
     /// Write resolv.conf inside container (for writable /etc, e.g. agent mode)
@@ -1177,7 +1088,7 @@ impl Drop for SetupRollback {
         }
 
         if self.veth_created {
-            if let Err(e) = BridgeNetwork::run_cmd("ip", &["link", "del", &self.veth_host]) {
+            if let Err(e) = netlink::del_link(&self.veth_host) {
                 warn!("Rollback: failed to delete veth {}: {}", self.veth_host, e);
             }
         }

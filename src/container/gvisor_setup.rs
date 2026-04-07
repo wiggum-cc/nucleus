@@ -1,14 +1,13 @@
 use crate::error::{NucleusError, Result};
 use crate::filesystem::{
-    create_dev_nodes, create_minimal_fs, resolve_container_destination, snapshot_context_dir,
-    verify_context_manifest, verify_rootfs_attestation, ContextPopulator,
+    create_dev_nodes, create_minimal_fs, read_regular_file_nofollow, resolve_container_destination,
+    snapshot_context_dir, verify_context_manifest, verify_rootfs_attestation, ContextPopulator,
 };
 use crate::network::{BridgeNetwork, NetworkMode};
 use crate::security::{GVisorNetworkMode, GVisorRuntime, OciBundle, OciConfig, OciMount};
 use tracing::info;
 
 use super::runtime::Container;
-use super::ServiceMode;
 
 impl Container {
     /// Set up container with gVisor and exec.
@@ -80,7 +79,7 @@ impl Container {
             }
         }
 
-        if !self.config.secrets.is_empty() && self.config.service_mode == ServiceMode::Production {
+        if !self.config.secrets.is_empty() {
             let secret_stage_dir = Self::gvisor_secret_stage_dir(&self.config.id);
             Self::mount_gvisor_secret_stage_tmpfs(&secret_stage_dir)?;
             Self::apply_secret_dir_identity(&secret_stage_dir, &self.config.process_identity)?;
@@ -91,8 +90,6 @@ impl Container {
             )?;
             oci_config =
                 oci_config.with_inmemory_secret_mounts(&secret_stage_dir, &staged_secrets)?;
-        } else if !self.config.secrets.is_empty() {
-            oci_config = oci_config.with_secret_mounts(&self.config.secrets);
         }
 
         if let Some(user_ns_config) = &self.config.user_ns_config {
@@ -304,15 +301,6 @@ impl Container {
         let mut staged = Vec::with_capacity(secrets.len());
 
         for secret in secrets {
-            // Use symlink_metadata (lstat) to check existence without following
-            // symlinks, preventing TOCTOU via symlink swap before the read.
-            if std::fs::symlink_metadata(&secret.source).is_err() {
-                return Err(NucleusError::FilesystemError(format!(
-                    "Secret source does not exist: {:?}",
-                    secret.source
-                )));
-            }
-
             let staged_source = resolve_container_destination(stage_dir, &secret.dest)?;
             if let Some(parent) = staged_source.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -323,12 +311,7 @@ impl Container {
                 })?;
             }
 
-            let mut content = std::fs::read(&secret.source).map_err(|e| {
-                NucleusError::FilesystemError(format!(
-                    "Failed to read secret {:?}: {}",
-                    secret.source, e
-                ))
-            })?;
+            let mut content = read_regular_file_nofollow(&secret.source)?;
             std::fs::write(&staged_source, &content).map_err(|e| {
                 NucleusError::FilesystemError(format!(
                     "Failed to write staged secret {:?}: {}",

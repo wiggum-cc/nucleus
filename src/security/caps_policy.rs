@@ -69,6 +69,10 @@ const DANGEROUS_CAPABILITIES: &[Capability] = &[
     Capability::CAP_LINUX_IMMUTABLE,
     Capability::CAP_BPF,
     Capability::CAP_PERFMON,
+    Capability::CAP_NET_RAW,
+    Capability::CAP_SETUID,
+    Capability::CAP_SETGID,
+    Capability::CAP_FOWNER,
 ];
 
 impl CapsPolicy {
@@ -336,5 +340,21 @@ keep = ["NET_RAW"]
         assert_eq!(resolved.ambient, vec![Capability::CAP_NET_RAW]);
         assert_eq!(resolved.inheritable, vec![Capability::CAP_NET_RAW]);
         assert_eq!(resolved.permitted, vec![Capability::CAP_NET_RAW]);
+    }
+
+    #[test]
+    fn test_validate_production_rejects_newly_classified_dangerous_caps() {
+        let toml = r#"
+[bounding]
+keep = ["NET_RAW", "SETUID", "SETGID", "FOWNER"]
+"#;
+        let policy: CapsPolicy = toml::from_str(toml).unwrap();
+
+        let err = policy.validate_production().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CAP_NET_RAW"));
+        assert!(msg.contains("CAP_SETUID"));
+        assert!(msg.contains("CAP_SETGID"));
+        assert!(msg.contains("CAP_FOWNER"));
     }
 }

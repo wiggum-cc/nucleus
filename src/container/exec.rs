@@ -179,11 +179,7 @@ impl Container {
             "PID 1 init supervisor for zombie reaping and signal forwarding",
         );
 
-        Self::apply_process_identity_to_current_process(
-            &self.config.process_identity,
-            self.config.user_ns_config.is_some(),
-        )?;
-
+        Self::assert_single_threaded_for_fork("init supervisor fork")?;
         match unsafe { fork() }? {
             ForkResult::Parent { child } => {
                 // PID 1: mini-init — reap zombies and forward signals

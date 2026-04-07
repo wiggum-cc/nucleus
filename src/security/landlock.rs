@@ -116,9 +116,17 @@ impl LandlockManager {
                     Ok(true)
                 }
                 RulesetStatus::PartiallyEnforced => {
-                    self.applied = true;
-                    info!("Landlock policy partially enforced (kernel lacks some access rights)");
-                    Ok(true)
+                    if best_effort {
+                        self.applied = true;
+                        info!(
+                            "Landlock policy partially enforced (kernel lacks some access rights)"
+                        );
+                        Ok(true)
+                    } else {
+                        Err(NucleusError::LandlockError(
+                            "Landlock policy only partially enforced; strict mode requires full target ABI support".to_string(),
+                        ))
+                    }
                 }
                 RulesetStatus::NotEnforced => {
                     if best_effort {
@@ -368,6 +376,23 @@ mod tests {
             not_enforced_block.contains("best_effort") && not_enforced_block.contains("Err"),
             "NotEnforced must return Err when best_effort=false. Block: {}",
             not_enforced_block
+        );
+    }
+
+    #[test]
+    fn test_partially_enforced_returns_error_in_strict_mode() {
+        let source = include_str!("landlock.rs");
+        let fn_body = extract_fn_body(source, "fn apply_container_policy_with_mode");
+        let partial_start = fn_body
+            .find("PartiallyEnforced")
+            .expect("function must handle PartiallyEnforced status");
+        let rest = &fn_body[partial_start..];
+        let arm_end = rest.find("NotEnforced").unwrap_or(rest.len().min(500));
+        let partial_block = &rest[..arm_end];
+        assert!(
+            partial_block.contains("best_effort") && partial_block.contains("Err"),
+            "PartiallyEnforced must return Err when best_effort=false. Block: {}",
+            partial_block
         );
     }
 }

@@ -6,9 +6,9 @@ use crate::container::{
 use crate::error::{NucleusError, Result, StateTransition};
 use crate::filesystem::{
     audit_mounts, bind_mount_host_paths, bind_mount_rootfs, create_dev_nodes, create_minimal_fs,
-    mask_proc_paths, mount_procfs, mount_secrets, mount_secrets_inmemory, mount_volumes,
-    snapshot_context_dir, switch_root, verify_context_manifest, verify_rootfs_attestation,
-    FilesystemState, LazyContextPopulator, TmpfsMount,
+    mask_proc_paths, mount_procfs, mount_secrets_inmemory, mount_volumes, snapshot_context_dir,
+    switch_root, verify_context_manifest, verify_rootfs_attestation, FilesystemState,
+    LazyContextPopulator, TmpfsMount,
 };
 use crate::isolation::NamespaceManager;
 use crate::network::{BridgeNetwork, NetworkMode};
@@ -106,6 +106,26 @@ impl Container {
                 }
             }
         }
+    }
+
+    pub(crate) fn assert_single_threaded_for_fork(context: &str) -> Result<()> {
+        let thread_count = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|line| line.starts_with("Threads:"))
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|count| count.parse::<u32>().ok())
+            });
+
+        if thread_count == Some(1) {
+            return Ok(());
+        }
+
+        Err(NucleusError::ExecError(format!(
+            "{} requires a single-threaded process before fork, found {:?} threads",
+            context, thread_count
+        )))
     }
 
     fn create_internal(&self, defer_exec_until_start: bool) -> Result<CreatedContainer> {
@@ -298,6 +318,7 @@ impl Container {
         // tracing guards before fork to minimize deadlock risk from locks held
         // by other threads (tracing, allocator). The Tokio runtime is not yet
         // started at this point, so async thread contention is not a concern.
+        Self::assert_single_threaded_for_fork("container create fork")?;
         // SAFETY: fork() is called before any Tokio runtime is created.
         // Only the main thread should be active at this point.
         match unsafe { fork() }? {
@@ -500,6 +521,7 @@ impl Container {
         // CLONE_NEWPID only applies to children created after unshare().
         // Create a child that will become PID 1 in the new namespace and exec the workload.
         if self.config.namespaces.pid {
+            Self::assert_single_threaded_for_fork("PID namespace init fork")?;
             match unsafe { fork() }? {
                 ForkResult::Parent { child } => {
                     if let Some(fd) = ready_pipe {
@@ -599,16 +621,12 @@ impl Container {
             }
         }
 
-        // 7d. Mount secrets (in-memory tmpfs for production, bind-mount for agent mode)
-        if self.config.service_mode == ServiceMode::Production {
-            mount_secrets_inmemory(
-                &container_root,
-                &self.config.secrets,
-                &self.config.process_identity,
-            )?;
-        } else {
-            mount_secrets(&container_root, &self.config.secrets)?;
-        }
+        // 7d. Mount secrets on an in-memory tmpfs in all modes.
+        mount_secrets_inmemory(
+            &container_root,
+            &self.config.secrets,
+            &self.config.process_identity,
+        )?;
 
         // 8. Mount procfs (hidepid=2 in production mode to prevent PID enumeration)
         let proc_path = container_root.join("proc");
@@ -1311,6 +1329,32 @@ mod tests {
     use crate::container::KernelLockdownMode;
     use crate::network::NetworkMode;
 
+    fn extract_fn_body<'a>(source: &'a str, fn_signature: &str) -> &'a str {
+        let fn_start = source
+            .find(fn_signature)
+            .unwrap_or_else(|| panic!("function '{}' not found in source", fn_signature));
+        let after = &source[fn_start..];
+        let open = after
+            .find('{')
+            .unwrap_or_else(|| panic!("no opening brace found for '{}'", fn_signature));
+        let mut depth = 0u32;
+        let mut end = open;
+        for (i, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &after[..end]
+    }
+
     #[test]
     fn test_container_config() {
         let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap();
@@ -1457,6 +1501,98 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&staged[0].source).unwrap(),
             "supersecret"
+        );
+    }
+
+    #[test]
+    fn test_stage_gvisor_secret_files_rejects_symlink_source() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source-secret");
+        let link = temp.path().join("source-link");
+        std::fs::write(&source, "supersecret").unwrap();
+        symlink(&source, &link).unwrap();
+
+        let err = Container::stage_gvisor_secret_files(
+            &temp.path().join("stage"),
+            &[crate::container::SecretMount {
+                source: link,
+                dest: std::path::PathBuf::from("/etc/app/secret.txt"),
+                mode: 0o400,
+            }],
+            &crate::container::ProcessIdentity::root(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("O_NOFOLLOW"),
+            "gVisor secret staging must reject symlink sources"
+        );
+    }
+
+    #[test]
+    fn test_native_runtime_uses_inmemory_secrets_for_all_modes() {
+        let source = include_str!("runtime.rs");
+        let fn_body = extract_fn_body(source, "fn setup_and_exec");
+        assert!(
+            fn_body.contains("mount_secrets_inmemory("),
+            "setup_and_exec must use in-memory secret mounting"
+        );
+        assert!(
+            !fn_body.contains("mount_secrets(&"),
+            "setup_and_exec must not bind-mount secrets from the host"
+        );
+    }
+
+    #[test]
+    fn test_gvisor_uses_inmemory_secret_staging_for_all_modes() {
+        let source = include_str!("gvisor_setup.rs");
+        let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
+        assert!(
+            fn_body.contains("with_inmemory_secret_mounts"),
+            "gVisor setup must use the tmpfs-backed secret staging path"
+        );
+        assert!(
+            !fn_body.contains("with_secret_mounts"),
+            "gVisor setup must not bind-mount host secret paths"
+        );
+    }
+
+    #[test]
+    fn test_native_fork_sites_assert_single_threaded() {
+        let runtime_source = include_str!("runtime.rs");
+        let create_body = extract_fn_body(runtime_source, "fn create_internal");
+        assert!(
+            create_body.contains("assert_single_threaded_for_fork(\"container create fork\")"),
+            "create_internal must assert single-threaded before fork"
+        );
+
+        let setup_body = extract_fn_body(runtime_source, "fn setup_and_exec");
+        assert!(
+            setup_body.contains("assert_single_threaded_for_fork(\"PID namespace init fork\")"),
+            "PID namespace setup must assert single-threaded before fork"
+        );
+
+        let exec_source = include_str!("exec.rs");
+        let init_body = extract_fn_body(exec_source, "fn run_as_init");
+        assert!(
+            init_body.contains("assert_single_threaded_for_fork(\"init supervisor fork\")"),
+            "run_as_init must assert single-threaded before fork"
+        );
+    }
+
+    #[test]
+    fn test_run_as_init_keeps_identity_drop_in_workload_child_path() {
+        let source = include_str!("exec.rs");
+        let fn_body = extract_fn_body(source, "fn run_as_init");
+        assert!(
+            !fn_body.contains("Self::apply_process_identity_to_current_process("),
+            "run_as_init must not drop identity before the supervisor fork"
+        );
+        assert!(
+            fn_body.contains("self.exec_command()?"),
+            "workload child must still route through exec_command for identity application"
         );
     }
 

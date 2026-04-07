@@ -3,20 +3,42 @@ use crate::isolation::{NamespaceConfig, UserNamespaceConfig};
 use crate::network::EgressPolicy;
 use crate::resources::ResourceLimits;
 use crate::security::GVisorPlatform;
+use std::fs::OpenOptions;
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
+
+fn open_dev_urandom() -> crate::error::Result<std::fs::File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/dev/urandom")
+        .map_err(|e| {
+            crate::error::NucleusError::ConfigError(format!(
+                "Failed to open /dev/urandom for container ID generation: {}",
+                e
+            ))
+        })?;
+
+    let metadata = file.metadata().map_err(|e| {
+        crate::error::NucleusError::ConfigError(format!("Failed to stat /dev/urandom: {}", e))
+    })?;
+    if !metadata.file_type().is_char_device() {
+        return Err(crate::error::NucleusError::ConfigError(
+            "/dev/urandom is not a character device".to_string(),
+        ));
+    }
+
+    Ok(file)
+}
 
 /// Generate a unique 32-hex-char container ID (128-bit) using /dev/urandom.
 pub fn generate_container_id() -> crate::error::Result<String> {
     use std::io::Read;
 
     let mut buf = [0u8; 16];
-    let mut file = std::fs::File::open("/dev/urandom").map_err(|e| {
-        crate::error::NucleusError::ConfigError(format!(
-            "Failed to open /dev/urandom for container ID generation: {}",
-            e
-        ))
-    })?;
+    let mut file = open_dev_urandom()?;
     file.read_exact(&mut buf).map_err(|e| {
         crate::error::NucleusError::ConfigError(format!(
             "Failed to read secure random bytes for container ID generation: {}",

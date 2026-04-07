@@ -452,7 +452,8 @@ let
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
 
-      path = lib.optionals (containerCfg.runtime == "gvisor") [ pkgs.gvisor ];
+      path = lib.optionals (containerCfg.runtime == "gvisor") [ pkgs.gvisor ]
+        ++ lib.optionals (containerCfg.network == "bridge") [ pkgs.iptables ];
 
       serviceConfig = {
         Type = if containerCfg.sdNotify then "notify" else "simple";
