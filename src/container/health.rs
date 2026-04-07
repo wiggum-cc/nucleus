@@ -75,7 +75,12 @@ impl Container {
 
         for attempt in 1..=max_attempts {
             // Check that the container is still alive using signal 0
-            if kill(Pid::from_raw(i32::try_from(pid).expect("PID exceeds i32::MAX")), None).is_err() {
+            if kill(
+                Pid::from_raw(i32::try_from(pid).expect("PID exceeds i32::MAX")),
+                None,
+            )
+            .is_err()
+            {
                 return Err(NucleusError::ExecError(format!(
                     "Container process {} exited before becoming ready",
                     pid
@@ -238,7 +243,12 @@ impl Container {
                 return;
             }
             // Check if the container process is still alive using signal 0
-            if kill(Pid::from_raw(i32::try_from(pid).expect("PID exceeds i32::MAX")), None).is_err() {
+            if kill(
+                Pid::from_raw(i32::try_from(pid).expect("PID exceeds i32::MAX")),
+                None,
+            )
+            .is_err()
+            {
                 debug!("Health check: container process {} gone, stopping", pid);
                 return;
             }

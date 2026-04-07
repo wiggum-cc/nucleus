@@ -14,11 +14,7 @@ pub fn init_tracing() {
     // trace directives: "info" default, but user can raise to "debug" max.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
-        .add_directive(
-            "nucleus=debug"
-                .parse()
-                .expect("valid tracing directive"),
-        );
+        .add_directive("nucleus=debug".parse().expect("valid tracing directive"));
     let fmt_layer = tracing_subscriber::fmt::layer();
 
     tracing_subscriber::registry()

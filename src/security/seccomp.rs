@@ -282,8 +282,8 @@ impl SeccompManager {
             0x5429, // TIOCGSID
             0x541B, // FIONREAD
             0x5421, // M12: FIONBIO — allowed because fcntl(F_SETFL, O_NONBLOCK)
-                    // achieves the same result and is already permitted. Blocking
-                    // FIONBIO only breaks tokio/mio for no security gain.
+            // achieves the same result and is already permitted. Blocking
+            // FIONBIO only breaks tokio/mio for no security gain.
             0x5451, // FIOCLEX
             0x5450, // FIONCLEX
         ];
@@ -518,8 +518,8 @@ impl SeccompManager {
 
         let filter = match SeccompFilter::new(
             rules,
-            SeccompAction::KillProcess,               // Default: kill on blocked syscall
-            SeccompAction::Allow,                     // Match action: allow
+            SeccompAction::KillProcess, // Default: kill on blocked syscall
+            SeccompAction::Allow,       // Match action: allow
             std::env::consts::ARCH.try_into().map_err(|e| {
                 NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
             })?,

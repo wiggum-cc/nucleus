@@ -807,7 +807,7 @@ impl OciConfig {
                     "/proc/scsi".to_string(),
                     "/proc/timer_list".to_string(),
                     "/proc/timer_stats".to_string(),
-                    "/proc/sysrq-trigger".to_string(),  // M14: null-mask, not read-only
+                    "/proc/sysrq-trigger".to_string(), // M14: null-mask, not read-only
                     "/proc/kpagecount".to_string(),
                     "/proc/kpageflags".to_string(),
                     "/proc/kpagecgroup".to_string(),

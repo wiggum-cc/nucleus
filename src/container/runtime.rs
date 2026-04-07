@@ -89,7 +89,8 @@ impl Container {
         // O(1) on Linux 5.9+ and marks all FDs as close-on-exec.
         const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
         // SAFETY: close_range is a safe syscall that marks FDs as close-on-exec.
-        let ret = unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) };
+        let ret =
+            unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) };
         if ret == 0 {
             return;
         }

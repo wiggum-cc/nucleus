@@ -876,14 +876,35 @@ fn chroot_impl(new_root: &Path) -> Result<()> {
 
     // L3: Drop CAP_SYS_CHROOT after chroot to prevent escape via nested chroot.
     // Also close any FDs pointing outside the new root.
-    if let Err(e) = caps::drop(None, caps::CapSet::Bounding, caps::Capability::CAP_SYS_CHROOT) {
-        debug!("Could not drop CAP_SYS_CHROOT after chroot: {} (may not be present)", e);
+    if let Err(e) = caps::drop(
+        None,
+        caps::CapSet::Bounding,
+        caps::Capability::CAP_SYS_CHROOT,
+    ) {
+        debug!(
+            "Could not drop CAP_SYS_CHROOT after chroot: {} (may not be present)",
+            e
+        );
     }
-    if let Err(e) = caps::drop(None, caps::CapSet::Effective, caps::Capability::CAP_SYS_CHROOT) {
-        debug!("Could not drop effective CAP_SYS_CHROOT: {} (may not be present)", e);
+    if let Err(e) = caps::drop(
+        None,
+        caps::CapSet::Effective,
+        caps::Capability::CAP_SYS_CHROOT,
+    ) {
+        debug!(
+            "Could not drop effective CAP_SYS_CHROOT: {} (may not be present)",
+            e
+        );
     }
-    if let Err(e) = caps::drop(None, caps::CapSet::Permitted, caps::Capability::CAP_SYS_CHROOT) {
-        debug!("Could not drop permitted CAP_SYS_CHROOT: {} (may not be present)", e);
+    if let Err(e) = caps::drop(
+        None,
+        caps::CapSet::Permitted,
+        caps::Capability::CAP_SYS_CHROOT,
+    ) {
+        debug!(
+            "Could not drop permitted CAP_SYS_CHROOT: {} (may not be present)",
+            e
+        );
     }
 
     info!("Successfully switched root using chroot (CAP_SYS_CHROOT dropped)");

@@ -257,8 +257,8 @@ mod tests {
         assert!(config.pid);
         assert!(config.mnt);
         assert!(config.net);
-        assert!(config.uts);  // M10: UTS enabled in minimal
-        assert!(config.ipc);  // M10: IPC enabled in minimal
+        assert!(config.uts); // M10: UTS enabled in minimal
+        assert!(config.ipc); // M10: IPC enabled in minimal
         assert!(config.cgroup);
         assert!(!config.user);
         assert!(!config.time);

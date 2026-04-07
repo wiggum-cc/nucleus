@@ -223,7 +223,10 @@ impl ContainerAttach {
         // Apply seccomp filter to match container's syscall restrictions
         let mut seccomp_mgr = crate::security::SeccompManager::new();
         if let Err(e) = seccomp_mgr.apply_minimal_filter() {
-            tracing::warn!("Failed to apply seccomp filter on attach: {} (continuing)", e);
+            tracing::warn!(
+                "Failed to apply seccomp filter on attach: {} (continuing)",
+                e
+            );
         }
 
         // Apply Landlock filesystem restrictions

@@ -145,10 +145,7 @@ impl Container {
         // Append user-configured environment variables (filtered)
         for (key, value) in &self.config.environment {
             if BLOCKED_ENV_VARS.contains(&key.as_str()) {
-                debug!(
-                    "Blocking dangerous environment variable: {}",
-                    key
-                );
+                debug!("Blocking dangerous environment variable: {}", key);
                 continue;
             }
             env.push(CString::new(format!("{}={}", key, value)).map_err(|e| {

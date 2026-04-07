@@ -118,7 +118,10 @@ impl UserNamespaceConfig {
     }
 
     /// Create config with custom mappings (validated)
-    pub fn custom(uid_mappings: Vec<IdMapping>, gid_mappings: Vec<IdMapping>) -> crate::error::Result<Self> {
+    pub fn custom(
+        uid_mappings: Vec<IdMapping>,
+        gid_mappings: Vec<IdMapping>,
+    ) -> crate::error::Result<Self> {
         let allow_host_root = nix::unistd::Uid::effective().is_root();
         for mapping in &uid_mappings {
             mapping.validate(allow_host_root)?;
@@ -256,7 +259,8 @@ mod tests {
         let uid_mappings = vec![IdMapping::new(0, 1000, 1), IdMapping::new(1000, 2000, 100)];
         let gid_mappings = vec![IdMapping::new(0, 1000, 1)];
 
-        let config = UserNamespaceConfig::custom(uid_mappings.clone(), gid_mappings.clone()).unwrap();
+        let config =
+            UserNamespaceConfig::custom(uid_mappings.clone(), gid_mappings.clone()).unwrap();
         assert_eq!(config.uid_mappings, uid_mappings);
         assert_eq!(config.gid_mappings, gid_mappings);
     }
