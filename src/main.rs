@@ -1295,14 +1295,16 @@ fn main() -> Result<()> {
                 let hooks_json = std::fs::read_to_string(&hooks_path).map_err(|e| {
                     NucleusError::ConfigError(format!(
                         "Failed to read hooks file '{}': {}",
-                        hooks_path.display(), e
+                        hooks_path.display(),
+                        e
                     ))
                 })?;
                 let oci_hooks: nucleus::security::OciHooks = serde_json::from_str(&hooks_json)
                     .map_err(|e| {
                         NucleusError::ConfigError(format!(
                             "Failed to parse hooks file '{}': {}",
-                            hooks_path.display(), e
+                            hooks_path.display(),
+                            e
                         ))
                     })?;
                 config.hooks = Some(oci_hooks);

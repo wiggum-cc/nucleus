@@ -455,11 +455,7 @@ impl ContainerStateManager {
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                "Skipping {} — cannot stat: {}",
-                                fallback.display(),
-                                e
-                            );
+                            tracing::warn!("Skipping {} — cannot stat: {}", fallback.display(), e);
                             false
                         }
                     }

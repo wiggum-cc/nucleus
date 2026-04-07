@@ -265,9 +265,7 @@ impl Container {
                     let cpu_millicores = config
                         .limits
                         .cpu_quota_us
-                        .map(|quota| {
-                            quota.saturating_mul(1000) / config.limits.cpu_period_us
-                        });
+                        .map(|quota| quota.saturating_mul(1000) / config.limits.cpu_period_us);
                     let mut state = ContainerState::new(ContainerStateParams {
                         id: config.id.clone(),
                         name: config.name.clone(),
@@ -287,8 +285,7 @@ impl Container {
                         config.rootfs_path.as_ref().map(|p| p.display().to_string());
 
                     let mut bridge_net: Option<BridgeNetwork> = None;
-                    let trace_reader =
-                        Self::maybe_start_seccomp_trace_reader(&config, target_pid)?;
+                    let trace_reader = Self::maybe_start_seccomp_trace_reader(&config, target_pid)?;
 
                     // Transition: Creating -> Created
                     state.status = OciStatus::Created;
@@ -311,16 +308,10 @@ impl Container {
                     }
 
                     if let NetworkMode::Bridge(ref bridge_config) = config.network {
-                        match BridgeNetwork::setup_with_id(
-                            target_pid,
-                            bridge_config,
-                            &config.id,
-                        ) {
+                        match BridgeNetwork::setup_with_id(target_pid, bridge_config, &config.id) {
                             Ok(net) => {
                                 if let Some(ref egress) = config.egress_policy {
-                                    if let Err(e) =
-                                        net.apply_egress_policy(target_pid, egress)
-                                    {
+                                    if let Err(e) = net.apply_egress_policy(target_pid, egress) {
                                         if config.service_mode == ServiceMode::Production {
                                             return Err(NucleusError::NetworkError(format!(
                                                 "Failed to apply egress policy: {}",

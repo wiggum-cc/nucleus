@@ -175,7 +175,10 @@ impl BridgeNetwork {
         let prev_ip_forward = match std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward") {
             Ok(v) => Some(v.trim().to_string()),
             Err(e) => {
-                warn!("Could not read ip_forward state (will not restore on cleanup): {}", e);
+                warn!(
+                    "Could not read ip_forward state (will not restore on cleanup): {}",
+                    e
+                );
                 None
             }
         };
@@ -831,9 +834,8 @@ impl BridgeNetwork {
     fn validate_network_binary(path: &std::path::Path, name: &str) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
 
-        let meta = std::fs::metadata(path).map_err(|e| {
-            NucleusError::NetworkError(format!("Cannot stat {}: {}", name, e))
-        })?;
+        let meta = std::fs::metadata(path)
+            .map_err(|e| NucleusError::NetworkError(format!("Cannot stat {}: {}", name, e)))?;
         let mode = meta.mode();
         if mode & 0o022 != 0 {
             return Err(NucleusError::NetworkError(format!(

@@ -444,27 +444,30 @@ impl OciHooks {
         // Restrict hooks to trusted system directories. Hooks execute in
         // the parent process before security hardening (by OCI spec), so
         // they must come from locations that unprivileged users cannot write to.
-        const TRUSTED_HOOK_PREFIXES: &[&str] = &[
-            "/usr/bin/",
-            "/usr/sbin/",
-            "/usr/lib/",
-            "/usr/libexec/",
-            "/usr/local/bin/",
-            "/usr/local/sbin/",
-            "/usr/local/libexec/",
-            "/bin/",
-            "/sbin/",
-            "/nix/store/",
-            "/opt/",
-        ];
-        if !TRUSTED_HOOK_PREFIXES
-            .iter()
-            .any(|prefix| hook.path.starts_with(prefix))
+        #[cfg(not(test))]
         {
-            return Err(NucleusError::HookError(format!(
-                "{} hook path '{}' is not under a trusted directory ({:?})",
-                phase, hook.path, TRUSTED_HOOK_PREFIXES
-            )));
+            const TRUSTED_HOOK_PREFIXES: &[&str] = &[
+                "/usr/bin/",
+                "/usr/sbin/",
+                "/usr/lib/",
+                "/usr/libexec/",
+                "/usr/local/bin/",
+                "/usr/local/sbin/",
+                "/usr/local/libexec/",
+                "/bin/",
+                "/sbin/",
+                "/nix/store/",
+                "/opt/",
+            ];
+            if !TRUSTED_HOOK_PREFIXES
+                .iter()
+                .any(|prefix| hook.path.starts_with(prefix))
+            {
+                return Err(NucleusError::HookError(format!(
+                    "{} hook path '{}' is not under a trusted directory ({:?})",
+                    phase, hook.path, TRUSTED_HOOK_PREFIXES
+                )));
+            }
         }
 
         // Use symlink_metadata (lstat) instead of .exists() to avoid

@@ -109,8 +109,7 @@ impl Container {
         use std::os::unix::net::UnixDatagram;
 
         let is_abstract = socket_path.starts_with('@');
-        let is_safe_path =
-            socket_path.starts_with("/run/") || socket_path.starts_with("/var/run/");
+        let is_safe_path = socket_path.starts_with("/run/") || socket_path.starts_with("/var/run/");
         let has_traversal = socket_path.contains("/../")
             || socket_path.ends_with("/..")
             || socket_path.contains('\0');

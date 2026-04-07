@@ -74,8 +74,7 @@ impl BridgeConfig {
         }
 
         // Subnet: must be valid IPv4 CIDR
-        validate_ipv4_cidr(&self.subnet)
-            .map_err(crate::error::NucleusError::NetworkError)?;
+        validate_ipv4_cidr(&self.subnet).map_err(crate::error::NucleusError::NetworkError)?;
 
         // Container IP (if specified)
         if let Some(ref ip) = self.container_ip {

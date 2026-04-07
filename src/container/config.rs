@@ -1040,7 +1040,8 @@ mod tests {
 
     #[test]
     fn test_production_mode_rejects_degraded_flags() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_allow_degraded_security(true)
             .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
@@ -1056,7 +1057,8 @@ mod tests {
 
     #[test]
     fn test_production_mode_rejects_chroot_fallback() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_allow_chroot_fallback(true)
             .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
@@ -1076,7 +1078,8 @@ mod tests {
 
     #[test]
     fn test_production_mode_requires_rootfs() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_limits(
                 crate::resources::ResourceLimits::default()
@@ -1107,7 +1110,8 @@ mod tests {
     #[test]
     fn test_production_mode_requires_memory_limit() {
         let rootfs = test_rootfs_path();
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_rootfs_path(rootfs);
         let err = cfg.validate_production_mode().unwrap_err();
@@ -1118,7 +1122,8 @@ mod tests {
     #[test]
     fn test_production_mode_valid_config() {
         let rootfs = test_rootfs_path();
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_rootfs_path(rootfs.clone())
             .with_verify_rootfs_attestation(true)
@@ -1137,7 +1142,8 @@ mod tests {
     #[test]
     fn test_production_mode_requires_rootfs_attestation() {
         let rootfs = test_rootfs_path();
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_rootfs_path(rootfs.clone())
             .with_limits(
@@ -1155,7 +1161,8 @@ mod tests {
     #[test]
     fn test_production_mode_rejects_seccomp_trace() {
         let rootfs = test_rootfs_path();
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_rootfs_path(rootfs.clone())
             .with_seccomp_mode(SeccompMode::Trace)
@@ -1177,7 +1184,8 @@ mod tests {
     #[test]
     fn test_production_mode_requires_cpu_limit() {
         let rootfs = test_rootfs_path();
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_rootfs_path(rootfs.clone())
             .with_limits(
@@ -1192,7 +1200,8 @@ mod tests {
 
     #[test]
     fn test_config_security_builders_override_defaults() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_allow_degraded_security(true)
             .with_allow_chroot_fallback(true)
             .with_allow_host_network(true)
@@ -1208,7 +1217,8 @@ mod tests {
 
     #[test]
     fn test_hardening_builders_override_defaults() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_required_kernel_lockdown(KernelLockdownMode::Confidentiality)
             .with_verify_context_integrity(true)
             .with_verify_rootfs_attestation(true)
@@ -1227,7 +1237,8 @@ mod tests {
 
     #[test]
     fn test_seccomp_trace_requires_log_path() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_gvisor(false)
             .with_seccomp_mode(SeccompMode::Trace);
 
@@ -1237,7 +1248,8 @@ mod tests {
 
     #[test]
     fn test_gvisor_rejects_native_security_policy_files() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_seccomp_profile(PathBuf::from("/tmp/seccomp.json"))
             .with_caps_policy(PathBuf::from("/tmp/caps.toml"));
 
@@ -1247,7 +1259,8 @@ mod tests {
 
     #[test]
     fn test_gvisor_rejects_landlock_policy_file() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_landlock_policy(PathBuf::from("/tmp/landlock.toml"));
 
         let err = cfg.validate_runtime_support().unwrap_err();
@@ -1256,7 +1269,8 @@ mod tests {
 
     #[test]
     fn test_gvisor_rejects_trace_mode_even_with_log_path() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_seccomp_mode(SeccompMode::Trace)
             .with_seccomp_trace_log(PathBuf::from("/tmp/trace.ndjson"));
 
@@ -1266,13 +1280,13 @@ mod tests {
 
     #[test]
     fn test_secret_dest_must_be_absolute() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap().with_secret(
-            crate::container::SecretMount {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_secret(crate::container::SecretMount {
                 source: PathBuf::from("/run/secrets/api-key"),
                 dest: PathBuf::from("secrets/api-key"),
                 mode: 0o400,
-            },
-        );
+            });
 
         let err = cfg.validate_runtime_support().unwrap_err();
         assert!(err.to_string().contains("absolute"));
@@ -1280,13 +1294,13 @@ mod tests {
 
     #[test]
     fn test_secret_dest_rejects_parent_traversal() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap().with_secret(
-            crate::container::SecretMount {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_secret(crate::container::SecretMount {
                 source: PathBuf::from("/run/secrets/api-key"),
                 dest: PathBuf::from("/../../etc/passwd"),
                 mode: 0o400,
-            },
-        );
+            });
 
         let err = cfg.validate_runtime_support().unwrap_err();
         assert!(err.to_string().contains("parent traversal"));
@@ -1294,8 +1308,9 @@ mod tests {
 
     #[test]
     fn test_bind_volume_source_must_exist() {
-        let cfg =
-            ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap().with_volume(VolumeMount {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_volume(VolumeMount {
                 source: VolumeSource::Bind {
                     source: PathBuf::from("/tmp/definitely-missing-nucleus-volume"),
                 },
@@ -1310,8 +1325,9 @@ mod tests {
     #[test]
     fn test_bind_volume_dest_must_be_absolute() {
         let dir = tempfile::TempDir::new().unwrap();
-        let cfg =
-            ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap().with_volume(VolumeMount {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_volume(VolumeMount {
                 source: VolumeSource::Bind {
                     source: dir.path().to_path_buf(),
                 },
@@ -1325,8 +1341,9 @@ mod tests {
 
     #[test]
     fn test_tmpfs_volume_rejects_parent_traversal() {
-        let cfg =
-            ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap().with_volume(VolumeMount {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_volume(VolumeMount {
                 source: VolumeSource::Tmpfs {
                     size: Some("64M".to_string()),
                 },
@@ -1340,7 +1357,8 @@ mod tests {
 
     #[test]
     fn test_gvisor_rejects_bind_mount_context_integrity_verification() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_context(PathBuf::from("/tmp/context"))
             .with_context_mode(crate::filesystem::ContextMode::BindMount)
             .with_verify_context_integrity(true);
@@ -1351,15 +1369,15 @@ mod tests {
 
     #[test]
     fn test_gvisor_rejects_exec_health_checks() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap().with_health_check(
-            HealthCheck {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_health_check(HealthCheck {
                 command: vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
                 interval: Duration::from_secs(30),
                 retries: 3,
                 start_period: Duration::from_secs(1),
                 timeout: Duration::from_secs(5),
-            },
-        );
+            });
 
         let err = cfg.validate_runtime_support().unwrap_err();
         assert!(err.to_string().contains("health checks"));
@@ -1367,11 +1385,11 @@ mod tests {
 
     #[test]
     fn test_gvisor_rejects_exec_readiness_probes() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap().with_readiness_probe(
-            ReadinessProbe::Exec {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_readiness_probe(ReadinessProbe::Exec {
                 command: vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
-            },
-        );
+            });
 
         let err = cfg.validate_runtime_support().unwrap_err();
         assert!(err.to_string().contains("readiness"));
@@ -1379,7 +1397,8 @@ mod tests {
 
     #[test]
     fn test_gvisor_allows_copy_mode_context_integrity_verification() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_context(PathBuf::from("/tmp/context"))
             .with_context_mode(crate::filesystem::ContextMode::Copy)
             .with_verify_context_integrity(true);
@@ -1389,7 +1408,8 @@ mod tests {
 
     #[test]
     fn test_user_namespace_rejects_unmapped_process_identity() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_rootless()
             .with_process_identity(ProcessIdentity {
                 uid: 1000,
@@ -1403,7 +1423,8 @@ mod tests {
 
     #[test]
     fn test_user_namespace_rejects_supplementary_groups() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_rootless()
             .with_process_identity(ProcessIdentity {
                 uid: 0,
@@ -1418,7 +1439,8 @@ mod tests {
     #[test]
     fn test_native_runtime_disables_gvisor() {
         // --runtime native must explicitly disable gVisor and set Trusted trust level
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()]).unwrap()
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
             .with_gvisor(false)
             .with_trust_level(TrustLevel::Trusted);
         assert!(!cfg.use_gvisor, "native runtime must disable gVisor");

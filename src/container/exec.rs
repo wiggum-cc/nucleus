@@ -97,17 +97,17 @@ impl Container {
             if let Ok(notify_socket) = std::env::var("NOTIFY_SOCKET") {
                 // Only allow abstract sockets (@...) or absolute paths under /run/
                 let is_abstract = notify_socket.starts_with('@');
-                let is_safe_path = notify_socket.starts_with("/run/")
-                    || notify_socket.starts_with("/var/run/");
+                let is_safe_path =
+                    notify_socket.starts_with("/run/") || notify_socket.starts_with("/var/run/");
                 let has_traversal = notify_socket.contains("/../")
                     || notify_socket.ends_with("/..")
                     || notify_socket.contains('\0');
 
                 if (is_abstract || is_safe_path) && !has_traversal {
                     env.push(
-                        CString::new(format!("NOTIFY_SOCKET={}", notify_socket)).map_err(
-                            |e| NucleusError::ExecError(format!("Invalid NOTIFY_SOCKET: {}", e)),
-                        )?,
+                        CString::new(format!("NOTIFY_SOCKET={}", notify_socket)).map_err(|e| {
+                            NucleusError::ExecError(format!("Invalid NOTIFY_SOCKET: {}", e))
+                        })?,
                     );
                 } else {
                     debug!(
@@ -181,9 +181,7 @@ impl Container {
 
                 // Spawn a thread to forward signals to the child
                 let child_pid = child;
-                let sig_stop = std::sync::Arc::new(
-                    std::sync::atomic::AtomicBool::new(false),
-                );
+                let sig_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let sig_stop_clone = sig_stop.clone();
                 let sig_thread = std::thread::spawn(move || {
                     loop {

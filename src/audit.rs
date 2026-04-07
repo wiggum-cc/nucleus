@@ -171,8 +171,18 @@ impl AuditEvent {
 /// assignments for those same patterns.
 pub fn redact_command(args: &[String]) -> Vec<String> {
     const SENSITIVE: &[&str] = &[
-        "password", "passwd", "token", "secret", "key", "auth", "credential", "api-key",
-        "apikey", "api_key", "access-token", "private-key",
+        "password",
+        "passwd",
+        "token",
+        "secret",
+        "key",
+        "auth",
+        "credential",
+        "api-key",
+        "apikey",
+        "api_key",
+        "access-token",
+        "private-key",
     ];
 
     fn is_sensitive_flag(s: &str) -> bool {
