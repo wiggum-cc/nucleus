@@ -24,10 +24,13 @@ impl StateTransition for NamespaceState {
     fn can_transition_to(&self, next: &NamespaceState) -> bool {
         use NamespaceState::*;
 
+        // L9: Added Unshared->Cleaned transition for cleanup from
+        // partially-initialized state (e.g., error during namespace setup).
         matches!(
             (self, next),
             (Uninitialized, Unshared)
                 | (Unshared, Entered)
+                | (Unshared, Cleaned)
                 | (Entered, Cleaned)
                 | (Uninitialized, Uninitialized)
                 | (Unshared, Unshared)
@@ -53,11 +56,16 @@ mod tests {
     }
 
     #[test]
+    fn test_unshared_to_cleaned() {
+        // L9: Cleanup from partially-initialized state
+        assert!(NamespaceState::Unshared.can_transition_to(&NamespaceState::Cleaned));
+    }
+
+    #[test]
     fn test_invalid_transitions() {
         // Cannot skip states
         assert!(!NamespaceState::Uninitialized.can_transition_to(&NamespaceState::Entered));
         assert!(!NamespaceState::Uninitialized.can_transition_to(&NamespaceState::Cleaned));
-        assert!(!NamespaceState::Unshared.can_transition_to(&NamespaceState::Cleaned));
 
         // Cannot go backwards
         assert!(!NamespaceState::Entered.can_transition_to(&NamespaceState::Unshared));

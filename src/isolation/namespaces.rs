@@ -44,14 +44,17 @@ impl NamespaceConfig {
         }
     }
 
-    /// Create config with minimal namespaces for isolation
+    /// Create config with minimal namespaces for isolation.
+    ///
+    /// M10: UTS and IPC are enabled even in minimal mode. Without UTS, containers
+    /// can change the host hostname. Without IPC, they share System V IPC objects.
     pub fn minimal() -> Self {
         Self {
             pid: true,
             mnt: true,
             net: true,
-            uts: false,
-            ipc: false,
+            uts: true,
+            ipc: true,
             cgroup: true,
             user: false,
             time: false,
@@ -254,8 +257,8 @@ mod tests {
         assert!(config.pid);
         assert!(config.mnt);
         assert!(config.net);
-        assert!(!config.uts);
-        assert!(!config.ipc);
+        assert!(config.uts);  // M10: UTS enabled in minimal
+        assert!(config.ipc);  // M10: IPC enabled in minimal
         assert!(config.cgroup);
         assert!(!config.user);
         assert!(!config.time);

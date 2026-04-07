@@ -100,7 +100,8 @@ mod tests {
 
         let minimal = NamespaceConfig::minimal();
         assert!(minimal.pid && minimal.mnt && minimal.net && minimal.cgroup);
-        assert!(!minimal.uts && !minimal.ipc && !minimal.time);
+        // M10: UTS and IPC now enabled in minimal config
+        assert!(minimal.uts && minimal.ipc && !minimal.time);
     }
 
     #[test]

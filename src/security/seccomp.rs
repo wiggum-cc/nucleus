@@ -102,6 +102,9 @@ impl SeccompManager {
             libc::SYS_rt_sigreturn,
             libc::SYS_rt_sigsuspend,
             libc::SYS_sigaltstack,
+            // L7: kill/tgkill are safe when PID namespace is active (container
+            // can only signal its own processes). If PID namespace creation fails,
+            // the runtime aborts, so this is safe.
             libc::SYS_kill,
             libc::SYS_tgkill,
             // Time
@@ -123,9 +126,10 @@ impl SeccompManager {
             libc::SYS_set_tid_address,
             libc::SYS_set_robust_list,
             libc::SYS_get_robust_list,
-            libc::SYS_sysinfo,
+            // L8: sysinfo removed — leaks host RAM, uptime, and process count.
+            // Applications needing this info should use /proc/meminfo instead.
             libc::SYS_umask,
-            libc::SYS_prlimit64,
+            // prlimit64 moved to arg-filtered section (M3)
             libc::SYS_getrusage,
             libc::SYS_times,
             libc::SYS_sched_yield,
@@ -277,8 +281,9 @@ impl SeccompManager {
             0x5413, // TIOCGWINSZ
             0x5429, // TIOCGSID
             0x541B, // FIONREAD
-            // FIONBIO (0x5421) intentionally excluded — sets non-blocking mode
-            // on network sockets, enabling sophisticated network exploitation.
+            0x5421, // M12: FIONBIO — allowed because fcntl(F_SETFL, O_NONBLOCK)
+                    // achieves the same result and is already permitted. Blocking
+                    // FIONBIO only breaks tokio/mio for no security gain.
             0x5451, // FIOCLEX
             0x5450, // FIONCLEX
         ];
@@ -330,6 +335,22 @@ impl SeccompManager {
             prctl_rules.push(rule);
         }
         rules.insert(libc::SYS_prctl, prctl_rules);
+
+        // M3: prlimit64 — only allow GET (new_limit == NULL, i.e. arg2 == 0).
+        // SET operations could raise RLIMIT_NPROC to bypass fork-bomb protection.
+        let prlimit_condition = SeccompCondition::new(
+            2, // arg2 = new_limit pointer for prlimit64(pid, resource, new_limit, old_limit)
+            seccompiler::SeccompCmpArgLen::Qword,
+            seccompiler::SeccompCmpOp::Eq,
+            0u64, // new_limit == NULL means GET-only
+        )
+        .map_err(|e| {
+            NucleusError::SeccompError(format!("Failed to create prlimit64 condition: {}", e))
+        })?;
+        let prlimit_rule = SeccompRule::new(vec![prlimit_condition]).map_err(|e| {
+            NucleusError::SeccompError(format!("Failed to create prlimit64 rule: {}", e))
+        })?;
+        rules.insert(libc::SYS_prlimit64, vec![prlimit_rule]);
 
         // mprotect: permit RW or RX transitions, but reject PROT_WRITE|PROT_EXEC.
         let mut mprotect_rules = Vec::new();
@@ -420,7 +441,7 @@ impl SeccompManager {
         let rules = Self::minimal_filter(true)?;
         let filter = SeccompFilter::new(
             rules,
-            SeccompAction::Errno(libc::EPERM as u32),
+            SeccompAction::KillProcess,
             SeccompAction::Allow,
             std::env::consts::ARCH.try_into().map_err(|e| {
                 NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
@@ -497,7 +518,7 @@ impl SeccompManager {
 
         let filter = match SeccompFilter::new(
             rules,
-            SeccompAction::Errno(libc::EPERM as u32), // Default: deny with EPERM
+            SeccompAction::KillProcess,               // Default: kill on blocked syscall
             SeccompAction::Allow,                     // Match action: allow
             std::env::consts::ARCH.try_into().map_err(|e| {
                 NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
@@ -657,12 +678,18 @@ impl SeccompManager {
                 }
             }
         }
-        // Also enforce clone3 denial — it cannot be argument-filtered
-        rules.remove(&libc::SYS_clone3);
+        // H2: clone3 is allowed in the built-in filter (needed for glibc 2.34+).
+        // Apply the same policy to custom profiles for consistency. The security
+        // invariant against namespace creation via clone3 is enforced by dropping
+        // CAP_SYS_ADMIN *before* seccomp is installed (see verify_no_namespace_caps).
+        // If the custom profile doesn't include clone3, add it.
+        if !rules.contains_key(&libc::SYS_clone3) {
+            rules.insert(libc::SYS_clone3, Vec::new());
+        }
 
         let filter = SeccompFilter::new(
             rules,
-            SeccompAction::Errno(libc::EPERM as u32),
+            SeccompAction::KillProcess,
             SeccompAction::Allow,
             std::env::consts::ARCH.try_into().map_err(|e| {
                 NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
@@ -1152,14 +1179,16 @@ mod tests {
         let net = SeccompManager::network_mode_syscalls(true);
 
         // Snapshot counts to catch unintended policy drift.
-        // +7 accounts for conditional rules inserted in minimal_filter():
-        // socket/ioctl/prctl/mprotect/clone/clone3/execveat.
+        // +8 accounts for conditional rules inserted in minimal_filter():
+        // socket/ioctl/prctl/prlimit64/mprotect/clone/clone3/execveat.
         // fork removed (forces through filtered clone path).
         // execveat removed from base (arg-filtered separately).
-        assert_eq!(base.len(), 131);
+        // sysinfo removed (L8: leaks host info).
+        // prlimit64 moved to arg-filtered (M3).
+        assert_eq!(base.len(), 129);
         assert_eq!(net.len(), 11);
-        assert_eq!(base.len() + 7, 138);
-        assert_eq!(base.len() + net.len() + 7, 149);
+        assert_eq!(base.len() + 8, 137);
+        assert_eq!(base.len() + net.len() + 8, 148);
     }
 
     #[test]

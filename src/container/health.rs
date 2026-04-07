@@ -6,6 +6,40 @@ use tracing::{debug, error, info, warn};
 
 use super::runtime::Container;
 
+/// L2: Attempt to open a pidfd for the given PID.
+/// Returns the raw fd on success, or -1 if the kernel doesn't support pidfd_open.
+fn pidfd_open(pid: u32) -> i32 {
+    // SAFETY: pidfd_open is a safe syscall that returns a file descriptor.
+    unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_uint, 0i32) as i32 }
+}
+
+/// L2: Send a signal via pidfd to avoid PID-reuse TOCTOU.
+/// Falls back to kill(2) with start_ticks verification if pidfd is unavailable.
+fn pidfd_send_signal_or_kill(pid: u32, pidfd: i32, signal: Signal, expected_ticks: u64) {
+    if pidfd >= 0 {
+        // SAFETY: pidfd_send_signal is safe with a valid pidfd.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd,
+                signal as libc::c_int,
+                std::ptr::null::<libc::siginfo_t>(),
+                0u32,
+            );
+        }
+    } else {
+        // Fallback: verify start_ticks before sending
+        if read_start_ticks(pid) == expected_ticks {
+            let _ = kill(
+                Pid::from_raw(i32::try_from(pid).expect("PID exceeds i32::MAX")),
+                signal,
+            );
+        } else {
+            warn!("Health check: PID {} was recycled, not sending signal", pid);
+        }
+    }
+}
+
 /// Read the start time (field 22) from /proc/<pid>/stat to detect PID reuse.
 fn read_start_ticks(pid: u32) -> u64 {
     let stat_path = format!("/proc/{}/stat", pid);
@@ -41,7 +75,7 @@ impl Container {
 
         for attempt in 1..=max_attempts {
             // Check that the container is still alive using signal 0
-            if kill(Pid::from_raw(pid as i32), None).is_err() {
+            if kill(Pid::from_raw(i32::try_from(pid).expect("PID exceeds i32::MAX")), None).is_err() {
                 return Err(NucleusError::ExecError(format!(
                     "Container process {} exited before becoming ready",
                     pid
@@ -109,10 +143,20 @@ impl Container {
         use std::os::unix::net::UnixDatagram;
 
         let is_abstract = socket_path.starts_with('@');
-        let is_safe_path = socket_path.starts_with("/run/") || socket_path.starts_with("/var/run/");
         let has_traversal = socket_path.contains("/../")
             || socket_path.ends_with("/..")
             || socket_path.contains('\0');
+        // M9: Canonicalize filesystem paths to resolve symlinks
+        let is_safe_path = if !is_abstract && !has_traversal {
+            if let Ok(canonical) = std::fs::canonicalize(socket_path) {
+                let canonical_str = canonical.to_string_lossy();
+                canonical_str.starts_with("/run/") || canonical_str.starts_with("/var/run/")
+            } else {
+                socket_path.starts_with("/run/") || socket_path.starts_with("/var/run/")
+            }
+        } else {
+            false
+        };
 
         if (!is_abstract && !is_safe_path) || has_traversal {
             return Err(NucleusError::ExecError(format!(
@@ -156,12 +200,15 @@ impl Container {
             cancel.load(std::sync::atomic::Ordering::Relaxed)
         };
 
-        // Capture start_ticks to verify PID ownership before sending signals,
-        // preventing SIGTERM to a recycled PID.
+        // L2: Open a pidfd to avoid PID-reuse TOCTOU races when sending signals.
+        // Falls back to start_ticks verification if the kernel doesn't support pidfd.
+        let pidfd = pidfd_open(pid);
+
+        // Capture start_ticks as a fallback for PID ownership verification.
         let expected_ticks = read_start_ticks(pid);
-        if expected_ticks == 0 {
+        if expected_ticks == 0 && pidfd < 0 {
             warn!(
-                "Health check: could not read start_ticks for PID {}, aborting",
+                "Health check: could not read start_ticks for PID {} and pidfd unavailable, aborting",
                 pid
             );
             return;
@@ -191,7 +238,7 @@ impl Container {
                 return;
             }
             // Check if the container process is still alive using signal 0
-            if kill(Pid::from_raw(pid as i32), None).is_err() {
+            if kill(Pid::from_raw(i32::try_from(pid).expect("PID exceeds i32::MAX")), None).is_err() {
                 debug!("Health check: container process {} gone, stopping", pid);
                 return;
             }
@@ -225,15 +272,7 @@ impl Container {
                             "Container {} is unhealthy after {} consecutive failures",
                             container_name, consecutive_failures
                         );
-                        // Re-verify PID ownership to avoid signaling a recycled PID
-                        if read_start_ticks(pid) == expected_ticks {
-                            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-                        } else {
-                            warn!(
-                                "Health check: PID {} was recycled, not sending SIGTERM",
-                                pid
-                            );
-                        }
+                        pidfd_send_signal_or_kill(pid, pidfd, Signal::SIGTERM, expected_ticks);
                         return;
                     }
                 }
@@ -242,15 +281,7 @@ impl Container {
                         "Health check execution failed for {}: {}",
                         container_name, e
                     );
-                    // Re-verify PID ownership to avoid signaling a recycled PID
-                    if read_start_ticks(pid) == expected_ticks {
-                        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-                    } else {
-                        warn!(
-                            "Health check: PID {} was recycled, not sending SIGTERM",
-                            pid
-                        );
-                    }
+                    pidfd_send_signal_or_kill(pid, pidfd, Signal::SIGTERM, expected_ticks);
                     return;
                 }
             }

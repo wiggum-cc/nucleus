@@ -59,6 +59,28 @@ pub struct LandlockRule {
 }
 
 impl LandlockPolicy {
+    /// Validate the policy for production safety.
+    ///
+    /// Rejects rules that grant both write and execute on the same path,
+    /// as this enables drop-and-exec attacks.
+    pub fn validate_production(&self) -> Result<()> {
+        for rule in &self.rules {
+            let flags = parse_access_flags(&rule.access)?;
+            let has_write =
+                flags.contains(AccessFs::WriteFile) || flags.contains(AccessFs::MakeReg);
+            let has_execute = flags.contains(AccessFs::Execute);
+            if has_write && has_execute {
+                return Err(NucleusError::ConfigError(format!(
+                    "Landlock policy grants both write and execute on '{}'. \
+                     This enables drop-and-exec attacks. Use separate rules or \
+                     'all_except_execute' for writable paths.",
+                    rule.path
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Apply this policy, replacing the default hardcoded Landlock rules.
     ///
     /// Returns true if the policy was enforced (fully or partially),
@@ -131,8 +153,16 @@ impl LandlockPolicy {
                 Ok(true)
             }
             RulesetStatus::NotEnforced => {
-                warn!("Landlock custom policy not enforced (kernel unsupported)");
-                Ok(false)
+                if best_effort {
+                    warn!("Landlock custom policy not enforced (kernel unsupported)");
+                    Ok(false)
+                } else {
+                    Err(NucleusError::LandlockError(
+                        "Landlock custom policy not enforced (kernel unsupported) \
+                         and best_effort=false"
+                            .to_string(),
+                    ))
+                }
             }
         }
     }

@@ -111,7 +111,8 @@ fn test_namespace_no_state_skipping() {
 
     assert!(!NamespaceState::Uninitialized.can_transition_to(&NamespaceState::Entered));
     assert!(!NamespaceState::Uninitialized.can_transition_to(&NamespaceState::Cleaned));
-    assert!(!NamespaceState::Unshared.can_transition_to(&NamespaceState::Cleaned));
+    // L9: Unshared->Cleaned is now allowed for cleanup from partially-initialized state
+    assert!(NamespaceState::Unshared.can_transition_to(&NamespaceState::Cleaned));
 }
 
 #[test]

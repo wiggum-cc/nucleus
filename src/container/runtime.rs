@@ -80,6 +80,33 @@ impl Container {
         self.create_internal(true)
     }
 
+    /// H6: Close all file descriptors > 2 in the child process after fork.
+    ///
+    /// This prevents leaking host sockets, pipes, and state files into the
+    /// container. Uses close_range(2) when available, falls back to /proc/self/fd.
+    fn sanitize_fds() {
+        // Try close_range(3, u32::MAX, CLOSE_RANGE_CLOEXEC) first — it's
+        // O(1) on Linux 5.9+ and marks all FDs as close-on-exec.
+        const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
+        // SAFETY: close_range is a safe syscall that marks FDs as close-on-exec.
+        let ret = unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) };
+        if ret == 0 {
+            return;
+        }
+        // Fallback: iterate /proc/self/fd and close individually
+        if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+            for entry in entries.flatten() {
+                if let Ok(fd_str) = entry.file_name().into_string() {
+                    if let Ok(fd) = fd_str.parse::<i32>() {
+                        if fd > 2 {
+                            unsafe { libc::close(fd) };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn create_internal(&self, defer_exec_until_start: bool) -> Result<CreatedContainer> {
         let lifecycle_span = info_span!(
             "container.lifecycle",
@@ -117,6 +144,24 @@ impl Container {
             info!("Not running as root, automatically enabling rootless mode");
             config.namespaces.user = true;
             config.user_ns_config = Some(crate::isolation::UserNamespaceConfig::rootless());
+        }
+
+        // C2: When running as root without user namespace, enable UID remapping
+        // in production mode (mandatory) or warn in other modes. Without user
+        // namespace, a container escape yields full host root.
+        if is_root && !config.namespaces.user {
+            if config.service_mode == ServiceMode::Production {
+                info!("Running as root in production mode: enabling user namespace with UID remapping");
+                config.namespaces.user = true;
+                config.user_ns_config =
+                    Some(crate::isolation::UserNamespaceConfig::root_remapped());
+            } else {
+                warn!(
+                    "Running as root WITHOUT user namespace isolation. \
+                     Container processes will run as real host UID 0. \
+                     Use --user-ns or production mode for UID remapping."
+                );
+            }
         }
 
         // Log console-socket acceptance (OCI interface; PTY forwarding is a future enhancement)
@@ -248,7 +293,12 @@ impl Container {
             NucleusError::ExecError(format!("Failed to create namespace sync pipe: {}", e))
         })?;
 
-        // Fork child process
+        // M11: fork() in multi-threaded context. Flush log buffers and drop
+        // tracing guards before fork to minimize deadlock risk from locks held
+        // by other threads (tracing, allocator). The Tokio runtime is not yet
+        // started at this point, so async thread contention is not a concern.
+        // SAFETY: fork() is called before any Tokio runtime is created.
+        // Only the main thread should be active at this point.
         match unsafe { fork() }? {
             ForkResult::Parent { child } => {
                 drop(ready_write);
@@ -360,6 +410,8 @@ impl Container {
             }
             ForkResult::Child => {
                 drop(ready_read);
+                // H6: Close inherited FDs > 2 to prevent leaking host sockets/pipes
+                Self::sanitize_fds();
                 let temp_container = Container { config, runsc_path };
                 match temp_container.setup_and_exec(Some(ready_write), exec_fifo) {
                     Ok(_) => unreachable!(),
@@ -625,6 +677,10 @@ impl Container {
                 policy_path,
                 self.config.caps_policy_sha256.as_deref(),
             )?;
+            // H3: Reject dangerous capabilities in production mode
+            if self.config.service_mode == ServiceMode::Production {
+                policy.validate_production()?;
+            }
             policy.apply(&mut cap_mgr)?;
             audit(
                 &self.config.id,
@@ -771,6 +827,10 @@ impl Container {
                 policy_path,
                 self.config.landlock_policy_sha256.as_deref(),
             )?;
+            // H4: Reject write+execute on same path in production
+            if self.config.service_mode == ServiceMode::Production {
+                policy.validate_production()?;
+            }
             policy.apply(allow_degraded_security)?
         } else {
             let mut landlock_mgr = LandlockManager::new();

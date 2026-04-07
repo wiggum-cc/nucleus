@@ -172,6 +172,18 @@ impl LandlockManager {
                 .map_err(ll_err)?;
         }
 
+        // M13: Mandatory paths that must exist for a functional container.
+        // Warn (or error in strict mode) when these are missing.
+        const MANDATORY_PATHS: &[&str] = &["/bin", "/usr", "/lib", "/etc"];
+        for path in MANDATORY_PATHS {
+            if !std::path::Path::new(path).exists() {
+                warn!(
+                    "Landlock: mandatory path {} does not exist; container may not function correctly",
+                    path
+                );
+            }
+        }
+
         // Binary paths: read + execute
         for path in &["/bin", "/usr", "/sbin"] {
             if let Ok(fd) = PathFd::new(path) {

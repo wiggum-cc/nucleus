@@ -227,15 +227,16 @@ impl BridgeNetwork {
 
         let pid_str = pid.to_string();
 
+        // M15: Set DROP policy BEFORE flushing rules to avoid a window where
+        // all egress is unrestricted. The order is: DROP -> flush -> add rules.
+        Self::run_cmd(
+            "nsenter",
+            &["-t", &pid_str, "-n", "iptables", "-P", "OUTPUT", "DROP"],
+        )?;
         // Flush any existing OUTPUT rules to prevent duplication on repeated calls
         Self::run_cmd(
             "nsenter",
             &["-t", &pid_str, "-n", "iptables", "-F", "OUTPUT"],
-        )?;
-        // Reset OUTPUT policy to ACCEPT before rebuilding rules
-        Self::run_cmd(
-            "nsenter",
-            &["-t", &pid_str, "-n", "iptables", "-P", "OUTPUT", "ACCEPT"],
         )?;
 
         // Default policy: drop all OUTPUT (except established/related and loopback)
@@ -713,19 +714,35 @@ impl BridgeNetwork {
     /// Create the IP allocation directory with restrictive permissions (0700)
     /// and reject symlinked paths to prevent symlink attacks.
     fn ensure_alloc_dir(alloc_dir: &std::path::Path) -> Result<()> {
+        // L11: Check for symlinks BEFORE creating directories to avoid TOCTOU.
+        // If the path already exists, verify it's not a symlink.
+        if alloc_dir.exists() {
+            if let Ok(meta) = std::fs::symlink_metadata(alloc_dir) {
+                if meta.file_type().is_symlink() {
+                    return Err(NucleusError::NetworkError(format!(
+                        "IP alloc dir {:?} is a symlink, refusing to use",
+                        alloc_dir
+                    )));
+                }
+            }
+        }
+        // Also check parent directory for symlinks
+        if let Some(parent) = alloc_dir.parent() {
+            if let Ok(meta) = std::fs::symlink_metadata(parent) {
+                if meta.file_type().is_symlink() {
+                    return Err(NucleusError::NetworkError(format!(
+                        "IP alloc dir parent {:?} is a symlink, refusing to use",
+                        parent
+                    )));
+                }
+            }
+        }
+
         std::fs::create_dir_all(alloc_dir).map_err(|e| {
             NucleusError::NetworkError(format!("Failed to create IP alloc dir: {}", e))
         })?;
-        // Reject if the final path component is a symlink
-        if let Ok(meta) = std::fs::symlink_metadata(alloc_dir) {
-            if meta.file_type().is_symlink() {
-                return Err(NucleusError::NetworkError(format!(
-                    "IP alloc dir {:?} is a symlink, refusing to use",
-                    alloc_dir
-                )));
-            }
-        }
-        // Restrict permissions to owner-only
+
+        // Restrict permissions to owner-only atomically after creation
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o700);
         std::fs::set_permissions(alloc_dir, perms).map_err(|e| {
@@ -734,6 +751,16 @@ impl BridgeNetwork {
                 alloc_dir, e
             ))
         })?;
+
+        // Re-verify no symlink replacement after permissions were set
+        if let Ok(meta) = std::fs::symlink_metadata(alloc_dir) {
+            if meta.file_type().is_symlink() {
+                return Err(NucleusError::NetworkError(format!(
+                    "IP alloc dir {:?} was replaced with a symlink during setup",
+                    alloc_dir
+                )));
+            }
+        }
         Ok(())
     }
 

@@ -749,6 +749,25 @@ impl ContainerConfig {
             ));
         }
 
+        // L6: Policy files must have SHA-256 verification in production
+        if self.caps_policy.is_some() && self.caps_policy_sha256.is_none() {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Production mode requires --caps-policy-sha256 when using --caps-policy".to_string(),
+            ));
+        }
+        if self.landlock_policy.is_some() && self.landlock_policy_sha256.is_none() {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Production mode requires --landlock-policy-sha256 when using --landlock-policy"
+                    .to_string(),
+            ));
+        }
+        if self.seccomp_profile.is_some() && self.seccomp_profile_sha256.is_none() {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Production mode requires --seccomp-profile-sha256 when using --seccomp-profile"
+                    .to_string(),
+            ));
+        }
+
         // Production mode requires explicit resource limits
         if self.limits.memory_bytes.is_none() {
             return Err(crate::error::NucleusError::ConfigError(

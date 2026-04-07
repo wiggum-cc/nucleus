@@ -15,9 +15,9 @@ impl Container {
         identity: &ProcessIdentity,
         inside_user_namespace: bool,
     ) -> Result<()> {
-        if identity.is_root() {
-            return Ok(());
-        }
+        // Always apply identity, even for root. Skipping setuid/setgid for root
+        // means processes run with real host UID 0 when user namespace is disabled,
+        // which is a container escape risk (C3).
 
         if !inside_user_namespace {
             let groups: Vec<Gid> = identity
@@ -97,11 +97,22 @@ impl Container {
             if let Ok(notify_socket) = std::env::var("NOTIFY_SOCKET") {
                 // Only allow abstract sockets (@...) or absolute paths under /run/
                 let is_abstract = notify_socket.starts_with('@');
-                let is_safe_path =
-                    notify_socket.starts_with("/run/") || notify_socket.starts_with("/var/run/");
                 let has_traversal = notify_socket.contains("/../")
                     || notify_socket.ends_with("/..")
                     || notify_socket.contains('\0');
+                // M9: Canonicalize filesystem paths to resolve symlinks,
+                // preventing symlink-based traversal attacks.
+                let is_safe_path = if !is_abstract && !has_traversal {
+                    if let Ok(canonical) = std::fs::canonicalize(&notify_socket) {
+                        let canonical_str = canonical.to_string_lossy();
+                        canonical_str.starts_with("/run/") || canonical_str.starts_with("/var/run/")
+                    } else {
+                        // Path doesn't exist yet — check the string directly
+                        notify_socket.starts_with("/run/") || notify_socket.starts_with("/var/run/")
+                    }
+                } else {
+                    false
+                };
 
                 if (is_abstract || is_safe_path) && !has_traversal {
                     env.push(
@@ -119,8 +130,27 @@ impl Container {
             }
         }
 
-        // Append user-configured environment variables
+        // L4: Filter dangerous environment variables that could be used for
+        // privilege escalation or library injection.
+        const BLOCKED_ENV_VARS: &[&str] = &[
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "LD_DEBUG",
+            "LD_PROFILE",
+            "LD_DYNAMIC_WEAK",
+            "LD_SHOW_AUXV",
+        ];
+
+        // Append user-configured environment variables (filtered)
         for (key, value) in &self.config.environment {
+            if BLOCKED_ENV_VARS.contains(&key.as_str()) {
+                debug!(
+                    "Blocking dangerous environment variable: {}",
+                    key
+                );
+                continue;
+            }
             env.push(CString::new(format!("{}={}", key, value)).map_err(|e| {
                 NucleusError::ExecError(format!(
                     "Invalid environment variable {}={}: {}",

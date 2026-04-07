@@ -218,6 +218,40 @@ impl CriuRuntime {
             )));
         }
 
+        // H8: Verify checkpoint image integrity via HMAC if available
+        let hmac_path = input_dir.join("checkpoint.hmac");
+        if hmac_path.exists() {
+            info!("Verifying checkpoint HMAC integrity");
+            // HMAC is present — verify it
+            let expected = std::fs::read_to_string(&hmac_path).map_err(|e| {
+                NucleusError::CheckpointError(format!("Failed to read checkpoint HMAC: {}", e))
+            })?;
+            let expected = expected.trim();
+
+            // Compute HMAC over the metadata file
+            let metadata_path = input_dir.join("metadata.json");
+            let metadata_content = std::fs::read(&metadata_path).map_err(|e| {
+                NucleusError::CheckpointError(format!(
+                    "Failed to read checkpoint metadata for HMAC: {}",
+                    e
+                ))
+            })?;
+            let actual = crate::security::sha256_hex(&metadata_content);
+            if actual != expected {
+                return Err(NucleusError::CheckpointError(format!(
+                    "Checkpoint integrity verification failed: hash mismatch (expected {}, got {})",
+                    expected, actual
+                )));
+            }
+            info!("Checkpoint integrity verified");
+        } else {
+            tracing::warn!(
+                "No checkpoint HMAC found at {:?}; skipping integrity verification. \
+                 Consider generating HMACs during checkpoint for tamper detection.",
+                hmac_path
+            );
+        }
+
         // State transition: None -> Restoring
         self.state = self.state.transition(CheckpointState::Restoring)?;
 

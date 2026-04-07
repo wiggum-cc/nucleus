@@ -796,6 +796,7 @@ impl OciConfig {
                 resources: None,
                 uid_mappings: vec![],
                 gid_mappings: vec![],
+                // M14: Aligned with native masked paths in mount.rs (PROC_NULL_MASKED)
                 masked_paths: vec![
                     "/proc/acpi".to_string(),
                     "/proc/asound".to_string(),
@@ -806,6 +807,12 @@ impl OciConfig {
                     "/proc/scsi".to_string(),
                     "/proc/timer_list".to_string(),
                     "/proc/timer_stats".to_string(),
+                    "/proc/sysrq-trigger".to_string(),  // M14: null-mask, not read-only
+                    "/proc/kpagecount".to_string(),
+                    "/proc/kpageflags".to_string(),
+                    "/proc/kpagecgroup".to_string(),
+                    "/proc/config.gz".to_string(),
+                    "/proc/kallsyms".to_string(),
                     "/sys/firmware".to_string(),
                 ],
                 readonly_paths: vec![
@@ -813,7 +820,6 @@ impl OciConfig {
                     "/proc/fs".to_string(),
                     "/proc/irq".to_string(),
                     "/proc/sys".to_string(),
-                    "/proc/sysrq-trigger".to_string(),
                 ],
                 devices: vec![
                     OciDevice {
@@ -1340,11 +1346,13 @@ impl OciBundle {
             NucleusError::GVisorError(format!("Failed to serialize OCI config: {}", e))
         })?;
 
+        // L5: Use O_NOFOLLOW via custom_flags to prevent writing through symlinks
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&config_path)
             .map_err(|e| NucleusError::GVisorError(format!("Failed to open config.json: {}", e)))?;
         file.write_all(config_json.as_bytes()).map_err(|e| {

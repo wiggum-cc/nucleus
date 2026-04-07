@@ -224,8 +224,30 @@ fn validate_rootfs_symlink_target(root: &Path, path: &Path) -> Result<()> {
         NucleusError::FilesystemError(format!("Failed to resolve rootfs {:?}: {}", root, e))
     })?;
 
-    if resolved.starts_with(&canonical_root) || resolved.starts_with("/nix/store") {
+    // M6: Tighten /nix/store symlink allowance. Only allow targets
+    // that resolve to a valid /nix/store/<hash>-<name> path pattern
+    // (32-char base32 hash followed by a dash and a package name).
+    if resolved.starts_with(&canonical_root) {
         return Ok(());
+    }
+    if resolved.starts_with("/nix/store/") {
+        let store_relative = resolved
+            .strip_prefix("/nix/store/")
+            .unwrap_or_else(|_| std::path::Path::new(""));
+        let store_entry = store_relative
+            .to_string_lossy()
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        // Valid Nix store paths have the form <32-char-hash>-<name>
+        if store_entry.len() >= 34 && store_entry.as_bytes()[32] == b'-' {
+            return Ok(());
+        }
+        return Err(NucleusError::FilesystemError(format!(
+            "Rootfs symlink {:?} resolves to invalid /nix/store path: {:?}",
+            path, resolved
+        )));
     }
 
     Err(NucleusError::FilesystemError(format!(

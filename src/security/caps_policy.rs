@@ -53,7 +53,53 @@ pub struct CapSetPolicy {
     pub keep: Vec<String>,
 }
 
+/// Capabilities that are too dangerous for container workloads.
+/// These must be explicitly rejected in production mode.
+const DANGEROUS_CAPABILITIES: &[Capability] = &[
+    Capability::CAP_SYS_ADMIN,
+    Capability::CAP_SYS_MODULE,
+    Capability::CAP_SYS_RAWIO,
+    Capability::CAP_SYS_PTRACE,
+    Capability::CAP_DAC_OVERRIDE,
+    Capability::CAP_DAC_READ_SEARCH,
+    Capability::CAP_SYS_BOOT,
+    Capability::CAP_MAC_ADMIN,
+    Capability::CAP_MAC_OVERRIDE,
+    Capability::CAP_SYS_PACCT,
+    Capability::CAP_LINUX_IMMUTABLE,
+    Capability::CAP_BPF,
+    Capability::CAP_PERFMON,
+];
+
 impl CapsPolicy {
+    /// Validate that the policy does not retain dangerous capabilities
+    /// in production mode.
+    pub fn validate_production(&self) -> Result<()> {
+        let sets = self.resolve_sets()?;
+        let all_kept: Vec<&Capability> = sets
+            .bounding
+            .iter()
+            .chain(&sets.permitted)
+            .chain(&sets.effective)
+            .chain(&sets.inheritable)
+            .chain(&sets.ambient)
+            .collect();
+        let mut rejected = Vec::new();
+        for &dangerous in DANGEROUS_CAPABILITIES {
+            if all_kept.contains(&&dangerous) {
+                rejected.push(format!("{:?}", dangerous));
+            }
+        }
+        if !rejected.is_empty() {
+            return Err(NucleusError::ConfigError(format!(
+                "Capability policy retains dangerous capabilities in production mode: [{}]. \
+                 These must be removed for production workloads.",
+                rejected.join(", ")
+            )));
+        }
+        Ok(())
+    }
+
     /// Apply this policy using the given CapabilityManager.
     ///
     /// If all sets are empty, delegates to `drop_all()`.

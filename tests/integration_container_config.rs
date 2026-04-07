@@ -483,7 +483,9 @@ mod tests {
     fn test_namespace_minimal() {
         let ns = NamespaceConfig::minimal();
         assert!(ns.pid && ns.mnt && ns.net && ns.cgroup);
-        assert!(!ns.uts && !ns.ipc && !ns.user && !ns.time);
+        // M10: UTS and IPC are now enabled in minimal config for security
+        assert!(ns.uts && ns.ipc);
+        assert!(!ns.user && !ns.time);
     }
 
     // --- Network state machine ---

@@ -87,7 +87,11 @@ mod tests {
         let config = OciConfig::new(vec!["/bin/sh".to_string()], None);
         let linux = config.linux.unwrap();
         assert!(linux.readonly_paths.contains(&"/proc/sys".to_string()));
+        // M14: sysrq-trigger moved from readonly to masked (null-masked)
         assert!(linux
+            .masked_paths
+            .contains(&"/proc/sysrq-trigger".to_string()));
+        assert!(!linux
             .readonly_paths
             .contains(&"/proc/sysrq-trigger".to_string()));
     }

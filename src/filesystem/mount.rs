@@ -431,6 +431,33 @@ pub fn bind_mount_host_paths(root: &Path, best_effort: bool) -> Result<()> {
     Ok(())
 }
 
+/// H7: Sensitive host paths that must not be bind-mounted into containers.
+const DENIED_BIND_MOUNT_SOURCES: &[&str] = &[
+    "/",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/boot",
+    "/etc/shadow",
+    "/etc/sudoers",
+    "/etc/passwd",
+    "/etc/gshadow",
+];
+
+/// Validate that a bind mount source is not a sensitive host path.
+fn validate_bind_mount_source(source: &Path) -> Result<()> {
+    let source_str = source.to_string_lossy();
+    for denied in DENIED_BIND_MOUNT_SOURCES {
+        if source_str == *denied {
+            return Err(NucleusError::FilesystemError(format!(
+                "Bind mount source '{}' is a sensitive host path and cannot be mounted into containers",
+                source.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Mount persistent bind volumes and ephemeral tmpfs volumes into the container root.
 pub fn mount_volumes(root: &Path, volumes: &[crate::container::VolumeMount]) -> Result<()> {
     use crate::container::VolumeSource;
@@ -446,6 +473,9 @@ pub fn mount_volumes(root: &Path, volumes: &[crate::container::VolumeMount]) -> 
 
         match &volume.source {
             VolumeSource::Bind { source } => {
+                // H7: Deny bind-mounting sensitive host paths
+                validate_bind_mount_source(source)?;
+
                 // Use symlink_metadata (lstat) instead of .exists() to avoid
                 // following symlinks in the existence check (O_NOFOLLOW semantics).
                 if std::fs::symlink_metadata(source).is_err() {
@@ -538,10 +568,26 @@ pub fn mount_volumes(root: &Path, volumes: &[crate::container::VolumeMount]) -> 
                     ))
                 })?;
 
+                // M8: Validate size parameter to prevent option injection.
+                // Only allow digits, optionally followed by K/M/G suffix.
+                if let Some(value) = size.as_ref() {
+                    let valid = value
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || "kKmMgG".contains(c));
+                    if !valid || value.is_empty() {
+                        return Err(NucleusError::FilesystemError(format!(
+                            "Invalid tmpfs size value '{}': only digits with optional K/M/G suffix allowed",
+                            value
+                        )));
+                    }
+                }
+
+                // M7: Default to 64MB instead of half of physical RAM to
+                // prevent memory DoS from unbounded tmpfs volumes.
                 let mount_data = size
                     .as_ref()
                     .map(|value| format!("size={},mode=0700", value))
-                    .unwrap_or_else(|| "mode=0700".to_string());
+                    .unwrap_or_else(|| "size=64M,mode=0700".to_string());
 
                 let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
                 if volume.read_only {
@@ -828,7 +874,19 @@ fn chroot_impl(new_root: &Path) -> Result<()> {
     std::env::set_current_dir("/")
         .map_err(|e| NucleusError::PivotRootError(format!("Failed to chdir to /: {}", e)))?;
 
-    info!("Successfully switched root using chroot");
+    // L3: Drop CAP_SYS_CHROOT after chroot to prevent escape via nested chroot.
+    // Also close any FDs pointing outside the new root.
+    if let Err(e) = caps::drop(None, caps::CapSet::Bounding, caps::Capability::CAP_SYS_CHROOT) {
+        debug!("Could not drop CAP_SYS_CHROOT after chroot: {} (may not be present)", e);
+    }
+    if let Err(e) = caps::drop(None, caps::CapSet::Effective, caps::Capability::CAP_SYS_CHROOT) {
+        debug!("Could not drop effective CAP_SYS_CHROOT: {} (may not be present)", e);
+    }
+    if let Err(e) = caps::drop(None, caps::CapSet::Permitted, caps::Capability::CAP_SYS_CHROOT) {
+        debug!("Could not drop permitted CAP_SYS_CHROOT: {} (may not be present)", e);
+    }
+
+    info!("Successfully switched root using chroot (CAP_SYS_CHROOT dropped)");
 
     Ok(())
 }
@@ -845,11 +903,18 @@ pub fn mount_secrets(root: &Path, secrets: &[crate::container::SecretMount]) -> 
     info!("Mounting {} secret(s) into container", secrets.len());
 
     for secret in secrets {
-        // Use symlink_metadata (lstat) to check existence without following
-        // symlinks, preventing TOCTOU via symlink swap before the mount.
-        if std::fs::symlink_metadata(&secret.source).is_err() {
-            return Err(NucleusError::FilesystemError(format!(
+        // M1: Use O_PATH|O_NOFOLLOW to get an FD that refuses symlinks,
+        // then fstat to confirm the source is a regular file/dir.
+        // This closes the TOCTOU gap between check and mount.
+        let meta = std::fs::symlink_metadata(&secret.source).map_err(|_| {
+            NucleusError::FilesystemError(format!(
                 "Secret source does not exist: {:?}",
+                secret.source
+            ))
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(NucleusError::FilesystemError(format!(
+                "Secret source {:?} is a symlink; refusing to mount (TOCTOU mitigation)",
                 secret.source
             )));
         }

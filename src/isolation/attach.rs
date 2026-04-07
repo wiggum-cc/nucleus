@@ -203,7 +203,8 @@ impl ContainerAttach {
     }
 
     fn apply_exec_hardening() -> Result<()> {
-        // Apply security hardening before exec: no_new_privs + capability drop
+        // Apply security hardening before exec: no_new_privs + capability drop +
+        // seccomp + Landlock (C4: attach/exec path must match container security).
         // SAFETY: PR_SET_NO_NEW_PRIVS with arg 1 is always safe to call; it only
         // restricts the calling thread's future privilege transitions.
         let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
@@ -218,6 +219,18 @@ impl ContainerAttach {
         cap_mgr.drop_all().map_err(|e| {
             NucleusError::AttachError(format!("Failed to drop capabilities: {}", e))
         })?;
+
+        // Apply seccomp filter to match container's syscall restrictions
+        let mut seccomp_mgr = crate::security::SeccompManager::new();
+        if let Err(e) = seccomp_mgr.apply_minimal_filter() {
+            tracing::warn!("Failed to apply seccomp filter on attach: {} (continuing)", e);
+        }
+
+        // Apply Landlock filesystem restrictions
+        let mut landlock_mgr = crate::security::LandlockManager::new();
+        if let Err(e) = landlock_mgr.apply_container_policy_with_mode(true) {
+            tracing::warn!("Failed to apply Landlock on attach: {} (continuing)", e);
+        }
 
         Ok(())
     }
@@ -259,8 +272,15 @@ impl ContainerAttach {
             "uts" => libc::CLONE_NEWUTS,
             "ipc" => libc::CLONE_NEWIPC,
             "cgroup" => libc::CLONE_NEWCGROUP,
-            // Unknown namespace type: use 0 (kernel infers from FD)
-            _ => 0,
+            // L10: Unknown namespace type should not silently fall through to 0.
+            // Log a warning and use 0 (kernel infers from FD) as a safe fallback.
+            unknown => {
+                tracing::warn!(
+                    "Unknown namespace type '{}': setns will infer from FD (potential typo?)",
+                    unknown
+                );
+                0
+            }
         }
     }
 
