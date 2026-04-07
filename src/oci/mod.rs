@@ -440,11 +440,23 @@ impl OciHooks {
                 phase, hook.path
             )));
         }
-        if !hook_path.exists() {
-            return Err(NucleusError::HookError(format!(
-                "{} hook binary not found: {}",
-                phase, hook.path
-            )));
+        // Use symlink_metadata (lstat) instead of .exists() to avoid
+        // following symlinks in the existence check. Reject symlinked hooks
+        // to prevent a TOCTOU swap between the check and exec.
+        match std::fs::symlink_metadata(hook_path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(NucleusError::HookError(format!(
+                    "{} hook path is a symlink (refusing to follow): {}",
+                    phase, hook.path
+                )));
+            }
+            Err(_) => {
+                return Err(NucleusError::HookError(format!(
+                    "{} hook binary not found: {}",
+                    phase, hook.path
+                )));
+            }
+            Ok(_) => {}
         }
 
         // C-1: Validate hook binary ownership and permissions to prevent
@@ -570,7 +582,10 @@ impl OciHooks {
     /// a UID that doesn't match the effective UID or root. This prevents
     /// privilege escalation via tampered hook binaries.
     fn validate_hook_binary(hook_path: &Path, phase: &str) -> Result<()> {
-        let metadata = std::fs::metadata(hook_path).map_err(|e| {
+        // Use symlink_metadata (lstat) to inspect the hook path itself
+        // rather than following symlinks, consistent with the rejection
+        // of symlinked hooks above.
+        let metadata = std::fs::symlink_metadata(hook_path).map_err(|e| {
             NucleusError::HookError(format!(
                 "Failed to stat {} hook {}: {}",
                 phase,

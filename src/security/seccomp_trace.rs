@@ -126,6 +126,9 @@ fn record_loop(pid: u32, output_path: &Path, stop: &AtomicBool) -> Result<()> {
     // setsockopt silently fails with ENOTSOCK.
     use std::os::unix::io::AsRawFd;
     let fd = file.as_raw_fd();
+    // SAFETY: fd is a valid file descriptor from File::open("/dev/kmsg").
+    // F_GETFL/F_SETFL only modify the file status flags; O_NONBLOCK is safe
+    // to set and required for poll-based reading.
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         if flags >= 0 {
@@ -151,6 +154,8 @@ fn record_loop(pid: u32, output_path: &Path, stop: &AtomicBool) -> Result<()> {
                         events: libc::POLLIN,
                         revents: 0,
                     };
+                    // SAFETY: pfd is a valid stack-allocated pollfd with a valid fd.
+                    // poll with nfds=1 and timeout=2000ms is safe; it only blocks.
                     unsafe { libc::poll(&mut pfd, 1, 2000) };
                     continue;
                 }

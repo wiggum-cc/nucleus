@@ -367,15 +367,6 @@ impl ContainerConfig {
     ///
     /// # Panics
     /// Panics if secure random bytes cannot be read from `/dev/urandom`.
-    /// Prefer [`Self::try_new`] for production code.
-    #[deprecated(
-        since = "0.2.1",
-        note = "Use try_new() instead to handle errors gracefully"
-    )]
-    pub fn new(name: Option<String>, command: Vec<String>) -> Self {
-        Self::try_new(name, command).expect("secure container ID generation failed")
-    }
-
     pub fn try_new(name: Option<String>, command: Vec<String>) -> crate::error::Result<Self> {
         let id = generate_container_id()?;
         let name = name.unwrap_or_else(|| id.clone());
@@ -721,6 +712,16 @@ impl ContainerConfig {
                 "Production mode requires explicit --rootfs path (no host bind mounts)".to_string(),
             ));
         };
+
+        // Canonicalize to resolve symlinks before validating the prefix,
+        // preventing symlink-based bypasses (e.g. /nix/store/evil -> /etc).
+        let rootfs_path = std::fs::canonicalize(&rootfs_path).map_err(|e| {
+            crate::error::NucleusError::ConfigError(format!(
+                "Failed to canonicalize rootfs path '{}': {}",
+                rootfs_path.display(),
+                e
+            ))
+        })?;
 
         // Allow test rootfs paths under /tmp that simulate /nix/store structure
         let is_test_rootfs = rootfs_path
@@ -1081,23 +1082,16 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
 
-        let real_dir = std::env::temp_dir().join(format!(
-            "nucleus-test-real-rootfs-{}-{}",
+        // Create a real directory (not a symlink) whose path contains the
+        // test marker so it survives canonicalization.
+        let rootfs = std::env::temp_dir().join(format!(
+            "nucleus-test-nix-store-{}-{}/rootfs",
             std::process::id(),
             id
         ));
-        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::create_dir_all(&rootfs).unwrap();
 
-        let fake_nix_store = std::env::temp_dir().join(format!(
-            "nucleus-test-nix-store-{}-{}",
-            std::process::id(),
-            id
-        ));
-        let link = fake_nix_store.join("nucleus-test-rootfs");
-        std::fs::create_dir_all(&fake_nix_store).unwrap();
-        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
-
-        link
+        rootfs
     }
 
     #[test]

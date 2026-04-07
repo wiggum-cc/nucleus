@@ -275,7 +275,7 @@ pub fn bind_mount_rootfs(root: &Path, rootfs_path: &Path) -> Result<()> {
         rootfs_path, root
     );
 
-    if !rootfs_path.exists() {
+    if std::fs::symlink_metadata(rootfs_path).is_err() {
         return Err(NucleusError::FilesystemError(format!(
             "Rootfs path does not exist: {:?}",
             rootfs_path
@@ -446,7 +446,9 @@ pub fn mount_volumes(root: &Path, volumes: &[crate::container::VolumeMount]) -> 
 
         match &volume.source {
             VolumeSource::Bind { source } => {
-                if !source.exists() {
+                // Use symlink_metadata (lstat) instead of .exists() to avoid
+                // following symlinks in the existence check (O_NOFOLLOW semantics).
+                if std::fs::symlink_metadata(source).is_err() {
                     return Err(NucleusError::FilesystemError(format!(
                         "Volume source does not exist: {:?}",
                         source
@@ -843,7 +845,9 @@ pub fn mount_secrets(root: &Path, secrets: &[crate::container::SecretMount]) -> 
     info!("Mounting {} secret(s) into container", secrets.len());
 
     for secret in secrets {
-        if !secret.source.exists() {
+        // Use symlink_metadata (lstat) to check existence without following
+        // symlinks, preventing TOCTOU via symlink swap before the mount.
+        if std::fs::symlink_metadata(&secret.source).is_err() {
             return Err(NucleusError::FilesystemError(format!(
                 "Secret source does not exist: {:?}",
                 secret.source
@@ -1012,7 +1016,9 @@ fn mount_secrets_inmemory_inner(
     identity: &crate::container::ProcessIdentity,
 ) -> Result<()> {
     for secret in secrets {
-        if !secret.source.exists() {
+        // Use symlink_metadata (lstat) to check existence without following
+        // symlinks, preventing TOCTOU via symlink swap before the read.
+        if std::fs::symlink_metadata(&secret.source).is_err() {
             return Err(NucleusError::FilesystemError(format!(
                 "Secret source does not exist: {:?}",
                 secret.source

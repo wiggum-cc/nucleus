@@ -1,6 +1,8 @@
 use crate::error::{NucleusError, Result, StateTransition};
 use crate::network::config::{BridgeConfig, EgressPolicy, PortForward};
 use crate::network::NetworkState;
+use std::os::fd::FromRawFd;
+use std::os::unix::io::AsRawFd;
 use std::process::Command;
 use tracing::{debug, info, warn};
 
@@ -608,7 +610,8 @@ impl BridgeNetwork {
             .map_err(|e| {
                 NucleusError::NetworkError(format!("Failed to open IP alloc lock: {}", e))
             })?;
-        use std::os::unix::io::AsRawFd;
+        // SAFETY: lock_file is a valid open fd. LOCK_EX is a blocking exclusive
+        // lock that is released when the fd is closed (end of scope).
         let lock_ret = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
         if lock_ret != 0 {
             return Err(NucleusError::NetworkError(format!(
@@ -850,22 +853,30 @@ impl BridgeNetwork {
         let memfd_name = std::ffi::CString::new("nucleus-resolv").map_err(|e| {
             NucleusError::NetworkError(format!("Failed to create memfd name: {}", e))
         })?;
-        let memfd_fd = unsafe { libc::memfd_create(memfd_name.as_ptr(), 0) };
-        if memfd_fd < 0 {
+        // SAFETY: memfd_name is a valid NUL-terminated CString. memfd_create
+        // returns a new fd or -1 on error; we check for error below.
+        let raw_fd = unsafe { libc::memfd_create(memfd_name.as_ptr(), 0) };
+        if raw_fd < 0 {
             // Fallback to staging file if memfd_create is unavailable
             return Self::bind_mount_resolv_conf_staging(root, dns);
         }
+        // SAFETY: raw_fd is a valid, newly-created fd from memfd_create.
+        // OwnedFd takes ownership and will close it exactly once on drop,
+        // preventing double-close on any error path.
+        let memfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) };
 
         // Write content to memfd
+        // SAFETY: memfd is a valid open fd. content is a valid byte buffer
+        // with correct length. write() may return -1 on error.
         let write_result = unsafe {
             libc::write(
-                memfd_fd,
+                memfd.as_raw_fd(),
                 content.as_ptr() as *const libc::c_void,
                 content.len(),
             )
         };
         if write_result < 0 {
-            unsafe { libc::close(memfd_fd) };
+            // memfd dropped here, closing the fd automatically
             return Self::bind_mount_resolv_conf_staging(root, dns);
         }
 
@@ -876,7 +887,7 @@ impl BridgeNetwork {
         }
 
         // Bind mount the memfd over the read-only resolv.conf
-        let memfd_path = format!("/proc/self/fd/{}", memfd_fd);
+        let memfd_path = format!("/proc/self/fd/{}", memfd.as_raw_fd());
         mount(
             Some(memfd_path.as_str()),
             &target,
@@ -885,12 +896,12 @@ impl BridgeNetwork {
             None::<&str>,
         )
         .map_err(|e| {
-            unsafe { libc::close(memfd_fd) };
+            // memfd dropped here via the returned Err, closing the fd automatically
             NucleusError::NetworkError(format!("Failed to bind mount resolv.conf: {}", e))
         })?;
 
-        // Close the fd — the mount keeps the file alive
-        unsafe { libc::close(memfd_fd) };
+        // memfd dropped here — the mount holds a kernel reference to the file,
+        // so it survives the fd close.
 
         info!("Bind-mounted resolv.conf for bridge networking (rootfs mode, memfd)");
         Ok(())

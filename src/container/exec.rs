@@ -230,6 +230,8 @@ impl Container {
     }
 
     pub(super) fn enforce_no_new_privs(&self) -> Result<()> {
+        // SAFETY: PR_SET_NO_NEW_PRIVS with arg 1 is always safe to call; it only
+        // restricts the calling thread's future privilege transitions.
         let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
         if ret != 0 {
             return Err(NucleusError::ExecError(format!(

@@ -304,7 +304,9 @@ impl Container {
         let mut staged = Vec::with_capacity(secrets.len());
 
         for secret in secrets {
-            if !secret.source.exists() {
+            // Use symlink_metadata (lstat) to check existence without following
+            // symlinks, preventing TOCTOU via symlink swap before the read.
+            if std::fs::symlink_metadata(&secret.source).is_err() {
                 return Err(NucleusError::FilesystemError(format!(
                     "Secret source does not exist: {:?}",
                     secret.source

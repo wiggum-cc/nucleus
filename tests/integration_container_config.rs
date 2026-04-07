@@ -18,6 +18,21 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
+    /// Create a temp directory whose path contains the test-nix-store marker
+    /// so it passes production mode rootfs validation after canonicalization.
+    fn test_rootfs_path() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "nucleus-test-nix-store-integ-{}-{}/rootfs",
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     // --- Container ID generation ---
 
     #[test]
@@ -268,10 +283,11 @@ mod tests {
 
     #[test]
     fn test_production_mode_requires_rootfs_attestation() {
+        let rootfs = test_rootfs_path();
         let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
             .with_service_mode(ServiceMode::Production)
-            .with_rootfs_path(PathBuf::from("/nix/store/fake-rootfs"))
+            .with_rootfs_path(rootfs)
             .with_limits(
                 ResourceLimits::unlimited()
                     .with_memory("512M")
@@ -286,11 +302,12 @@ mod tests {
 
     #[test]
     fn test_production_mode_rejects_degraded_security() {
+        let rootfs = test_rootfs_path();
         let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_allow_degraded_security(true)
-            .with_rootfs_path(PathBuf::from("/nix/store/fake"))
+            .with_rootfs_path(rootfs)
             .with_limits(
                 ResourceLimits::unlimited()
                     .with_memory("512M")
@@ -305,11 +322,12 @@ mod tests {
 
     #[test]
     fn test_production_mode_rejects_chroot_fallback() {
+        let rootfs = test_rootfs_path();
         let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_allow_chroot_fallback(true)
-            .with_rootfs_path(PathBuf::from("/nix/store/fake"))
+            .with_rootfs_path(rootfs)
             .with_limits(
                 ResourceLimits::unlimited()
                     .with_memory("512M")
@@ -324,11 +342,12 @@ mod tests {
 
     #[test]
     fn test_production_mode_rejects_host_network_flag() {
+        let rootfs = test_rootfs_path();
         let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_allow_host_network(true)
-            .with_rootfs_path(PathBuf::from("/nix/store/fake"))
+            .with_rootfs_path(rootfs)
             .with_limits(
                 ResourceLimits::unlimited()
                     .with_memory("512M")
@@ -359,10 +378,11 @@ mod tests {
 
     #[test]
     fn test_production_mode_requires_memory_limit() {
+        let rootfs = test_rootfs_path();
         let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
             .with_service_mode(ServiceMode::Production)
-            .with_rootfs_path(PathBuf::from("/nix/store/fake"))
+            .with_rootfs_path(rootfs)
             .with_limits(ResourceLimits::unlimited().with_cpu_cores(1.0).unwrap());
 
         let err = config.validate_production_mode().unwrap_err();
@@ -371,10 +391,11 @@ mod tests {
 
     #[test]
     fn test_production_mode_requires_cpu_limit() {
+        let rootfs = test_rootfs_path();
         let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
             .with_service_mode(ServiceMode::Production)
-            .with_rootfs_path(PathBuf::from("/nix/store/fake"))
+            .with_rootfs_path(rootfs)
             .with_limits(ResourceLimits::unlimited().with_memory("512M").unwrap());
 
         let err = config.validate_production_mode().unwrap_err();

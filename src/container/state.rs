@@ -420,39 +420,54 @@ impl ContainerStateManager {
             // Final fallback for restricted sandboxes where standard runtime/home
             // paths are mounted read-only. Use a private directory under /tmp
             // with O_NOFOLLOW semantics to prevent symlink attacks.
+            //
+            // We avoid the TOCTOU pattern of .exists() then create_dir_all()
+            // by attempting mkdir atomically and validating the result.
             let uid = nix::unistd::Uid::effective().as_raw();
             let fallback = PathBuf::from(format!("/tmp/nucleus-{}", uid));
-            // Only add the /tmp fallback if it either doesn't exist yet
-            // (will be created later) or passes symlink/ownership checks.
-            let fallback_ok = if fallback.exists() {
-                match std::fs::symlink_metadata(&fallback) {
-                    Ok(meta) => {
-                        use std::os::unix::fs::MetadataExt;
-                        if meta.file_type().is_symlink() {
+            let fallback_ok = match std::fs::create_dir(&fallback) {
+                Ok(()) => {
+                    // We created it — it's ours with correct ownership.
+                    true
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Already exists: validate it is not a symlink and is owned by us.
+                    // symlink_metadata (lstat) does not follow symlinks.
+                    use std::os::unix::fs::MetadataExt;
+                    match std::fs::symlink_metadata(&fallback) {
+                        Ok(meta) => {
+                            if meta.file_type().is_symlink() {
+                                tracing::warn!(
+                                    "Skipping {} — it is a symlink (possible attack)",
+                                    fallback.display()
+                                );
+                                false
+                            } else if meta.uid() != uid {
+                                tracing::warn!(
+                                    "Skipping {} — owned by UID {} not {}",
+                                    fallback.display(),
+                                    meta.uid(),
+                                    uid
+                                );
+                                false
+                            } else {
+                                true
+                            }
+                        }
+                        Err(e) => {
                             tracing::warn!(
-                                "Skipping {} — it is a symlink (possible attack)",
-                                fallback.display()
-                            );
-                            false
-                        } else if meta.uid() != uid {
-                            tracing::warn!(
-                                "Skipping {} — owned by UID {} not {}",
+                                "Skipping {} — cannot stat: {}",
                                 fallback.display(),
-                                meta.uid(),
-                                uid
+                                e
                             );
                             false
-                        } else {
-                            true
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("Skipping {} — cannot stat: {}", fallback.display(), e);
-                        false
-                    }
                 }
-            } else {
-                true
+                Err(_) => {
+                    // Cannot create (e.g. /tmp read-only) — skip this candidate.
+                    false
+                }
             };
             if fallback_ok {
                 candidates.push(fallback);

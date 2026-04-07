@@ -374,6 +374,8 @@ impl GVisorRuntime {
                 thread_count
             )));
         }
+        // SAFETY: PR_SET_NO_NEW_PRIVS with arg 1 is always safe; we verified
+        // single-threaded above so no other thread can race this prctl.
         let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
         if ret != 0 {
             return Err(NucleusError::GVisorError(format!(

@@ -984,7 +984,13 @@ fn main() -> Result<()> {
             }
 
             if let Some(ctx) = context {
-                config = config.with_context(PathBuf::from(ctx));
+                let canonical_ctx = std::fs::canonicalize(&ctx).map_err(|e| {
+                    NucleusError::ConfigError(format!(
+                        "Failed to canonicalize context path '{}': {}",
+                        ctx, e
+                    ))
+                })?;
+                config = config.with_context(canonical_ctx);
             }
 
             if let Some(host) = hostname {
@@ -999,9 +1005,22 @@ fn main() -> Result<()> {
                 config = config.with_bundle_dir(bundle_dir.clone());
             }
 
-            // Console socket
+            // Console socket — canonicalize parent to prevent symlink traversal
             if let Some(ref socket_path) = console_socket {
-                config = config.with_console_socket(socket_path.clone());
+                let socket = PathBuf::from(socket_path);
+                let canonical = if let Some(parent) = socket.parent() {
+                    let canon_parent = std::fs::canonicalize(parent).map_err(|e| {
+                        NucleusError::ConfigError(format!(
+                            "Failed to canonicalize console socket parent '{}': {}",
+                            parent.display(),
+                            e
+                        ))
+                    })?;
+                    canon_parent.join(socket.file_name().unwrap_or_default())
+                } else {
+                    socket
+                };
+                config = config.with_console_socket(canonical);
             }
 
             if rootless {
@@ -1026,7 +1045,13 @@ fn main() -> Result<()> {
 
             // Seccomp profile and mode
             if let Some(profile_path) = seccomp_profile {
-                config = config.with_seccomp_profile(PathBuf::from(profile_path));
+                let canonical = std::fs::canonicalize(&profile_path).map_err(|e| {
+                    NucleusError::ConfigError(format!(
+                        "Failed to canonicalize seccomp profile path '{}': {}",
+                        profile_path, e
+                    ))
+                })?;
+                config = config.with_seccomp_profile(canonical);
             }
             if let Some(sha256) = seccomp_profile_sha256 {
                 config = config.with_seccomp_profile_sha256(sha256);
@@ -1047,7 +1072,13 @@ fn main() -> Result<()> {
 
             // Capability policy
             if let Some(path) = caps_policy {
-                config = config.with_caps_policy(PathBuf::from(path));
+                let canonical = std::fs::canonicalize(&path).map_err(|e| {
+                    NucleusError::ConfigError(format!(
+                        "Failed to canonicalize capability policy path '{}': {}",
+                        path, e
+                    ))
+                })?;
+                config = config.with_caps_policy(canonical);
             }
             if let Some(sha256) = caps_policy_sha256 {
                 config = config.with_caps_policy_sha256(sha256);
@@ -1055,7 +1086,13 @@ fn main() -> Result<()> {
 
             // Landlock policy
             if let Some(path) = landlock_policy {
-                config = config.with_landlock_policy(PathBuf::from(path));
+                let canonical = std::fs::canonicalize(&path).map_err(|e| {
+                    NucleusError::ConfigError(format!(
+                        "Failed to canonicalize Landlock policy path '{}': {}",
+                        path, e
+                    ))
+                })?;
+                config = config.with_landlock_policy(canonical);
             }
             if let Some(sha256) = landlock_policy_sha256 {
                 config = config.with_landlock_policy_sha256(sha256);
@@ -1256,25 +1293,44 @@ fn main() -> Result<()> {
 
             // OCI lifecycle hooks
             if let Some(hooks_path) = hooks {
+                let hooks_path = std::fs::canonicalize(&hooks_path).map_err(|e| {
+                    NucleusError::ConfigError(format!(
+                        "Failed to canonicalize hooks path '{}': {}",
+                        hooks_path, e
+                    ))
+                })?;
                 let hooks_json = std::fs::read_to_string(&hooks_path).map_err(|e| {
                     NucleusError::ConfigError(format!(
                         "Failed to read hooks file '{}': {}",
-                        hooks_path, e
+                        hooks_path.display(), e
                     ))
                 })?;
                 let oci_hooks: nucleus::security::OciHooks = serde_json::from_str(&hooks_json)
                     .map_err(|e| {
                         NucleusError::ConfigError(format!(
                             "Failed to parse hooks file '{}': {}",
-                            hooks_path, e
+                            hooks_path.display(), e
                         ))
                     })?;
                 config.hooks = Some(oci_hooks);
             }
 
-            // PID file path (OCI runtime interface)
+            // PID file path — canonicalize parent to prevent symlink traversal
             if let Some(ref pid_path) = pid_file {
-                config = config.with_pid_file(pid_path.clone());
+                let pid = PathBuf::from(pid_path);
+                let canonical = if let Some(parent) = pid.parent() {
+                    let canon_parent = std::fs::canonicalize(parent).map_err(|e| {
+                        NucleusError::ConfigError(format!(
+                            "Failed to canonicalize PID file parent '{}': {}",
+                            parent.display(),
+                            e
+                        ))
+                    })?;
+                    canon_parent.join(pid.file_name().unwrap_or_default())
+                } else {
+                    pid
+                };
+                config = config.with_pid_file(canonical);
             }
 
             if !quiet_id {

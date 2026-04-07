@@ -129,6 +129,8 @@ impl ContainerAttach {
         // Phase 1: user namespace (must be first)
         for (ns_name, fd) in ns_fds {
             if ns_name == "user" {
+                // SAFETY: fd is a valid open file descriptor obtained from /proc/<pid>/ns/user.
+                // setns with CLONE_NEWUSER joins the user namespace; fd remains valid after the call.
                 let ret = unsafe { libc::setns(fd.as_raw_fd(), libc::CLONE_NEWUSER) };
                 if ret != 0 {
                     let err = std::io::Error::last_os_error();
@@ -153,6 +155,8 @@ impl ContainerAttach {
 
             let nstype = Self::ns_name_to_clone_flag(ns_name);
             let raw_fd = fd.as_raw_fd();
+            // SAFETY: raw_fd is a valid open file descriptor from /proc/<pid>/ns/<ns>.
+            // nstype is the correct clone flag for this namespace type.
             let ret = unsafe { libc::setns(raw_fd, nstype) };
             if ret != 0 {
                 let err = std::io::Error::last_os_error();
@@ -165,6 +169,8 @@ impl ContainerAttach {
         }
 
         if let Some(fd) = pid_ns_fd {
+            // SAFETY: fd is a valid open file descriptor from /proc/<pid>/ns/pid.
+            // PID namespace takes effect on next fork, which follows immediately.
             let ret = unsafe { libc::setns(fd.as_raw_fd(), libc::CLONE_NEWPID) };
             if ret != 0 {
                 let err = std::io::Error::last_os_error();
@@ -198,6 +204,8 @@ impl ContainerAttach {
 
     fn apply_exec_hardening() -> Result<()> {
         // Apply security hardening before exec: no_new_privs + capability drop
+        // SAFETY: PR_SET_NO_NEW_PRIVS with arg 1 is always safe to call; it only
+        // restricts the calling thread's future privilege transitions.
         let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
         if ret != 0 {
             return Err(NucleusError::AttachError(format!(

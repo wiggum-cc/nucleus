@@ -22,7 +22,7 @@ use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
 use nix::sys::stat::Mode;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, pipe, read, write, ForkResult, Pid};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -265,7 +265,9 @@ impl Container {
                     let cpu_millicores = config
                         .limits
                         .cpu_quota_us
-                        .map(|quota| (quota * 1000) / config.limits.cpu_period_us);
+                        .map(|quota| {
+                            quota.saturating_mul(1000) / config.limits.cpu_period_us
+                        });
                     let mut state = ContainerState::new(ContainerStateParams {
                         id: config.id.clone(),
                         name: config.name.clone(),
@@ -939,7 +941,7 @@ impl Container {
     fn wait_for_namespace_ready(ready_read: &OwnedFd, child: Pid) -> Result<u32> {
         let mut pid_buf = [0u8; 4];
         loop {
-            match read(ready_read.as_raw_fd(), &mut pid_buf) {
+            match read(ready_read, &mut pid_buf) {
                 Err(nix::errno::Errno::EINTR) => continue,
                 Ok(4) => return Ok(u32::from_ne_bytes(pid_buf)),
                 Ok(0) => {
