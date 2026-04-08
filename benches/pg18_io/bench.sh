@@ -292,17 +292,15 @@ run_nucleus_bench() {
   # Clean up any stale container state from a previous run
   "$NUCLEUS_BIN" delete "pg18-bench-${io_method}" 2>/dev/null || true
 
-  # For io_uring mode, use a custom seccomp profile that adds io_uring_*
-  # syscalls (excluded from nucleus defaults due to kernel CVE history).
+  # For io_uring mode, opt in to io_uring_* syscalls via --seccomp-allow
+  # (excluded from nucleus defaults due to kernel CVE history).
   local seccomp_args=()
   if [ "$io_method" = "io_uring" ]; then
-    local profile_path
-    profile_path="$(cd "$(dirname "$0")" && pwd)/seccomp.json"
-    if [ -f "$profile_path" ]; then
-      seccomp_args=(--seccomp-profile "$profile_path")
-    else
-      echo "WARNING: seccomp.json not found at $profile_path, io_uring may be blocked" >&2
-    fi
+    seccomp_args=(
+      --seccomp-allow io_uring_setup
+      --seccomp-allow io_uring_enter
+      --seccomp-allow io_uring_register
+    )
   fi
 
   "$NUCLEUS_BIN" create \
@@ -315,6 +313,7 @@ run_nucleus_bench() {
     --trust-level trusted \
     --allow-degraded-security \
     --allow-chroot-fallback \
+    --seccomp-log-denied \
     --pids 0 \
     --volume "$pgdata:/pgdata" \
     --volume "/nix:/nix:ro" \

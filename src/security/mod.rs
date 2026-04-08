@@ -18,5 +18,5 @@ pub use landlock_policy::LandlockPolicy;
 pub use policy::{load_json_policy, load_toml_policy, sha256_hex};
 pub use seccomp::*;
 pub use seccomp_generate::{generate_from_trace, SeccompProfile};
-pub use seccomp_trace::SeccompTraceReader;
+pub use seccomp_trace::{SeccompDenyLogger, SeccompTraceReader};
 pub use state::*;

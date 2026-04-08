@@ -209,6 +209,139 @@ fn write_trace_file(path: &Path, syscalls: &BTreeMap<i64, u64>) -> Result<()> {
     Ok(())
 }
 
+/// Reads `/dev/kmsg` for SECCOMP deny records and emits WARN-level logs.
+///
+/// When `--seccomp-log-denied` is set with `SECCOMP_FILTER_FLAG_LOG`, the
+/// kernel logs denied syscalls to the audit subsystem. This reader runs in
+/// the parent process (which survives the child kill) and surfaces those
+/// records as application-level warnings.
+pub struct SeccompDenyLogger {
+    pid: u32,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl SeccompDenyLogger {
+    pub fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            stop: Arc::new(AtomicBool::new(false)),
+            handle: None,
+        }
+    }
+
+    /// Start the background reader thread.
+    pub fn start(&mut self) -> Result<()> {
+        let pid = self.pid;
+        let stop = self.stop.clone();
+
+        let handle = std::thread::spawn(move || {
+            if let Err(e) = deny_log_loop(pid, &stop) {
+                warn!("Seccomp deny logger error: {}", e);
+            }
+        });
+
+        self.handle = Some(handle);
+        debug!("Seccomp deny logger started for PID {}", self.pid);
+        Ok(())
+    }
+
+    /// Signal the logger to stop and join the thread.
+    pub fn stop(mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for SeccompDenyLogger {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Main deny-log loop — reads /dev/kmsg and emits WARN for denied syscalls.
+fn deny_log_loop(pid: u32, stop: &AtomicBool) -> Result<()> {
+    let kmsg_path = std::path::Path::new("/dev/kmsg");
+    if let Ok(meta) = std::fs::symlink_metadata(kmsg_path) {
+        if meta.file_type().is_symlink() {
+            warn!("/dev/kmsg is a symlink — refusing to open for seccomp deny logging");
+            return Ok(());
+        }
+    }
+
+    let file = match std::fs::File::open(kmsg_path) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(
+                "Cannot open /dev/kmsg for seccomp deny logging: {} \
+                 (requires root or CAP_SYSLOG)",
+                e
+            );
+            return Ok(());
+        }
+    };
+
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY: fd is a valid file descriptor from File::open("/dev/kmsg").
+    // F_GETFL/F_SETFL only modify the file status flags; O_NONBLOCK is safe
+    // to set and required for poll-based reading.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+
+    let reader = BufReader::new(file);
+    let pid_pattern = format!("pid={}", pid);
+
+    for line in reader.lines() {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // SAFETY: pfd is a valid stack-allocated pollfd with a valid fd.
+                    // poll with nfds=1 and timeout=2000ms is safe; it only blocks.
+                    unsafe { libc::poll(&mut pfd, 1, 2000) };
+                    continue;
+                }
+                debug!("kmsg read error: {}", e);
+                continue;
+            }
+        };
+
+        if line.contains("type=1326") && line.contains(&pid_pattern) {
+            if let Some(nr) = extract_syscall_nr(&line) {
+                let name = super::seccomp_generate::syscall_number_to_name(nr)
+                    .unwrap_or("unknown");
+                warn!(
+                    syscall = nr,
+                    name = name,
+                    pid = pid,
+                    "seccomp denied syscall"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

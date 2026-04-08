@@ -14,8 +14,8 @@ use crate::isolation::NamespaceManager;
 use crate::network::{BridgeNetwork, NetworkMode};
 use crate::resources::Cgroup;
 use crate::security::{
-    CapabilityManager, GVisorRuntime, LandlockManager, OciContainerState, OciHooks, SeccompManager,
-    SeccompTraceReader, SecurityState,
+    CapabilityManager, GVisorRuntime, LandlockManager, OciContainerState, OciHooks,
+    SeccompDenyLogger, SeccompManager, SeccompTraceReader, SecurityState,
 };
 use nix::sys::signal::{kill, Signal};
 use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
@@ -56,6 +56,7 @@ pub struct CreatedContainer {
     pub(super) cgroup_opt: Option<Cgroup>,
     pub(super) bridge_net: Option<BridgeNetwork>,
     pub(super) trace_reader: Option<SeccompTraceReader>,
+    pub(super) deny_logger: Option<SeccompDenyLogger>,
     pub(super) exec_fifo_path: Option<PathBuf>,
     pub(super) _lifecycle_span: tracing::Span,
 }
@@ -358,6 +359,7 @@ impl Container {
 
                     let mut bridge_net: Option<BridgeNetwork> = None;
                     let trace_reader = Self::maybe_start_seccomp_trace_reader(&config, target_pid)?;
+                    let deny_logger = Self::maybe_start_seccomp_deny_logger(&config, target_pid)?;
 
                     // Transition: Creating -> Created
                     state.status = OciStatus::Created;
@@ -417,6 +419,7 @@ impl Container {
                         cgroup_opt,
                         bridge_net,
                         trace_reader,
+                        deny_logger,
                         exec_fifo_path: exec_fifo,
                         _lifecycle_span: lifecycle_span.clone(),
                     })
@@ -1276,6 +1279,10 @@ impl CreatedContainer {
 
         if let Some(reader) = self.trace_reader.take() {
             reader.stop_and_flush();
+        }
+
+        if let Some(logger) = self.deny_logger.take() {
+            logger.stop();
         }
 
         if let Some(cgroup) = self.cgroup_opt.take() {

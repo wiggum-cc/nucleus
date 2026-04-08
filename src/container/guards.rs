@@ -1,7 +1,7 @@
 use crate::container::{ContainerConfig, KernelLockdownMode};
 use crate::error::{NucleusError, Result};
 use crate::network::NetworkMode;
-use crate::security::{GVisorRuntime, SeccompTraceReader};
+use crate::security::{GVisorRuntime, SeccompDenyLogger, SeccompTraceReader};
 use tracing::{info, warn};
 
 use super::runtime::Container;
@@ -151,5 +151,22 @@ impl Container {
         let mut reader = SeccompTraceReader::new(target_pid, log_path);
         reader.start_recording()?;
         Ok(Some(reader))
+    }
+
+    pub(super) fn maybe_start_seccomp_deny_logger(
+        config: &ContainerConfig,
+        target_pid: u32,
+    ) -> Result<Option<SeccompDenyLogger>> {
+        if !config.seccomp_log_denied {
+            return Ok(None);
+        }
+        if config.seccomp_mode == crate::container::config::SeccompMode::Trace {
+            // Trace mode already logs everything; deny logger would be redundant
+            return Ok(None);
+        }
+
+        let mut logger = SeccompDenyLogger::new(target_pid);
+        logger.start()?;
+        Ok(Some(logger))
     }
 }
