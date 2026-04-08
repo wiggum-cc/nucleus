@@ -300,10 +300,11 @@ run_nucleus_bench() {
       --seccomp-allow io_uring_setup
       --seccomp-allow io_uring_enter
       --seccomp-allow io_uring_register
+      --memlock 8M
     )
   fi
 
-  "$NUCLEUS_BIN" create \
+  RUST_LOG=warn "$NUCLEUS_BIN" create \
     --name "pg18-bench-${io_method}" \
     --user "$PG_UID" \
     --group "$PG_GID" \

@@ -186,6 +186,11 @@ enum Commands {
         #[arg(long)]
         pids: Option<u64>,
 
+        /// RLIMIT_MEMLOCK limit (e.g. "8M"). Required for io_uring ring buffers.
+        /// Default: 64K.
+        #[arg(long)]
+        memlock: Option<String>,
+
         /// Enable swap (by default swap is disabled when --memory is set)
         #[arg(long)]
         swap: bool,
@@ -879,6 +884,7 @@ fn main() -> Result<()> {
             cpu_weight,
             io_limits,
             pids,
+            memlock,
             swap,
             hostname,
             runtime,
@@ -1052,6 +1058,10 @@ fn main() -> Result<()> {
                     limits = limits.with_pids(max_pids)?;
                     info!("PID limit: {}", max_pids);
                 }
+            }
+
+            if let Some(ref memlock_str) = memlock {
+                limits = limits.with_memlock(memlock_str)?;
             }
 
             for io_spec in &io_limits {

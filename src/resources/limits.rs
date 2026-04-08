@@ -109,6 +109,9 @@ pub struct ResourceLimits {
     pub pids_max: Option<u64>,
     /// Per-device I/O limits
     pub io_limits: Vec<IoDeviceLimit>,
+    /// RLIMIT_MEMLOCK in bytes (None = use default 64KB).
+    /// io_uring requires a larger limit (e.g. 8M) for ring buffers.
+    pub memlock_bytes: Option<u64>,
 }
 
 impl ResourceLimits {
@@ -123,6 +126,7 @@ impl ResourceLimits {
             cpu_weight: None,
             pids_max: None,
             io_limits: Vec::new(),
+            memlock_bytes: None,
         }
     }
 
@@ -226,6 +230,12 @@ impl ResourceLimits {
     pub fn with_io_limit(mut self, limit: IoDeviceLimit) -> Self {
         self.io_limits.push(limit);
         self
+    }
+
+    /// Set RLIMIT_MEMLOCK (e.g. "8M" for io_uring ring buffers)
+    pub fn with_memlock(mut self, limit: &str) -> Result<Self> {
+        self.memlock_bytes = Some(Self::parse_memory(limit)?);
+        Ok(self)
     }
 }
 

@@ -808,8 +808,8 @@ impl Container {
             // RLIMIT_MEMLOCK: prevent container from pinning excessive physical
             // memory via mlock(). Default 64KB matches unprivileged default, but
             // in a user namespace the container appears as UID 0 and may have a
-            // higher inherited limit.
-            let memlock_limit: u64 = 64 * 1024; // 64KB
+            // higher inherited limit. Configurable via --memlock for io_uring etc.
+            let memlock_limit: u64 = self.config.limits.memlock_bytes.unwrap_or(64 * 1024);
             let rlim_memlock = libc::rlimit {
                 rlim_cur: memlock_limit,
                 rlim_max: memlock_limit,
