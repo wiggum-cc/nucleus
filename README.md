@@ -1,5 +1,8 @@
 # Nucleus
 
+[![Crates.io](https://img.shields.io/crates/v/nucleus-container.svg)](https://crates.io/crates/nucleus-container)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 **Extremely lightweight Docker alternative for agents and production services**
 
 Nucleus is a minimalist container runtime for Linux. It provides isolated execution environments using Linux kernel primitives without the overhead of traditional container runtimes. Nucleus supports two operating modes:
@@ -44,8 +47,6 @@ benchmark noise rather than a guaranteed speedup.
 > bind-mounted host `pgdata` directory and `--network host`, so it measures the
 > steady-state cost of Nucleus isolation rather than VM or gVisor emulation
 > overhead. Full results: [`benches/pg18_io/results/`](benches/pg18_io/results/)
-
-[![Crates.io](https://img.shields.io/crates/v/nucleus-container.svg)](https://crates.io/crates/nucleus-container)
 
 ## Why Nucleus?
 
