@@ -13,6 +13,7 @@ Nucleus is a minimalist container runtime for Linux. It provides isolated execut
 - **Memory-backed filesystems** – Container disk mapped to tmpfs, pre-populated with agent context
 - **gVisor integration** – Optional application kernel for enhanced security, including networked service mode
 - **OCI runtime-spec subset for gVisor** – Generates OCI bundle/config data for `runsc`, including process identity, mounts, namespaces, seccomp, hooks, and cgroup path wiring
+- **Detached mode** – Run containers in the background as systemd transient services with `--detach`, managed via `nucleus stop`/`logs`/`attach`
 - **Production service support** – Declarative NixOS module, egress policies, health checks, secrets mounting, sd_notify, and journald integration
 - **Explicit workload identity** – Native and gVisor runtimes can drop to a configured `uid`/`gid` plus supplementary groups after privileged setup
 - **Minimal rootfs** – Replace host bind mounts with a purpose-built Nix store closure for production services
@@ -106,6 +107,38 @@ nucleus run -e DEBUG=1 -- ./agent
 # Pass sensitive values via --secret (mounted in-memory at /run/secrets)
 nucleus run --secret /path/to/api-key:/run/secrets/api_key -- ./agent
 ```
+
+### Detached Mode
+
+Use `-d`/`--detach` to run a container in the background as a systemd transient service. The CLI prints the container ID and exits immediately; systemd supervises the container process.
+
+```bash
+# Run a container in the background
+nucleus create -d --memory 512M -- /bin/sleep 3600
+# prints: a1b2c3d4e5f6...
+
+# All management commands work with detached containers
+nucleus state                        # list running containers
+nucleus logs <container>             # view stdout/stderr (from journald)
+nucleus logs -f <container>          # follow logs
+nucleus logs -n 50 <container>       # last 50 lines
+nucleus attach <container>           # exec into it
+nucleus stop <container>             # graceful SIGTERM → SIGKILL
+nucleus kill <container>             # send signal
+
+# Detach works with all create flags
+nucleus create -d \
+  --name my-service \
+  --memory 1G --cpus 2 \
+  --network bridge -p 8080:80 \
+  -- ./my-server
+
+# systemd unit is named nucleus-<id-prefix>
+systemctl status nucleus-a1b2c3d4e5f6
+journalctl -u nucleus-a1b2c3d4e5f6
+```
+
+The systemd transient service uses `KillMode=mixed` and `TimeoutStopSec=30`, so `systemctl stop` also works for graceful shutdown. The `--collect` flag ensures the unit is garbage-collected after the container exits.
 
 ### Production Mode
 
@@ -309,6 +342,11 @@ nucleus ps --all
 
 # Show resource usage statistics
 nucleus stats
+
+# View logs for a detached container (from systemd journal)
+nucleus logs <container>
+nucleus logs -f <container>          # follow output
+nucleus logs -n 100 <container>      # last 100 lines
 
 # Stop a container (SIGTERM, then SIGKILL after timeout)
 nucleus stop <container>

@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Detached mode (`-d`/`--detach`) for running containers in the background as systemd transient services
+  - `nucleus create -d` prints the container ID and exits immediately
+  - Container process supervised by systemd (`systemd-run --collect`)
+  - Graceful shutdown via `KillMode=mixed` with 30s `TimeoutStopSec`
+  - Compatible with all existing management commands (`stop`, `kill`, `attach`, `state`, `stats`)
+- `nucleus logs` command for viewing detached container output from the systemd journal
+  - `-f`/`--follow` for live log tailing
+  - `-n`/`--lines` to limit output to recent lines
+
 - Initial implementation of Nucleus container runtime
 - Security enforcement with state machine (Privileged → CapabilitiesDropped → SeccompApplied → LandlockApplied → Locked)
 - gVisor integration with state machine (NativeKernel → GVisorKernel)

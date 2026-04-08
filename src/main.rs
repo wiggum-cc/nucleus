@@ -194,9 +194,17 @@ enum Commands {
         #[arg(long, default_value = "gvisor")]
         runtime: RuntimeSelection,
 
+        /// Run container in the background as a systemd transient service
+        #[arg(short = 'd', long)]
+        detach: bool,
+
         /// Internal: suppress printing the container ID before execution
         #[arg(long, hide = true)]
         quiet_id: bool,
+
+        /// Internal: use a pre-generated container ID (set by --detach re-exec)
+        #[arg(long, hide = true)]
+        preset_id: Option<String>,
 
         /// Run in rootless mode with user namespace
         #[arg(long)]
@@ -491,6 +499,20 @@ enum Commands {
         input: String,
     },
 
+    /// View logs for a detached container (from systemd journal)
+    Logs {
+        /// Container ID, name, or ID prefix
+        container: String,
+
+        /// Follow log output (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+
+        /// Number of recent lines to show (default: all)
+        #[arg(short = 'n', long)]
+        lines: Option<u64>,
+    },
+
     /// Manage multi-container topologies (Compose equivalent)
     #[command(subcommand)]
     Compose(ComposeCommands),
@@ -753,6 +775,38 @@ fn main() -> Result<()> {
             std::process::exit(exit_code);
         }
 
+        Commands::Logs {
+            container,
+            follow,
+            lines,
+        } => {
+            let state_mgr = ContainerStateManager::new_with_root(state_root.clone())?;
+            let state = state_mgr.resolve_container(&container)?;
+            let unit_name = format!("nucleus-{}", &state.id[..12.min(state.id.len())]);
+
+            let mut cmd = std::process::Command::new("journalctl");
+            cmd.arg("--unit").arg(&unit_name).arg("--no-pager");
+            if follow {
+                cmd.arg("--follow");
+            }
+            if let Some(n) = lines {
+                cmd.arg("-n").arg(n.to_string());
+            }
+            let status = cmd.status().map_err(|e| {
+                NucleusError::ExecError(format!(
+                    "Failed to run journalctl: {}. Is systemd available?",
+                    e
+                ))
+            })?;
+            if !status.success() {
+                return Err(NucleusError::ExecError(format!(
+                    "journalctl exited with status {}",
+                    status
+                )));
+            }
+            Ok(())
+        }
+
         Commands::Checkpoint {
             container,
             output,
@@ -822,7 +876,9 @@ fn main() -> Result<()> {
             swap,
             hostname,
             runtime,
+            detach,
             quiet_id,
+            preset_id,
             rootless,
             user,
             group,
@@ -880,6 +936,83 @@ fn main() -> Result<()> {
                 return Err(NucleusError::ConfigError(
                     "No command specified".to_string(),
                 ));
+            }
+
+            // --detach: re-exec under systemd-run as a transient service
+            if detach {
+                let id = nucleus::container::generate_container_id()?;
+                let exe = std::env::current_exe().map_err(|e| {
+                    NucleusError::ConfigError(format!(
+                        "Failed to resolve current executable for detach re-exec: {}",
+                        e
+                    ))
+                })?;
+
+                // Reconstruct args: remove --detach/-d, inject --quiet-id and --preset-id
+                let raw_args: Vec<String> = std::env::args().collect();
+                let mut inner_args: Vec<String> = Vec::with_capacity(raw_args.len() + 2);
+                // Find the "--" separator position (everything after is the container command)
+                let separator_pos = raw_args.iter().position(|a| a == "--");
+
+                for (i, arg) in raw_args.iter().enumerate().skip(1) {
+                    // Only strip --detach/-d from nucleus args, not from the container command
+                    if separator_pos.map_or(true, |sep| i < sep)
+                        && (arg == "--detach" || arg == "-d")
+                    {
+                        continue;
+                    }
+                    inner_args.push(arg.clone());
+                }
+
+                // Insert --quiet-id and --preset-id right after "create"
+                if let Some(create_pos) =
+                    inner_args.iter().position(|a| a.eq_ignore_ascii_case("create"))
+                {
+                    inner_args.insert(create_pos + 1, format!("--preset-id={}", id));
+                    inner_args.insert(create_pos + 1, "--quiet-id".to_string());
+                }
+
+                // Propagate --root if set (it's a global arg before the subcommand)
+                if let Some(ref root) = state_root {
+                    if !raw_args.iter().any(|a| a.starts_with("--root")) {
+                        inner_args.insert(0, root.display().to_string());
+                        inner_args.insert(0, "--root".to_string());
+                    }
+                }
+
+                let unit_name = format!("nucleus-{}", &id[..12]);
+                let status = std::process::Command::new("systemd-run")
+                    .arg("--unit")
+                    .arg(&unit_name)
+                    .arg("--collect")
+                    .arg("--quiet")
+                    .arg("-p")
+                    .arg("KillMode=mixed")
+                    .arg("-p")
+                    .arg("KillSignal=SIGTERM")
+                    .arg("-p")
+                    .arg("TimeoutStopSec=30")
+                    .arg("--")
+                    .arg(&exe)
+                    .args(&inner_args)
+                    .status()
+                    .map_err(|e| {
+                        NucleusError::ExecError(format!(
+                            "Failed to launch systemd-run for detach: {}. \
+                             Is systemd available?",
+                            e
+                        ))
+                    })?;
+
+                if !status.success() {
+                    return Err(NucleusError::ExecError(format!(
+                        "systemd-run exited with status {}",
+                        status
+                    )));
+                }
+
+                println!("{}", id);
+                return Ok(());
             }
 
             if let Some(ref n) = name {
@@ -958,7 +1091,7 @@ fn main() -> Result<()> {
             }
 
             // Build configuration
-            let mut config = ContainerConfig::try_new(name, command)?
+            let mut config = ContainerConfig::try_new_with_id(preset_id, name, command)?
                 .with_limits(limits)
                 .with_namespaces(namespaces)
                 .with_network(net_mode)

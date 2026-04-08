@@ -394,7 +394,32 @@ impl ContainerConfig {
     /// # Panics
     /// Panics if secure random bytes cannot be read from `/dev/urandom`.
     pub fn try_new(name: Option<String>, command: Vec<String>) -> crate::error::Result<Self> {
-        let id = generate_container_id()?;
+        Self::try_new_with_id(None, name, command)
+    }
+
+    /// Create a new container config, optionally using a pre-generated ID.
+    ///
+    /// When `preset_id` is `Some`, it is used as the container ID instead of
+    /// generating a new one. This is used by `--detach` to ensure the outer
+    /// CLI process and the systemd-managed inner process share the same ID.
+    pub fn try_new_with_id(
+        preset_id: Option<String>,
+        name: Option<String>,
+        command: Vec<String>,
+    ) -> crate::error::Result<Self> {
+        let id = match preset_id {
+            Some(id) => {
+                // Validate preset ID: must be exactly 32 hex chars
+                if id.len() != 32 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(crate::error::NucleusError::ConfigError(format!(
+                        "Invalid preset container ID '{}': must be 32 hex characters",
+                        id
+                    )));
+                }
+                id
+            }
+            None => generate_container_id()?,
+        };
         let name = name.unwrap_or_else(|| id.clone());
         Ok(Self {
             id,

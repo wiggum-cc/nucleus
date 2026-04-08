@@ -5,7 +5,9 @@
       "Bash(cargo build:*)",
       "Bash(cargo test:*)",
       "Bash(apalache-mc check:*)",
-      "Bash(cargo check:*)"
+      "Bash(cargo check:*)",
+      "Bash(chmod +x:*)",
+      "Bash(nix eval:*)"
     ]
   }
 }

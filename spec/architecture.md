@@ -91,8 +91,17 @@ Multi-container lifecycle operations.
 - **Kill** – Send arbitrary signal
 - **Remove** – Delete state file (verify stopped first)
 - **Attach** – Enter container namespaces via `setns(2)`, fork/exec
+- **Logs** – View stdout/stderr from systemd journal (detached containers)
 - **Checkpoint** – CRIU dump to directory
 - **Restore** – CRIU restore from directory
+
+**Detached mode (`--detach`):**
+- Re-execs the nucleus binary under `systemd-run` as a transient service
+- systemd supervises the container process (restart, logging, cgroup tracking)
+- `KillMode=mixed` with `TimeoutStopSec=30` for graceful shutdown
+- `--collect` ensures automatic unit cleanup after exit
+- Container ID is pre-generated and shared between outer and inner processes
+- All management commands (`stop`, `kill`, `attach`, `state`, `logs`) work normally
 
 **Container Resolution:**
 - Exact ID match → exact name match → ID prefix match
@@ -275,6 +284,8 @@ CRIU-based container snapshotting.
 | Storage | Persistent | Ephemeral (RAM) |
 | Startup | ~100-500ms | <10ms |
 | Multi-container | Yes | Yes |
+| Detach/background | Yes (built-in daemon) | Yes (systemd transient service) |
+| Logs | Yes (docker logs) | Yes (nucleus logs / journalctl) |
 | Attach | Yes | Yes |
 | Checkpoint | Optional | Yes (CRIU) |
 | Use case | General containers | Agent workloads |
