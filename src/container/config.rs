@@ -348,6 +348,11 @@ pub struct ContainerConfig {
     /// Path to write seccomp trace log (NDJSON) when seccomp_mode == Trace.
     pub seccomp_trace_log: Option<PathBuf>,
 
+    /// Additional syscalls to allow beyond the built-in default allowlist.
+    /// Each entry is a syscall name (e.g. "io_uring_setup", "sysinfo").
+    /// These are merged into the built-in filter; they do NOT replace it.
+    pub seccomp_allow_syscalls: Vec<String>,
+
     /// Path to capability policy file (TOML).
     pub caps_policy: Option<PathBuf>,
 
@@ -458,6 +463,7 @@ impl ContainerConfig {
             seccomp_profile_sha256: None,
             seccomp_mode: SeccompMode::default(),
             seccomp_trace_log: None,
+            seccomp_allow_syscalls: Vec::new(),
             caps_policy: None,
             caps_policy_sha256: None,
             landlock_policy: None,
@@ -682,6 +688,12 @@ impl ContainerConfig {
     #[must_use]
     pub fn with_seccomp_trace_log(mut self, path: PathBuf) -> Self {
         self.seccomp_trace_log = Some(path);
+        self
+    }
+
+    #[must_use]
+    pub fn with_seccomp_allow_syscalls(mut self, syscalls: Vec<String>) -> Self {
+        self.seccomp_allow_syscalls = syscalls;
         self
     }
 

@@ -864,6 +864,7 @@ impl Container {
                         allow_network,
                         allow_degraded_security,
                         self.config.seccomp_log_denied,
+                        &self.config.seccomp_allow_syscalls,
                     )?
                 }
             }

@@ -363,6 +363,12 @@ enum Commands {
         #[arg(long = "seccomp-log-denied")]
         seccomp_log_denied: bool,
 
+        /// Additional syscalls to allow beyond the built-in default allowlist.
+        /// Can be specified multiple times (e.g. --seccomp-allow io_uring_setup --seccomp-allow sysinfo).
+        /// These are merged into the built-in filter; they do NOT replace it.
+        #[arg(long = "seccomp-allow")]
+        seccomp_allow: Vec<String>,
+
         /// Path to capability policy file (TOML)
         #[arg(long = "caps-policy")]
         caps_policy: Option<String>,
@@ -918,6 +924,7 @@ fn main() -> Result<()> {
             seccomp_mode,
             seccomp_log,
             seccomp_log_denied,
+            seccomp_allow,
             caps_policy,
             caps_policy_sha256,
             landlock_policy,
@@ -1201,6 +1208,10 @@ fn main() -> Result<()> {
                         ));
                     }
                 }
+            }
+
+            if !seccomp_allow.is_empty() {
+                config = config.with_seccomp_allow_syscalls(seccomp_allow);
             }
 
             // Capability policy

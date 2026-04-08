@@ -287,7 +287,10 @@ impl SeccompManager {
     /// - bpf (eBPF programs)
     /// - perf_event_open (performance monitoring)
     /// - userfaultfd (user fault handling)
-    fn minimal_filter(allow_network: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
+    fn minimal_filter(
+        allow_network: bool,
+        extra_syscalls: &[String],
+    ) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
         let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
         // Essential syscalls for basic operation
@@ -301,6 +304,28 @@ impl SeccompManager {
         // Add network-mode-specific syscalls
         for syscall in Self::network_mode_syscalls(allow_network) {
             rules.insert(syscall, Vec::new());
+        }
+
+        // Add user-requested extra syscalls (--seccomp-allow).
+        // - Already in default/arg-filtered: silently accepted (no-op).
+        // - In OPT_IN_SYSCALLS: added to allowlist.
+        // - Known but not opt-in: WARN and blocked (defense-in-depth).
+        // - Unknown name: WARN and blocked.
+        for name in extra_syscalls {
+            if let Some(nr) = syscall_name_to_number(name) {
+                if rules.contains_key(&nr) {
+                    // Already allowed by default or arg-filtered — no-op.
+                } else if Self::OPT_IN_SYSCALLS.contains(&name.as_str()) {
+                    rules.insert(nr, Vec::new());
+                } else {
+                    warn!(
+                        "--seccomp-allow: syscall '{}' is not in the opt-in allowlist — blocked",
+                        name
+                    );
+                }
+            } else {
+                warn!("--seccomp-allow: unknown syscall '{}' — blocked", name);
+            }
         }
 
         // Restrict socket() domains by network mode.
@@ -503,7 +528,7 @@ impl SeccompManager {
     /// This is useful for benchmarking filter compilation overhead
     /// without the irreversible side effect of applying the filter.
     pub fn compile_minimal_filter() -> Result<BpfProgram> {
-        let rules = Self::minimal_filter(true)?;
+        let rules = Self::minimal_filter(true, &[])?;
         let filter = SeccompFilter::new(
             rules,
             SeccompAction::KillProcess,
@@ -543,7 +568,7 @@ impl SeccompManager {
         best_effort: bool,
         log_denied: bool,
     ) -> Result<bool> {
-        self.apply_filter_for_network_mode(true, best_effort, log_denied)
+        self.apply_filter_for_network_mode(true, best_effort, log_denied, &[])
     }
 
     /// Apply seccomp filter with network-mode-aware socket restrictions
@@ -559,6 +584,7 @@ impl SeccompManager {
         allow_network: bool,
         best_effort: bool,
         log_denied: bool,
+        extra_syscalls: &[String],
     ) -> Result<bool> {
         if self.applied {
             debug!("Seccomp filter already applied, skipping");
@@ -567,7 +593,7 @@ impl SeccompManager {
 
         info!(allow_network, "Applying seccomp filter");
 
-        let rules = match Self::minimal_filter(allow_network) {
+        let rules = match Self::minimal_filter(allow_network, extra_syscalls) {
             Ok(r) => r,
             Err(e) => {
                 if best_effort {
@@ -727,7 +753,7 @@ impl SeccompManager {
         // Custom profiles that allow clone/ioctl/prctl/socket/mprotect by name
         // without argument-level filters would silently remove all hardening.
         // Overwrite their empty rules with the built-in argument-filtered rules.
-        let builtin_rules = Self::minimal_filter(true)?;
+        let builtin_rules = Self::minimal_filter(true, &[])?;
         for syscall_name in Self::ARG_FILTERED_SYSCALLS {
             if let Some(nr) = syscall_name_to_number(syscall_name) {
                 if let std::collections::btree_map::Entry::Occupied(mut entry) = rules.entry(nr) {
@@ -824,6 +850,156 @@ impl SeccompManager {
     /// Custom profiles allowing these without argument filters weaken security.
     const ARG_FILTERED_SYSCALLS: &'static [&'static str] = &[
         "clone", "clone3", "execveat", "ioctl", "mprotect", "prctl", "socket",
+    ];
+
+    /// Non-default syscalls that may be opted into via `--seccomp-allow`.
+    ///
+    /// Every syscall known to `syscall_name_to_number` but absent from both
+    /// `base_allowed_syscalls` and `ARG_FILTERED_SYSCALLS` must appear here
+    /// to be enableable. Requesting a known syscall that is NOT in this list
+    /// emits a WARN and is silently dropped (defense-in-depth).
+    const OPT_IN_SYSCALLS: &'static [&'static str] = &[
+        // io_uring — large attack surface but needed by modern databases
+        "io_uring_setup",
+        "io_uring_enter",
+        "io_uring_register",
+        // SysV message queues
+        "msgget",
+        "msgsnd",
+        "msgrcv",
+        "msgctl",
+        // POSIX message queues
+        "mq_open",
+        "mq_unlink",
+        "mq_timedsend",
+        "mq_timedreceive",
+        "mq_notify",
+        "mq_getsetattr",
+        // POSIX timers
+        "timer_create",
+        "timer_settime",
+        "timer_gettime",
+        "timer_getoverrun",
+        "timer_delete",
+        // Inotify / fanotify
+        "inotify_init",
+        "inotify_init1",
+        "inotify_add_watch",
+        "inotify_rm_watch",
+        "fanotify_init",
+        "fanotify_mark",
+        // Memory (non-default)
+        "mincore",
+        "mlockall",
+        "munlockall",
+        "membarrier",
+        "process_madvise",
+        "mbind",
+        "set_mempolicy",
+        "get_mempolicy",
+        "set_mempolicy_home_node",
+        "pkey_mprotect",
+        "pkey_alloc",
+        "pkey_free",
+        "cachestat",
+        "remap_file_pages",
+        // File I/O (non-default)
+        "sync",
+        "syncfs",
+        "sync_file_range",
+        "readahead",
+        "vmsplice",
+        "openat2",
+        "name_to_handle_at",
+        "open_by_handle_at",
+        "io_cancel",
+        "io_pgetevents",
+        "creat",
+        "fchmodat2",
+        "statmount",
+        "listmount",
+        "utimensat",
+        "utimes",
+        "utime",
+        "futimesat",
+        // Extended attributes (write)
+        "setxattr",
+        "lsetxattr",
+        "fsetxattr",
+        "removexattr",
+        "lremovexattr",
+        "fremovexattr",
+        "setxattrat",
+        "getxattrat",
+        "listxattrat",
+        "removexattrat",
+        // Network (non-default)
+        "recvmmsg",
+        "sendmmsg",
+        // Scheduling (non-default)
+        "sched_setparam",
+        "sched_setscheduler",
+        "sched_get_priority_max",
+        "sched_get_priority_min",
+        "sched_rr_get_interval",
+        "sched_setattr",
+        "sched_getattr",
+        // Resource limits / priority
+        "setrlimit",
+        "getpriority",
+        "setpriority",
+        "ioprio_set",
+        "ioprio_get",
+        // Process (non-default, low risk)
+        "vfork",
+        "pause",
+        "alarm",
+        "tkill",
+        "sysinfo",
+        "personality",
+        "vhangup",
+        "time",
+        "pidfd_open",
+        "pidfd_send_signal",
+        "pidfd_getfd",
+        // UID/GID
+        "setuid",
+        "setgid",
+        "setreuid",
+        "setregid",
+        "setresuid",
+        "getresuid",
+        "setresgid",
+        "getresgid",
+        "setfsuid",
+        "setfsgid",
+        "setgroups",
+        "getsid",
+        // Capabilities (read-only query)
+        "capget",
+        // Signals (non-default)
+        "rt_tgsigqueueinfo",
+        // Misc
+        "mknod",
+        "mknodat",
+        "syslog",
+        "clock_settime",
+        "clock_adjtime",
+        "adjtimex",
+        "unshare",
+        "kcmp",
+        "epoll_pwait2",
+        // Futex (non-default)
+        "futex_waitv",
+        "futex_wake",
+        "futex_wait",
+        "futex_requeue",
+        // Landlock (already in default but listed for completeness)
+        "seccomp",
+        // Keyring
+        "add_key",
+        "request_key",
+        "keyctl",
     ];
 
     /// Warn when a custom seccomp profile allows security-critical syscalls
@@ -1164,6 +1340,217 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "landlock_create_ruleset" => Some(libc::SYS_landlock_create_ruleset),
         "landlock_add_rule" => Some(libc::SYS_landlock_add_rule),
         "landlock_restrict_self" => Some(libc::SYS_landlock_restrict_self),
+        // --- Additional syscalls (not in default allowlist, available via --seccomp-allow) ---
+        // Memory
+        "mincore" => Some(libc::SYS_mincore),
+        "mlockall" => Some(libc::SYS_mlockall),
+        "munlockall" => Some(libc::SYS_munlockall),
+        "mbind" => Some(libc::SYS_mbind),
+        "set_mempolicy" => Some(libc::SYS_set_mempolicy),
+        "get_mempolicy" => Some(libc::SYS_get_mempolicy),
+        "memfd_secret" => Some(libc::SYS_memfd_secret),
+        "membarrier" => Some(libc::SYS_membarrier),
+        "process_madvise" => Some(libc::SYS_process_madvise),
+        "pkey_mprotect" => Some(libc::SYS_pkey_mprotect),
+        "pkey_alloc" => Some(libc::SYS_pkey_alloc),
+        "pkey_free" => Some(libc::SYS_pkey_free),
+        "mseal" => Some(libc::SYS_mseal),
+        "map_shadow_stack" => Some(453),
+        "remap_file_pages" => Some(libc::SYS_remap_file_pages),
+        "set_mempolicy_home_node" => Some(libc::SYS_set_mempolicy_home_node),
+        "cachestat" => Some(451),
+        // Process
+        #[cfg(target_arch = "x86_64")]
+        "vfork" => Some(libc::SYS_vfork),
+        #[cfg(target_arch = "x86_64")]
+        "pause" => Some(libc::SYS_pause),
+        #[cfg(target_arch = "x86_64")]
+        "alarm" => Some(libc::SYS_alarm),
+        "tkill" => Some(libc::SYS_tkill),
+        "ptrace" => Some(libc::SYS_ptrace),
+        "process_vm_readv" => Some(libc::SYS_process_vm_readv),
+        "process_vm_writev" => Some(libc::SYS_process_vm_writev),
+        "process_mrelease" => Some(libc::SYS_process_mrelease),
+        "kcmp" => Some(libc::SYS_kcmp),
+        "unshare" => Some(libc::SYS_unshare),
+        "setns" => Some(libc::SYS_setns),
+        "pidfd_open" => Some(libc::SYS_pidfd_open),
+        "pidfd_send_signal" => Some(libc::SYS_pidfd_send_signal),
+        "pidfd_getfd" => Some(libc::SYS_pidfd_getfd),
+        // UID/GID
+        "setuid" => Some(libc::SYS_setuid),
+        "setgid" => Some(libc::SYS_setgid),
+        "setreuid" => Some(libc::SYS_setreuid),
+        "setregid" => Some(libc::SYS_setregid),
+        "setresuid" => Some(libc::SYS_setresuid),
+        "getresuid" => Some(libc::SYS_getresuid),
+        "setresgid" => Some(libc::SYS_setresgid),
+        "getresgid" => Some(libc::SYS_getresgid),
+        "setfsuid" => Some(libc::SYS_setfsuid),
+        "setfsgid" => Some(libc::SYS_setfsgid),
+        "setgroups" => Some(libc::SYS_setgroups),
+        "getsid" => Some(libc::SYS_getsid),
+        // Capabilities
+        "capget" => Some(libc::SYS_capget),
+        "capset" => Some(libc::SYS_capset),
+        // Signals
+        "rt_tgsigqueueinfo" => Some(libc::SYS_rt_tgsigqueueinfo),
+        // SysV message queues
+        "msgget" => Some(libc::SYS_msgget),
+        "msgsnd" => Some(libc::SYS_msgsnd),
+        "msgrcv" => Some(libc::SYS_msgrcv),
+        "msgctl" => Some(libc::SYS_msgctl),
+        // Timers
+        "timer_create" => Some(libc::SYS_timer_create),
+        "timer_settime" => Some(libc::SYS_timer_settime),
+        "timer_gettime" => Some(libc::SYS_timer_gettime),
+        "timer_getoverrun" => Some(libc::SYS_timer_getoverrun),
+        "timer_delete" => Some(libc::SYS_timer_delete),
+        "clock_settime" => Some(libc::SYS_clock_settime),
+        "clock_adjtime" => Some(libc::SYS_clock_adjtime),
+        #[cfg(target_arch = "x86_64")]
+        "time" => Some(libc::SYS_time),
+        // File I/O (non-default)
+        #[cfg(target_arch = "x86_64")]
+        "creat" => Some(libc::SYS_creat),
+        "readahead" => Some(libc::SYS_readahead),
+        "sync" => Some(libc::SYS_sync),
+        "syncfs" => Some(libc::SYS_syncfs),
+        "vmsplice" => Some(libc::SYS_vmsplice),
+        "utimensat" => Some(libc::SYS_utimensat),
+        #[cfg(target_arch = "x86_64")]
+        "utimes" => Some(libc::SYS_utimes),
+        #[cfg(target_arch = "x86_64")]
+        "utime" => Some(libc::SYS_utime),
+        #[cfg(target_arch = "x86_64")]
+        "futimesat" => Some(libc::SYS_futimesat),
+        "openat2" => Some(libc::SYS_openat2),
+        "name_to_handle_at" => Some(libc::SYS_name_to_handle_at),
+        "open_by_handle_at" => Some(libc::SYS_open_by_handle_at),
+        "fchmodat2" => Some(libc::SYS_fchmodat2),
+        "statmount" => Some(457),
+        "listmount" => Some(458),
+        // Extended attributes (write)
+        "setxattr" => Some(libc::SYS_setxattr),
+        "lsetxattr" => Some(libc::SYS_lsetxattr),
+        "fsetxattr" => Some(libc::SYS_fsetxattr),
+        "removexattr" => Some(libc::SYS_removexattr),
+        "lremovexattr" => Some(libc::SYS_lremovexattr),
+        "fremovexattr" => Some(libc::SYS_fremovexattr),
+        "setxattrat" => Some(463),
+        "getxattrat" => Some(464),
+        "listxattrat" => Some(465),
+        "removexattrat" => Some(466),
+        // Network (non-default)
+        "recvmmsg" => Some(libc::SYS_recvmmsg),
+        "sendmmsg" => Some(libc::SYS_sendmmsg),
+        // Inotify
+        #[cfg(target_arch = "x86_64")]
+        "inotify_init" => Some(libc::SYS_inotify_init),
+        "inotify_init1" => Some(libc::SYS_inotify_init1),
+        "inotify_add_watch" => Some(libc::SYS_inotify_add_watch),
+        "inotify_rm_watch" => Some(libc::SYS_inotify_rm_watch),
+        // Fanotify
+        "fanotify_init" => Some(libc::SYS_fanotify_init),
+        "fanotify_mark" => Some(libc::SYS_fanotify_mark),
+        // Epoll (non-default)
+        "epoll_pwait2" => Some(libc::SYS_epoll_pwait2),
+        // Scheduling (non-default)
+        "sched_setparam" => Some(libc::SYS_sched_setparam),
+        "sched_setscheduler" => Some(libc::SYS_sched_setscheduler),
+        "sched_get_priority_max" => Some(libc::SYS_sched_get_priority_max),
+        "sched_get_priority_min" => Some(libc::SYS_sched_get_priority_min),
+        "sched_rr_get_interval" => Some(libc::SYS_sched_rr_get_interval),
+        "sched_setattr" => Some(libc::SYS_sched_setattr),
+        "sched_getattr" => Some(libc::SYS_sched_getattr),
+        "sched_setaffinity" => Some(libc::SYS_sched_setaffinity),
+        // Resource limits
+        #[cfg(target_arch = "x86_64")]
+        "setrlimit" => Some(libc::SYS_setrlimit),
+        "getpriority" => Some(libc::SYS_getpriority),
+        "setpriority" => Some(libc::SYS_setpriority),
+        "ioprio_set" => Some(libc::SYS_ioprio_set),
+        "ioprio_get" => Some(libc::SYS_ioprio_get),
+        // Futex (non-default)
+        "futex_waitv" => Some(libc::SYS_futex_waitv),
+        "futex_wake" => Some(454),
+        "futex_wait" => Some(455),
+        "futex_requeue" => Some(456),
+        // Kernel modules
+        "init_module" => Some(libc::SYS_init_module),
+        "finit_module" => Some(libc::SYS_finit_module),
+        "delete_module" => Some(libc::SYS_delete_module),
+        // eBPF and performance
+        "bpf" => Some(libc::SYS_bpf),
+        "perf_event_open" => Some(libc::SYS_perf_event_open),
+        // Seccomp
+        "seccomp" => Some(libc::SYS_seccomp),
+        // Userfaultfd
+        "userfaultfd" => Some(libc::SYS_userfaultfd),
+        // Mount (non-default)
+        "mount" => Some(libc::SYS_mount),
+        "umount2" => Some(libc::SYS_umount2),
+        "pivot_root" => Some(libc::SYS_pivot_root),
+        "mount_setattr" => Some(libc::SYS_mount_setattr),
+        "open_tree" => Some(libc::SYS_open_tree),
+        "open_tree_attr" => Some(467),
+        "move_mount" => Some(libc::SYS_move_mount),
+        "fsopen" => Some(libc::SYS_fsopen),
+        "fsconfig" => Some(libc::SYS_fsconfig),
+        "fsmount" => Some(libc::SYS_fsmount),
+        "fspick" => Some(libc::SYS_fspick),
+        // Misc (non-default)
+        "syslog" => Some(libc::SYS_syslog),
+        "reboot" => Some(libc::SYS_reboot),
+        "swapon" => Some(libc::SYS_swapon),
+        "swapoff" => Some(libc::SYS_swapoff),
+        "chroot" => Some(libc::SYS_chroot),
+        "acct" => Some(libc::SYS_acct),
+        "settimeofday" => Some(libc::SYS_settimeofday),
+        "sethostname" => Some(libc::SYS_sethostname),
+        "setdomainname" => Some(libc::SYS_setdomainname),
+        "adjtimex" => Some(libc::SYS_adjtimex),
+        #[cfg(target_arch = "x86_64")]
+        "modify_ldt" => Some(libc::SYS_modify_ldt),
+        #[cfg(target_arch = "x86_64")]
+        "iopl" => Some(libc::SYS_iopl),
+        #[cfg(target_arch = "x86_64")]
+        "ioperm" => Some(libc::SYS_ioperm),
+        "quotactl" => Some(libc::SYS_quotactl),
+        "quotactl_fd" => Some(libc::SYS_quotactl_fd),
+        "personality" => Some(libc::SYS_personality),
+        "vhangup" => Some(libc::SYS_vhangup),
+        #[cfg(target_arch = "x86_64")]
+        "ustat" => Some(libc::SYS_ustat),
+        #[cfg(target_arch = "x86_64")]
+        "sysfs" => Some(libc::SYS_sysfs),
+        "mknod" => Some(libc::SYS_mknod),
+        "mknodat" => Some(libc::SYS_mknodat),
+        "migrate_pages" => Some(libc::SYS_migrate_pages),
+        "move_pages" => Some(libc::SYS_move_pages),
+        #[cfg(target_arch = "x86_64")]
+        "kexec_load" => Some(libc::SYS_kexec_load),
+        "kexec_file_load" => Some(libc::SYS_kexec_file_load),
+        // POSIX message queues
+        "mq_open" => Some(libc::SYS_mq_open),
+        "mq_unlink" => Some(libc::SYS_mq_unlink),
+        "mq_timedsend" => Some(libc::SYS_mq_timedsend),
+        "mq_timedreceive" => Some(libc::SYS_mq_timedreceive),
+        "mq_notify" => Some(libc::SYS_mq_notify),
+        "mq_getsetattr" => Some(libc::SYS_mq_getsetattr),
+        // Keyring
+        "add_key" => Some(libc::SYS_add_key),
+        "request_key" => Some(libc::SYS_request_key),
+        "keyctl" => Some(libc::SYS_keyctl),
+        // IO pgetevents
+        "io_pgetevents" => Some(333),
+        // LSM
+        "lsm_get_self_attr" => Some(459),
+        "lsm_set_self_attr" => Some(460),
+        "lsm_list_modules" => Some(461),
+        #[cfg(target_arch = "x86_64")]
+        "lookup_dcookie" => Some(libc::SYS_lookup_dcookie),
+        "uretprobe" => Some(335),
         _ => None,
     }
 }
@@ -1311,7 +1698,7 @@ mod tests {
         // use clone3 internally for posix_spawn/fork. Blocking it breaks
         // std::process::Command on modern systems. Namespace creation is
         // prevented by dropped capabilities (CAP_SYS_ADMIN etc.), not seccomp.
-        let rules = SeccompManager::minimal_filter(true).unwrap();
+        let rules = SeccompManager::minimal_filter(true, &[]).unwrap();
         assert!(
             rules.contains_key(&libc::SYS_clone3),
             "clone3 must be in the seccomp allowlist (glibc 2.34+ requires it)"
@@ -1321,7 +1708,7 @@ mod tests {
     #[test]
     fn test_clone_is_allowed_with_arg_filter() {
         // clone (not clone3) should still be in the rules with arg filtering
-        let rules = SeccompManager::minimal_filter(true).unwrap();
+        let rules = SeccompManager::minimal_filter(true, &[]).unwrap();
         assert!(
             rules.contains_key(&libc::SYS_clone),
             "clone must be in the seccomp allowlist with arg filters"
@@ -1360,7 +1747,7 @@ mod tests {
         // argument-level filtering to block namespace-creating flags.
         // Verify by inspecting the built-in filter rules that serve as the
         // merge source for apply_profile_from_file.
-        let rules = SeccompManager::minimal_filter(true).unwrap();
+        let rules = SeccompManager::minimal_filter(true, &[]).unwrap();
 
         // Every ARG_FILTERED_SYSCALLS entry (except clone3, which is allowed
         // unconditionally since BPF can't inspect its struct-based flags) must
@@ -1394,7 +1781,7 @@ mod tests {
             "memfd_create must not be in the default seccomp allowlist (fileless exec risk)"
         );
         // Also verify it's not sneaked into the compiled filter rules
-        let rules = SeccompManager::minimal_filter(true).unwrap();
+        let rules = SeccompManager::minimal_filter(true, &[]).unwrap();
         assert!(
             !rules.contains_key(&libc::SYS_memfd_create),
             "memfd_create must not be in the compiled seccomp filter rules"
@@ -1415,7 +1802,7 @@ mod tests {
 
         // mprotect must be present in the compiled filter with non-empty
         // argument conditions (the conditions enforce W^X)
-        let rules = SeccompManager::minimal_filter(true).unwrap();
+        let rules = SeccompManager::minimal_filter(true, &[]).unwrap();
         let mprotect_rules = rules.get(&libc::SYS_mprotect);
         assert!(
             mprotect_rules.is_some(),
@@ -1521,6 +1908,85 @@ mod tests {
         assert!(
             mprotect_would_allow(libc::PROT_EXEC as u64),
             "PROT_EXEC alone must be allowed"
+        );
+    }
+
+    // --- Extra syscall allowlist tests ---
+
+    #[test]
+    fn test_extra_syscalls_are_merged_into_filter() {
+        let extra = vec!["io_uring_setup".to_string(), "sysinfo".to_string()];
+        let rules = SeccompManager::minimal_filter(true, &extra).unwrap();
+        assert!(
+            rules.contains_key(&libc::SYS_io_uring_setup),
+            "io_uring_setup must be in filter when requested via extra_syscalls"
+        );
+        assert!(
+            rules.contains_key(&libc::SYS_sysinfo),
+            "sysinfo must be in filter when requested via extra_syscalls"
+        );
+    }
+
+    #[test]
+    fn test_extra_syscalls_do_not_override_arg_filtered() {
+        // If a user requests "clone" via extra_syscalls, the arg-filtered
+        // version from the built-in filter should still be present (not
+        // replaced with an unconditional allow).
+        let extra = vec!["clone".to_string()];
+        let rules = SeccompManager::minimal_filter(true, &extra).unwrap();
+        let clone_rules = rules.get(&libc::SYS_clone);
+        assert!(
+            clone_rules.is_some() && !clone_rules.unwrap().is_empty(),
+            "clone must retain argument-level filtering even when in extra_syscalls"
+        );
+    }
+
+    #[test]
+    fn test_extra_syscalls_unknown_name_is_warned_and_skipped() {
+        // Unknown syscall names emit a WARN and are skipped (not fatal)
+        let extra = vec!["not_a_real_syscall".to_string()];
+        let result = SeccompManager::minimal_filter(true, &extra);
+        assert!(
+            result.is_ok(),
+            "Unknown syscall name should warn and skip, not error"
+        );
+    }
+
+    #[test]
+    fn test_extra_syscalls_empty_is_noop() {
+        let rules_without = SeccompManager::minimal_filter(true, &[]).unwrap();
+        let rules_with = SeccompManager::minimal_filter(true, &[]).unwrap();
+        assert_eq!(rules_without.len(), rules_with.len());
+    }
+
+    #[test]
+    fn test_extra_syscalls_duplicate_of_default_is_harmless() {
+        // Requesting a syscall that's already in the default allowlist should work fine
+        let extra = vec!["read".to_string()];
+        let rules = SeccompManager::minimal_filter(true, &extra).unwrap();
+        assert!(rules.contains_key(&libc::SYS_read));
+    }
+
+    #[test]
+    fn test_extra_syscalls_blocked_known_syscall_not_added() {
+        // A known syscall that is NOT in OPT_IN_SYSCALLS must be blocked
+        // (not added to the filter rules). E.g. kexec_load, bpf, ptrace.
+        let extra = vec!["kexec_load".to_string()];
+        let rules = SeccompManager::minimal_filter(true, &extra).unwrap();
+        assert!(
+            !rules.contains_key(&libc::SYS_kexec_load),
+            "kexec_load must be blocked even when requested via --seccomp-allow"
+        );
+    }
+
+    #[test]
+    fn test_extra_syscalls_opt_in_syscall_is_added() {
+        // Syscalls in OPT_IN_SYSCALLS must be added when requested
+        let extra = vec!["io_uring_setup".to_string()];
+        let rules = SeccompManager::minimal_filter(true, &extra).unwrap();
+        assert!(
+            rules.contains_key(&libc::SYS_io_uring_setup),
+            "io_uring_setup is in OPT_IN_SYSCALLS and must be added"
         );
     }
 }
