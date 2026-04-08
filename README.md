@@ -3,12 +3,20 @@
 [![Crates.io](https://img.shields.io/crates/v/nucleus-container.svg)](https://crates.io/crates/nucleus-container)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-**Extremely lightweight Docker alternative for agents and production services**
+**Extremely lightweight, declarative container runtime for agents and production services**
 
-Nucleus is a minimalist container runtime for Linux. It provides isolated execution environments using Linux kernel primitives without the overhead of traditional container runtimes. Nucleus supports two operating modes:
+Nucleus is a minimalist container runtime for Linux. It provides isolated execution environments using Linux kernel primitives without the overhead of traditional container runtimes. For production services, it is designed around a fully declarative model: Nix builds the root filesystem, the NixOS module declares the service, and Nucleus mounts a pinned, reproducible closure at runtime.
+
+Nucleus supports two operating modes:
 
 - **Agent mode** (default) – ephemeral, fast-startup sandboxes for AI agent workloads
-- **Production mode** – strict isolation for long-running, network-bound NixOS services with declarative configuration, egress policy enforcement, health checks, and systemd integration
+- **Production mode** – strict isolation for long-running, network-bound NixOS services with declarative configuration, reproducible Nix-built root filesystems, egress policy enforcement, health checks, and systemd integration
+
+Production deployments are built to be:
+
+- **Fully declarative** – service topology, runtime settings, and mounted rootfs are defined up front instead of assembled imperatively at deploy time
+- **Nix-native** – first-class NixOS module support plus `nucleus.lib.mkRootfs` for minimal service closures
+- **Reproducible** – flake-based builds, pinned store paths, and rootfs attestation keep runtime inputs stable and auditable
 
 ## Benchmarks
 
@@ -50,6 +58,9 @@ benchmark noise rather than a guaranteed speedup.
 
 ## Why Nucleus?
 
+- **Declarative by default for services** – Production deployments are defined in NixOS and TOML rather than stitched together with ad hoc runtime scripting
+- **Deep Nix integration** – First-class NixOS module, `mkRootfs`, and Nix store closures for minimal, locked-down service roots
+- **Reproducible service builds** – Flake-based packaging, pinned inputs, and rootfs attestation make runtime state auditable and repeatable
 - **Zero-overhead isolation** – Direct use of cgroups, namespaces, pivot_root, capabilities, seccomp, and Landlock
 - **Memory-backed filesystems** – Container disk mapped to tmpfs, pre-populated with agent context
 - **gVisor integration** – Optional application kernel for enhanced security, including networked service mode
@@ -81,7 +92,7 @@ Nucleus leverages Linux kernel isolation primitives:
 - **In-memory secrets** – Dedicated tmpfs at `/run/secrets` with volatile zeroing of source buffers
 - **Mount audit** – Post-setup verification of mount flags in production mode
 
-Container filesystem is backed by tmpfs and either populated with context files (agent mode) or mounted from a pre-built Nix rootfs closure (production mode).
+Container filesystem is backed by tmpfs and either populated with context files (agent mode) or mounted from a pre-built Nix rootfs closure (production mode). That lets production services run from a declaratively built, reproducible root filesystem instead of inheriting mutable host state.
 
 ## Platform Support
 
@@ -95,13 +106,13 @@ Container filesystem is backed by tmpfs and either populated with context files 
 cargo install nucleus-container --version 0.3.0
 ```
 
-Or via Nix:
+Or via Nix (recommended for reproducible builds and NixOS integration):
 
 ```bash
 nix run github:0kenx/nucleus/v0.3.0
 ```
 
-The Cargo package name is `nucleus-container`; it installs the `nucleus` binary.
+The Cargo package name is `nucleus-container`; it installs the `nucleus` binary. The repository itself is packaged as a Nix flake, so `nix run`, `nix build`, and the NixOS module all share the same pinned inputs.
 
 ## Recent Features in 0.3.0
 
@@ -224,7 +235,7 @@ nucleus run \
 
 ### Security Policy Files
 
-Nix defines the service (what runs). Separate files define security policy (what the process is allowed to do at the kernel level). This separation keeps security config auditable, tool-compatible, and on its own change cadence.
+Nix defines the service and the root filesystem; separate files define security policy (what the process is allowed to do at the kernel level). This separation keeps deployments declarative, security config auditable, and runtime inputs reproducible without coupling policy changes to application rebuilds.
 
 ```bash
 # Run with external security policies
