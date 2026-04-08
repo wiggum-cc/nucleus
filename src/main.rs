@@ -9,7 +9,7 @@ use nucleus::container::{
 use nucleus::error::{NucleusError, Result};
 use nucleus::filesystem::ContextMode;
 use nucleus::isolation::{ContainerAttach, NamespaceConfig};
-use nucleus::network::{BridgeConfig, EgressPolicy, NetworkMode, PortForward};
+use nucleus::network::{BridgeConfig, EgressPolicy, NatBackend, NetworkMode, PortForward};
 use nucleus::resources::{IoDeviceLimit, ResourceLimits, ResourceStats};
 use nucleus::security::GVisorPlatform;
 use nucleus::topology::{
@@ -295,6 +295,10 @@ enum Commands {
         /// DNS servers (repeatable). Required for bridge mode in production.
         #[arg(long)]
         dns: Vec<String>,
+
+        /// Native bridge NAT backend: auto, kernel, or userspace.
+        #[arg(long = "nat-backend", default_value = "auto")]
+        nat_backend: NatBackend,
 
         /// Health check command (run inside container)
         #[arg(long = "health-cmd")]
@@ -912,6 +916,7 @@ fn main() -> Result<()> {
             egress_tcp_ports,
             egress_udp_ports,
             dns,
+            nat_backend,
             health_cmd,
             health_interval,
             health_retries,
@@ -1090,7 +1095,8 @@ fn main() -> Result<()> {
                         BridgeConfig::default().with_public_dns()
                     } else {
                         BridgeConfig::default().with_dns(dns.clone())
-                    };
+                    }
+                    .with_nat_backend(nat_backend);
                     // Parse port forwards
                     for spec in &publish {
                         let pf = PortForward::parse(spec)?;

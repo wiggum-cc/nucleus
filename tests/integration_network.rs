@@ -7,7 +7,9 @@ mod tests {
     use nucleus::container::{ContainerConfig, TrustLevel};
     use nucleus::error::NucleusError;
     use nucleus::isolation::NamespaceConfig;
-    use nucleus::network::{BridgeConfig, EgressPolicy, NetworkMode, PortForward, Protocol};
+    use nucleus::network::{
+        BridgeConfig, EgressPolicy, NatBackend, NetworkMode, PortForward, Protocol,
+    };
 
     // --- BridgeConfig validation ---
 
@@ -19,6 +21,7 @@ mod tests {
         assert_eq!(config.subnet, "10.0.42.0/24");
         assert!(config.container_ip.is_none());
         assert!(config.dns.is_empty());
+        assert_eq!(config.nat_backend, NatBackend::Auto);
     }
 
     #[test]
@@ -34,6 +37,34 @@ mod tests {
             BridgeConfig::default().with_dns(vec!["1.1.1.1".to_string(), "9.9.9.9".to_string()]);
         assert!(config.validate().is_ok());
         assert_eq!(config.dns.len(), 2);
+    }
+
+    #[test]
+    fn test_bridge_config_with_nat_backend() {
+        let config = BridgeConfig::default().with_nat_backend(NatBackend::Userspace);
+        assert_eq!(config.nat_backend, NatBackend::Userspace);
+        assert_eq!(
+            config.selected_nat_backend(true, false),
+            NatBackend::Userspace
+        );
+        assert_eq!(
+            config.selected_nat_backend(false, true),
+            NatBackend::Userspace
+        );
+    }
+
+    #[test]
+    fn test_bridge_config_auto_nat_backend_selects_by_privilege() {
+        let config = BridgeConfig::default();
+        assert_eq!(config.selected_nat_backend(true, false), NatBackend::Kernel);
+        assert_eq!(
+            config.selected_nat_backend(true, true),
+            NatBackend::Userspace
+        );
+        assert_eq!(
+            config.selected_nat_backend(false, true),
+            NatBackend::Userspace
+        );
     }
 
     #[test]

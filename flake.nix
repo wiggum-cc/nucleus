@@ -66,7 +66,7 @@
         inherit (pkgs) lib;
 
         gvisorRuntimePkgs = lib.optionals pkgs.stdenv.isLinux [ pkgs.gvisor ];
-        networkRuntimePkgs = lib.optionals pkgs.stdenv.isLinux [ pkgs.iptables ];
+        networkRuntimePkgs = lib.optionals pkgs.stdenv.isLinux [ pkgs.iptables pkgs.slirp4netns ];
         runtimePath = lib.makeBinPath (gvisorRuntimePkgs ++ networkRuntimePkgs);
 
         rustToolchain = pkgs.rust-bin.stable.latest.default;
@@ -81,7 +81,7 @@
         commonArgs = {
           inherit src;
           pname = "nucleus";
-          version = "0.3.2";
+          version = "0.3.3";
           strictDeps = true;
 
           nativeBuildInputs = [
@@ -158,19 +158,19 @@
           my-crate-fmt = craneLib.cargoFmt {
             inherit src;
             pname = "nucleus";
-            version = "0.3.2";
+            version = "0.3.3";
           };
 
           my-crate-audit = craneLib.cargoAudit {
             inherit src advisory-db;
             pname = "nucleus";
-            version = "0.3.2";
+            version = "0.3.3";
           };
 
           my-crate-deny = craneLib.cargoDeny {
             inherit src;
             pname = "nucleus";
-            version = "0.3.2";
+            version = "0.3.3";
           };
 
           my-crate-nextest = craneLib.cargoNextest (commonArgs // {
@@ -217,6 +217,8 @@
 
             # Container runtime
             gvisor
+            iptables
+            slirp4netns
 
             # Formal verification tools
             z3

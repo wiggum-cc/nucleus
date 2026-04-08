@@ -11,7 +11,7 @@ use crate::filesystem::{
     LazyContextPopulator, TmpfsMount,
 };
 use crate::isolation::NamespaceManager;
-use crate::network::{BridgeNetwork, NetworkMode};
+use crate::network::{BridgeDriver, BridgeNetwork, NatBackend, NetworkMode, UserspaceNetwork};
 use crate::resources::Cgroup;
 use crate::security::{
     CapabilityManager, GVisorRuntime, LandlockManager, OciContainerState, OciHooks,
@@ -54,7 +54,7 @@ pub struct CreatedContainer {
     pub(super) state: ContainerState,
     pub(super) child: Pid,
     pub(super) cgroup_opt: Option<Cgroup>,
-    pub(super) bridge_net: Option<BridgeNetwork>,
+    pub(super) network_driver: Option<BridgeDriver>,
     pub(super) trace_reader: Option<SeccompTraceReader>,
     pub(super) deny_logger: Option<SeccompDenyLogger>,
     pub(super) exec_fifo_path: Option<PathBuf>,
@@ -204,17 +204,15 @@ impl Container {
         Self::apply_trust_level_guards(&mut config)?;
         config.validate_runtime_support()?;
 
-        // Bridge networking requires root
-        if matches!(config.network, NetworkMode::Bridge(_)) && !is_root {
-            if config.service_mode == ServiceMode::Production {
+        if let NetworkMode::Bridge(ref bridge_config) = config.network {
+            let backend =
+                bridge_config.selected_nat_backend(is_root, config.user_ns_config.is_some());
+            if backend == NatBackend::Kernel && !is_root {
                 return Err(NucleusError::NetworkError(
-                    "Production mode with bridge networking requires root (cannot silently \
-                     degrade to no networking)"
+                    "Kernel bridge networking requires root. Use --nat-backend userspace or leave the default auto selection for rootless/native containers."
                         .to_string(),
                 ));
             }
-            warn!("Bridge networking requires root, degrading to no networking");
-            config.network = NetworkMode::None;
         }
 
         // Create state manager, honoring --root override if set
@@ -359,7 +357,7 @@ impl Container {
                     state.bundle_path =
                         config.rootfs_path.as_ref().map(|p| p.display().to_string());
 
-                    let mut bridge_net: Option<BridgeNetwork> = None;
+                    let mut network_driver: Option<BridgeDriver> = None;
                     let trace_reader = Self::maybe_start_seccomp_trace_reader(&config, target_pid)?;
                     let deny_logger = Self::maybe_start_seccomp_deny_logger(&config, target_pid)?;
 
@@ -384,10 +382,20 @@ impl Container {
                     }
 
                     if let NetworkMode::Bridge(ref bridge_config) = config.network {
-                        match BridgeNetwork::setup_with_id(target_pid, bridge_config, &config.id) {
+                        match BridgeDriver::setup_with_id(
+                            target_pid,
+                            bridge_config,
+                            &config.id,
+                            is_root,
+                            config.user_ns_config.is_some(),
+                        ) {
                             Ok(net) => {
                                 if let Some(ref egress) = config.egress_policy {
-                                    if let Err(e) = net.apply_egress_policy(target_pid, egress) {
+                                    if let Err(e) = net.apply_egress_policy(
+                                        target_pid,
+                                        egress,
+                                        config.user_ns_config.is_some(),
+                                    ) {
                                         if config.service_mode == ServiceMode::Production {
                                             return Err(NucleusError::NetworkError(format!(
                                                 "Failed to apply egress policy: {}",
@@ -397,7 +405,7 @@ impl Container {
                                         warn!("Failed to apply egress policy: {}", e);
                                     }
                                 }
-                                bridge_net = Some(net);
+                                network_driver = Some(net);
                             }
                             Err(e) => {
                                 if config.service_mode == ServiceMode::Production {
@@ -419,7 +427,7 @@ impl Container {
                         state,
                         child,
                         cgroup_opt,
-                        bridge_net,
+                        network_driver,
                         trace_reader,
                         deny_logger,
                         exec_fifo_path: exec_fifo,
@@ -639,10 +647,18 @@ impl Container {
         // When rootfs is mounted, /etc is read-only, so we bind-mount a writable
         // resolv.conf over the top (same technique as secrets).
         if let NetworkMode::Bridge(ref bridge_config) = self.config.network {
-            if self.config.rootfs_path.is_some() {
-                BridgeNetwork::bind_mount_resolv_conf(&container_root, &bridge_config.dns)?;
+            let bridge_dns = if bridge_config.selected_nat_backend(!is_rootless, is_rootless)
+                == NatBackend::Userspace
+                && bridge_config.dns.is_empty()
+            {
+                vec![UserspaceNetwork::default_dns_server(&bridge_config.subnet)?]
             } else {
-                BridgeNetwork::write_resolv_conf(&container_root, &bridge_config.dns)?;
+                bridge_config.dns.clone()
+            };
+            if self.config.rootfs_path.is_some() {
+                BridgeNetwork::bind_mount_resolv_conf(&container_root, &bridge_dns)?;
+            } else {
+                BridgeNetwork::write_resolv_conf(&container_root, &bridge_dns)?;
             }
         }
 
@@ -1271,9 +1287,9 @@ impl CreatedContainer {
             }
         }
 
-        if let Some(net) = self.bridge_net.take() {
+        if let Some(net) = self.network_driver.take() {
             if let Err(e) = net.cleanup() {
-                warn!("Failed to cleanup bridge networking: {}", e);
+                warn!("Failed to cleanup container networking: {}", e);
             }
         }
 

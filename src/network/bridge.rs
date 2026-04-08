@@ -1,4 +1,4 @@
-use super::{netlink, netns};
+use super::{egress, netlink, netns};
 use crate::error::{NucleusError, Result, StateTransition};
 use crate::network::config::{BridgeConfig, EgressPolicy, PortForward};
 use crate::network::NetworkState;
@@ -205,118 +205,7 @@ impl BridgeNetwork {
     /// Uses iptables OUTPUT chain to restrict outbound connections.
     /// Must be called after bridge setup while the container netns is reachable.
     pub fn apply_egress_policy(&self, pid: u32, policy: &EgressPolicy) -> Result<()> {
-        // Validate egress CIDRs before passing to iptables
-        for cidr in &policy.allowed_cidrs {
-            crate::network::config::validate_egress_cidr(cidr)
-                .map_err(|e| NucleusError::NetworkError(format!("Invalid egress CIDR: {}", e)))?;
-        }
-
-        let ipt = Self::resolve_bin("iptables")?;
-
-        // M15: Set DROP policy BEFORE flushing rules to avoid a window where
-        // all egress is unrestricted. The order is: DROP -> flush -> add rules.
-        netns::exec_in_netns(pid, &ipt, &["-P", "OUTPUT", "DROP"])?;
-        // Flush any existing OUTPUT rules to prevent duplication on repeated calls
-        netns::exec_in_netns(pid, &ipt, &["-F", "OUTPUT"])?;
-
-        // Default policy: drop all OUTPUT (except established/related and loopback)
-        netns::exec_in_netns(pid, &ipt, &["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"])?;
-
-        netns::exec_in_netns(
-            pid,
-            &ipt,
-            &[
-                "-A",
-                "OUTPUT",
-                "-m",
-                "conntrack",
-                "--ctstate",
-                "ESTABLISHED,RELATED",
-                "-j",
-                "ACCEPT",
-            ],
-        )?;
-
-        // Allow DNS to configured resolvers (only when policy permits it)
-        if policy.allow_dns {
-            for dns in &self.config.dns {
-                netns::exec_in_netns(
-                    pid,
-                    &ipt,
-                    &[
-                        "-A", "OUTPUT", "-p", "udp", "-d", dns, "--dport", "53", "-j", "ACCEPT",
-                    ],
-                )?;
-                netns::exec_in_netns(
-                    pid,
-                    &ipt,
-                    &[
-                        "-A", "OUTPUT", "-p", "tcp", "-d", dns, "--dport", "53", "-j", "ACCEPT",
-                    ],
-                )?;
-            }
-        }
-
-        // Allow traffic to each permitted CIDR
-        for cidr in &policy.allowed_cidrs {
-            if policy.allowed_tcp_ports.is_empty() && policy.allowed_udp_ports.is_empty() {
-                netns::exec_in_netns(pid, &ipt, &["-A", "OUTPUT", "-d", cidr, "-j", "ACCEPT"])?;
-            } else {
-                for port in &policy.allowed_tcp_ports {
-                    let port_s = port.to_string();
-                    netns::exec_in_netns(
-                        pid,
-                        &ipt,
-                        &[
-                            "-A", "OUTPUT", "-p", "tcp", "-d", cidr, "--dport", &port_s, "-j",
-                            "ACCEPT",
-                        ],
-                    )?;
-                }
-                for port in &policy.allowed_udp_ports {
-                    let port_s = port.to_string();
-                    netns::exec_in_netns(
-                        pid,
-                        &ipt,
-                        &[
-                            "-A", "OUTPUT", "-p", "udp", "-d", cidr, "--dport", &port_s, "-j",
-                            "ACCEPT",
-                        ],
-                    )?;
-                }
-            }
-        }
-
-        // Log denied packets (rate-limited)
-        if policy.log_denied {
-            netns::exec_in_netns(
-                pid,
-                &ipt,
-                &[
-                    "-A",
-                    "OUTPUT",
-                    "-m",
-                    "limit",
-                    "--limit",
-                    "5/min",
-                    "-j",
-                    "LOG",
-                    "--log-prefix",
-                    "nucleus-egress-denied: ",
-                ],
-            )?;
-        }
-
-        // Drop everything else
-        netns::exec_in_netns(pid, &ipt, &["-P", "OUTPUT", "DROP"])?;
-
-        info!(
-            "Egress policy applied: {} allowed CIDRs",
-            policy.allowed_cidrs.len()
-        );
-        debug!("Egress policy details: {:?}", policy);
-
-        Ok(())
+        egress::apply_egress_policy(pid, &self.config.dns, policy, false)
     }
 
     /// Clean up bridge networking
@@ -749,9 +638,14 @@ impl BridgeNetwork {
     /// ownership and permissions before use. When unprivileged, uses
     /// `which`-style PATH resolution but still validates the result.
     /// Returns an error if no valid binary is found.
-    fn resolve_bin(name: &str) -> Result<String> {
+    pub(crate) fn resolve_bin(name: &str) -> Result<String> {
         let search_dirs: &[&str] = match name {
             "iptables" => &["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"],
+            "slirp4netns" => &[
+                "/usr/bin/slirp4netns",
+                "/bin/slirp4netns",
+                "/run/current-system/sw/bin/slirp4netns",
+            ],
             _ => &[],
         };
 

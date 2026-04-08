@@ -146,6 +146,8 @@ nucleus run --rootless -- /bin/sh
 nucleus run --network host --allow-host-network -- curl https://example.com
 nucleus run --network bridge -p 8080:80 -- ./server
 nucleus run --network bridge -p 127.0.0.1:8080:80 -- ./server
+nucleus run --rootless --network bridge -- ./client
+nucleus run --network bridge --nat-backend userspace -- ./client
 
 # Context streaming (bind mount for instant access)
 nucleus run --context ./large-dir/ --context-mode bind -- ./agent
@@ -653,6 +655,18 @@ nucleus run --network bridge --dns 10.0.0.1 \
   --egress-allow "" \
   -- ./isolated-service
 ```
+
+## Native Bridge Backends
+
+For the native runtime, `--network bridge` now has two backends:
+
+| `--nat-backend` | When used | Implementation |
+|---|---|---|
+| `auto` | Default | Kernel bridge/veth/iptables when privileged, `slirp4netns` userspace NAT when rootless |
+| `kernel` | Explicit opt-in | Kernel bridge + veth + iptables MASQUERADE/DNAT |
+| `userspace` | Explicit opt-in | `slirp4netns` userspace NAT + API-socket port forwarding |
+
+This changes the native rootless behavior from "degrade to `none`" to a real userspace NAT path.
 
 ## gVisor Network Modes
 

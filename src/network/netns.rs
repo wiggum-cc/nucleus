@@ -46,6 +46,28 @@ where
 ///
 /// `program` should be an absolute path (e.g. from `resolve_bin`).
 pub fn exec_in_netns(pid: u32, program: &str, args: &[&str]) -> Result<()> {
+    exec_in_namespaces(pid, false, program, args)
+}
+
+/// Execute a program inside the user+network namespaces of `pid`.
+///
+/// For rootless containers, network administration inside the target netns
+/// requires first joining the target user namespace, matching the ordering used
+/// by `nsenter -U -n`.
+pub fn exec_in_user_netns(pid: u32, program: &str, args: &[&str]) -> Result<()> {
+    exec_in_namespaces(pid, true, program, args)
+}
+
+fn exec_in_namespaces(pid: u32, enter_userns: bool, program: &str, args: &[&str]) -> Result<()> {
+    let userns_file = if enter_userns {
+        let userns_path = format!("/proc/{}/ns/user", pid);
+        Some(std::fs::File::open(&userns_path).map_err(|e| {
+            NucleusError::NetworkError(format!("failed to open userns for PID {}: {}", pid, e))
+        })?)
+    } else {
+        None
+    };
+
     let ns_path = format!("/proc/{}/ns/net", pid);
     let ns_file = std::fs::File::open(&ns_path).map_err(|e| {
         NucleusError::NetworkError(format!("failed to open netns for PID {}: {}", pid, e))
@@ -58,6 +80,10 @@ pub fn exec_in_netns(pid: u32, program: &str, args: &[&str]) -> Result<()> {
         Command::new(program)
             .args(args)
             .pre_exec(move || {
+                if let Some(ref userns) = userns_file {
+                    nix::sched::setns(userns, nix::sched::CloneFlags::CLONE_NEWUSER)
+                        .map_err(std::io::Error::other)?;
+                }
                 nix::sched::setns(&ns_file, nix::sched::CloneFlags::CLONE_NEWNET)
                     .map_err(std::io::Error::other)
             })

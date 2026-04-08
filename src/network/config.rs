@@ -11,6 +11,23 @@ pub enum NetworkMode {
     Bridge(BridgeConfig),
 }
 
+/// NAT backend for native bridge-style networking.
+///
+/// `Auto` preserves the historical behavior for privileged callers while
+/// enabling a userspace NAT path for rootless/native containers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum NatBackend {
+    /// Select kernel bridge + iptables when privileged, otherwise userspace NAT.
+    #[value(name = "auto")]
+    Auto,
+    /// Require the kernel bridge/veth/iptables backend.
+    #[value(name = "kernel")]
+    Kernel,
+    /// Require the userspace NAT backend.
+    #[value(name = "userspace")]
+    Userspace,
+}
+
 /// Configuration for bridge networking
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
@@ -24,6 +41,8 @@ pub struct BridgeConfig {
     pub dns: Vec<String>,
     /// Port forwarding rules
     pub port_forwards: Vec<PortForward>,
+    /// NAT backend selection for the native runtime.
+    pub nat_backend: NatBackend,
 }
 
 impl Default for BridgeConfig {
@@ -36,6 +55,7 @@ impl Default for BridgeConfig {
             // Agent mode callers can use BridgeConfig::with_public_dns() for convenience.
             dns: Vec::new(),
             port_forwards: Vec::new(),
+            nat_backend: NatBackend::Auto,
         }
     }
 }
@@ -51,6 +71,19 @@ impl BridgeConfig {
     pub fn with_dns(mut self, servers: Vec<String>) -> Self {
         self.dns = servers;
         self
+    }
+
+    pub fn with_nat_backend(mut self, backend: NatBackend) -> Self {
+        self.nat_backend = backend;
+        self
+    }
+
+    pub fn selected_nat_backend(&self, host_is_root: bool, rootless: bool) -> NatBackend {
+        match self.nat_backend {
+            NatBackend::Auto if host_is_root && !rootless => NatBackend::Kernel,
+            NatBackend::Auto => NatBackend::Userspace,
+            explicit => explicit,
+        }
     }
 
     /// Validate all fields to prevent argument injection into ip/iptables commands.
