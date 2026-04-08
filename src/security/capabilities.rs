@@ -4,7 +4,26 @@ use tracing::{debug, info};
 
 /// Security context that tracks capability state
 pub struct CapabilityManager {
-    dropped: bool,
+    phase: CapPhase,
+}
+
+/// Tracks which phase of the two-phase cap drop we're in.
+///
+/// Docker/runc convention: the identity switch (setuid/setgid) must happen
+/// between bounding-set cleanup and final cap clear. This is because:
+/// - PR_CAPBSET_DROP requires CAP_SETPCAP in the effective set
+/// - setuid/setgid require CAP_SETUID/CAP_SETGID in the effective set
+/// - After setuid to non-zero UID, the kernel auto-clears permitted/effective
+///
+/// So the ordering is: drop bounding → setuid/setgid → clear remaining caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapPhase {
+    /// No caps have been modified yet
+    Initial,
+    /// Bounding set dropped; effective/permitted still intact for identity switch
+    BoundingDropped,
+    /// All caps fully dropped (terminal state)
+    Dropped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,27 +37,28 @@ pub struct CapabilitySets {
 
 impl CapabilityManager {
     pub fn new() -> Self {
-        Self { dropped: false }
+        Self {
+            phase: CapPhase::Initial,
+        }
     }
 
-    /// Drop all capabilities
+    /// Phase 1: Drop the bounding set and clear ambient/inheritable caps.
     ///
-    /// This implements the transition: Privileged -> CapabilitiesDropped
-    /// in the security state machine (Nucleus_Security_SecurityEnforcement.tla)
+    /// After this call, CAP_SETUID and CAP_SETGID remain in the effective set
+    /// so the caller can perform the identity switch (setuid/setgid). Call
+    /// [`finalize_drop`] after the identity switch to clear remaining caps.
     ///
-    /// Ordering follows Docker/runc convention: bounding set is cleared first
-    /// while CAP_SETPCAP is still in the effective set. PR_CAPBSET_DROP requires
-    /// CAP_SETPCAP, so clearing effective/permitted before bounding causes EPERM
-    /// for every bounding drop — the process then fails the M4 verification.
-    pub fn drop_all(&mut self) -> Result<()> {
-        if self.dropped {
-            debug!("Capabilities already dropped, skipping");
+    /// This follows Docker/runc convention: bounding set is cleared first
+    /// while CAP_SETPCAP is still in the effective set.
+    pub fn drop_bounding_set(&mut self) -> Result<()> {
+        if self.phase != CapPhase::Initial {
+            debug!("Bounding set already dropped, skipping");
             return Ok(());
         }
 
-        info!("Dropping all capabilities");
+        info!("Phase 1: dropping bounding set and ambient/inheritable caps");
 
-        // 1. Clear bounding set FIRST (requires CAP_SETPCAP in effective set).
+        // 1. Clear bounding set (requires CAP_SETPCAP in effective set).
         //    Prevents regaining capabilities through exec of setuid binaries.
         for cap in caps::all() {
             if let Err(e) = caps::drop(None, CapSet::Bounding, cap) {
@@ -56,22 +76,50 @@ impl CapabilityManager {
         if !bounding.is_empty() {
             let leaked: Vec<String> = bounding.iter().map(|c| format!("{:?}", c)).collect();
             return Err(NucleusError::CapabilityError(format!(
-                "Bounding set still contains capabilities after drop_all: [{}]",
+                "Bounding set still contains capabilities after drop: [{}]",
                 leaked.join(", ")
             )));
         }
 
-        // 2. Clear ambient set (must be cleared before permitted, since
-        //    ambient caps are constrained to permitted ∩ inheritable).
+        // 2. Clear ambient set (constrained to permitted ∩ inheritable).
         caps::clear(None, CapSet::Ambient).map_err(|e| {
             NucleusError::CapabilityError(format!("Failed to clear ambient caps: {}", e))
         })?;
 
-        // 3. Clear inheritable, permitted, effective — in that order so we
-        //    never hold effective caps that exceed the permitted set.
+        // 3. Clear inheritable (prevents caps leaking across exec).
         caps::clear(None, CapSet::Inheritable).map_err(|e| {
             NucleusError::CapabilityError(format!("Failed to clear inheritable caps: {}", e))
         })?;
+
+        // Effective/permitted are intentionally kept — they hold CAP_SETUID,
+        // CAP_SETGID, and CAP_SETPCAP needed for the identity switch.
+
+        self.phase = CapPhase::BoundingDropped;
+        info!("Phase 1 complete: bounding/ambient/inheritable cleared, effective/permitted retained for identity switch");
+
+        Ok(())
+    }
+
+    /// Phase 2: Clear all remaining capabilities (permitted + effective).
+    ///
+    /// Call this AFTER the identity switch (setuid/setgid). If the process
+    /// switched to a non-root UID, the kernel already cleared these sets;
+    /// this call makes it explicit and verifies the result.
+    ///
+    /// If no identity switch was needed (process stays root), this performs
+    /// the actual clear.
+    pub fn finalize_drop(&mut self) -> Result<()> {
+        if self.phase == CapPhase::Dropped {
+            debug!("Capabilities already fully dropped, skipping");
+            return Ok(());
+        }
+
+        if self.phase == CapPhase::Initial {
+            // Caller skipped phase 1 — do full drop for backwards compat
+            self.drop_bounding_set()?;
+        }
+
+        info!("Phase 2: clearing permitted and effective caps");
 
         caps::clear(None, CapSet::Permitted).map_err(|e| {
             NucleusError::CapabilityError(format!("Failed to clear permitted caps: {}", e))
@@ -81,10 +129,19 @@ impl CapabilityManager {
             NucleusError::CapabilityError(format!("Failed to clear effective caps: {}", e))
         })?;
 
-        self.dropped = true;
+        self.phase = CapPhase::Dropped;
         info!("Successfully dropped all capabilities (including bounding set)");
 
         Ok(())
+    }
+
+    /// Drop all capabilities in a single call (convenience wrapper).
+    ///
+    /// Equivalent to calling [`drop_bounding_set`] then [`finalize_drop`].
+    /// Use the two-phase API when an identity switch is needed between phases.
+    pub fn drop_all(&mut self) -> Result<()> {
+        self.drop_bounding_set()?;
+        self.finalize_drop()
     }
 
     /// Drop all capabilities except the specified ones
@@ -92,7 +149,7 @@ impl CapabilityManager {
     /// For most use cases, we drop ALL capabilities. This method is provided
     /// for special cases where specific capabilities are needed.
     pub fn drop_except(&mut self, keep: &[Capability]) -> Result<()> {
-        if self.dropped {
+        if self.phase == CapPhase::Dropped {
             debug!("Capabilities already dropped, skipping");
             return Ok(());
         }
@@ -102,8 +159,6 @@ impl CapabilityManager {
         let all_caps = caps::all();
 
         // 1. Drop bounding set entries FIRST (requires CAP_SETPCAP in effective).
-        //    If CAP_SETPCAP is not in `keep`, we must drop it from bounding while
-        //    it is still in the effective set.
         for cap in &all_caps {
             if !keep.contains(cap) {
                 if let Err(e) = caps::drop(None, CapSet::Bounding, *cap) {
@@ -137,7 +192,7 @@ impl CapabilityManager {
             }
         }
 
-        self.dropped = true;
+        self.phase = CapPhase::Dropped;
         info!("Successfully dropped capabilities");
 
         Ok(())
@@ -148,7 +203,7 @@ impl CapabilityManager {
     /// Bounding is handled as a drop-only upper bound; the remaining sets are
     /// set exactly to the provided values.
     pub fn apply_sets(&mut self, sets: &CapabilitySets) -> Result<()> {
-        if self.dropped {
+        if self.phase == CapPhase::Dropped {
             debug!("Capabilities already dropped, skipping");
             return Ok(());
         }
@@ -186,14 +241,14 @@ impl CapabilityManager {
             NucleusError::CapabilityError(format!("Failed to set ambient caps: {}", e))
         })?;
 
-        self.dropped = true;
+        self.phase = CapPhase::Dropped;
         info!("Successfully applied capability sets");
         Ok(())
     }
 
     /// Check if capabilities have been dropped
     pub fn is_dropped(&self) -> bool {
-        self.dropped
+        self.phase == CapPhase::Dropped
     }
 
     /// Verify that namespace-creating capabilities are actually absent from
@@ -271,6 +326,22 @@ mod tests {
                 // In unprivileged tests, bounding set verification may fail.
                 // This is expected and not a test failure.
             }
+        }
+    }
+
+    #[test]
+    fn test_two_phase_drop() {
+        let mut mgr = CapabilityManager::new();
+        // Phase 1 may fail in unprivileged tests; that's fine
+        match mgr.drop_bounding_set() {
+            Ok(()) => {
+                assert!(!mgr.is_dropped()); // not fully dropped yet
+                match mgr.finalize_drop() {
+                    Ok(()) => assert!(mgr.is_dropped()),
+                    Err(_) => {} // clear may fail in test env
+                }
+            }
+            Err(_) => {}
         }
     }
 }

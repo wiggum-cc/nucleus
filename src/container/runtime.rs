@@ -582,9 +582,26 @@ impl Container {
         // 4. Create minimal filesystem structure
         create_minimal_fs(&container_root)?;
 
-        // 5. Create device nodes
+        // 5. Create device nodes and standard tmpfs mounts under /dev
         let dev_path = container_root.join("dev");
         create_dev_nodes(&dev_path, false)?;
+
+        // /dev/shm — POSIX shared memory (shm_open). Required by PostgreSQL,
+        // Redis, and other programs that use POSIX shared memory segments.
+        let shm_path = dev_path.join("shm");
+        std::fs::create_dir_all(&shm_path).map_err(|e| {
+            NucleusError::FilesystemError(format!("Failed to create /dev/shm: {}", e))
+        })?;
+        nix::mount::mount(
+            Some("shm"),
+            &shm_path,
+            Some("tmpfs"),
+            nix::mount::MsFlags::MS_NOSUID | nix::mount::MsFlags::MS_NODEV | nix::mount::MsFlags::MS_NOEXEC,
+            Some("mode=1777,size=64m"),
+        ).map_err(|e| {
+            NucleusError::FilesystemError(format!("Failed to mount tmpfs on /dev/shm: {}", e))
+        })?;
+        debug!("Mounted tmpfs on /dev/shm");
 
         // 6. Populate context if provided
         // Filesystem: Mounted -> Populated
@@ -688,8 +705,15 @@ impl Container {
             }
         }
 
-        // 11. Drop capabilities (from policy file or default drop-all)
-        // Security: Privileged -> CapabilitiesDropped
+        // 11. Drop capabilities and switch identity (Docker/runc convention).
+        //
+        // The identity switch (setuid/setgid) must happen between two cap phases:
+        //   Phase 1: drop bounding set (needs CAP_SETPCAP), clear ambient/inheritable
+        //   Identity: setgroups/setgid/setuid (needs CAP_SETUID/CAP_SETGID)
+        //   Phase 2: clear permitted/effective (or kernel auto-clears on setuid)
+        //
+        // Custom cap policies (drop_except / apply_sets) do their own full drop,
+        // so the two-phase approach only applies to the default drop-all path.
         let mut cap_mgr = CapabilityManager::new();
         if let Some(ref policy_path) = self.config.caps_policy {
             let policy: crate::security::CapsPolicy = crate::security::load_toml_policy(
@@ -701,6 +725,11 @@ impl Container {
                 policy.validate_production()?;
             }
             policy.apply(&mut cap_mgr)?;
+            // Identity switch after custom policy (caps may already be restricted)
+            Self::apply_process_identity_to_current_process(
+                &self.config.process_identity,
+                self.config.user_ns_config.is_some(),
+            )?;
             audit(
                 &self.config.id,
                 &self.config.name,
@@ -708,7 +737,21 @@ impl Container {
                 format!("capability policy applied from {:?}", policy_path),
             );
         } else {
-            cap_mgr.drop_all()?;
+            // Phase 1: drop bounding set while CAP_SETPCAP is still effective
+            cap_mgr.drop_bounding_set()?;
+
+            // Identity switch: setgroups/setgid/setuid while CAP_SETUID/CAP_SETGID
+            // are still in the effective set. For non-root target UIDs, the kernel
+            // auto-clears permitted/effective after setuid().
+            Self::apply_process_identity_to_current_process(
+                &self.config.process_identity,
+                self.config.user_ns_config.is_some(),
+            )?;
+
+            // Phase 2: explicitly clear any remaining caps (handles root-stays-root
+            // case where kernel doesn't auto-clear).
+            cap_mgr.finalize_drop()?;
+
             audit(
                 &self.config.id,
                 &self.config.name,
@@ -725,21 +768,22 @@ impl Container {
         {
             let is_production = self.config.service_mode == ServiceMode::Production;
 
-            let nproc_limit = self.config.limits.pids_max.unwrap_or(512);
-            let rlim_nproc = libc::rlimit {
-                rlim_cur: nproc_limit,
-                rlim_max: nproc_limit,
-            };
-            // SAFETY: setrlimit is a standard POSIX call with no memory safety concerns.
-            if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc) } != 0 {
-                let err = std::io::Error::last_os_error();
-                if is_production {
-                    return Err(NucleusError::SeccompError(format!(
-                        "Failed to set RLIMIT_NPROC to {} in production mode: {}",
-                        nproc_limit, err
-                    )));
+            if let Some(nproc_limit) = self.config.limits.pids_max {
+                let rlim_nproc = libc::rlimit {
+                    rlim_cur: nproc_limit,
+                    rlim_max: nproc_limit,
+                };
+                // SAFETY: setrlimit is a standard POSIX call with no memory safety concerns.
+                if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc) } != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if is_production {
+                        return Err(NucleusError::SeccompError(format!(
+                            "Failed to set RLIMIT_NPROC to {} in production mode: {}",
+                            nproc_limit, err
+                        )));
+                    }
+                    warn!("Failed to set RLIMIT_NPROC to {}: {}", nproc_limit, err);
                 }
-                warn!("Failed to set RLIMIT_NPROC to {}: {}", nproc_limit, err);
             }
 
             let rlim_nofile = libc::rlimit {
@@ -854,6 +898,10 @@ impl Container {
         } else {
             let mut landlock_mgr = LandlockManager::new();
             landlock_mgr.assert_minimum_abi(self.config.service_mode == ServiceMode::Production)?;
+            // Register volume mount destinations so Landlock permits access to them
+            for vol in &self.config.volumes {
+                landlock_mgr.add_rw_path(&vol.dest.to_string_lossy());
+            }
             landlock_mgr.apply_container_policy_with_mode(allow_degraded_security)?
         };
         if seccomp_applied && landlock_applied {

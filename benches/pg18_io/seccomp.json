@@ -1,0 +1,14 @@
+{
+  "comment": "Seccomp profile for PostgreSQL 18 benchmarks. Extends the nucleus default with io_uring syscalls needed for PG18 io_method=io_uring.",
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "syscalls": [
+    {
+      "names": [
+        "io_uring_setup",
+        "io_uring_enter",
+        "io_uring_register"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}

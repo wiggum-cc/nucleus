@@ -51,7 +51,10 @@ impl Container {
 
     /// Execute the target command.
     ///
-    /// This runs in the child process after fork, after all security setup is complete.
+    /// This runs in the child process after fork, after all security setup
+    /// (including identity switch) is complete. The identity switch
+    /// (setuid/setgid) has already been applied in the cap-drop phase of
+    /// setup_and_exec, between bounding-set cleanup and final cap clear.
     pub(super) fn exec_command(&self) -> Result<()> {
         if self.config.command.is_empty() {
             return Err(NucleusError::ExecError("No command specified".to_string()));
@@ -61,11 +64,6 @@ impl Container {
             "Executing command: {:?}",
             crate::audit::redact_command(&self.config.command)
         );
-
-        Self::apply_process_identity_to_current_process(
-            &self.config.process_identity,
-            self.config.user_ns_config.is_some(),
-        )?;
 
         let program = CString::new(self.config.command[0].as_str())
             .map_err(|e| NucleusError::ExecError(format!("Invalid program name: {}", e)))?;

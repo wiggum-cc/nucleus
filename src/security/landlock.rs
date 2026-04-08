@@ -27,11 +27,22 @@ const MINIMUM_PRODUCTION_ABI: ABI = ABI::V3;
 /// - Unprivileged: works in rootless mode
 pub struct LandlockManager {
     applied: bool,
+    /// Additional paths to grant read+write access to (e.g. volume mounts).
+    extra_rw_paths: Vec<String>,
 }
 
 impl LandlockManager {
     pub fn new() -> Self {
-        Self { applied: false }
+        Self {
+            applied: false,
+            extra_rw_paths: Vec::new(),
+        }
+    }
+
+    /// Register additional paths that need read+write access.
+    /// Used for volume mounts that aren't under the default allowed paths.
+    pub fn add_rw_path(&mut self, path: &str) {
+        self.extra_rw_paths.push(path.to_string());
     }
 
     /// Apply the container Landlock policy.
@@ -219,6 +230,15 @@ impl LandlockManager {
             }
         }
 
+        // /dev/shm: read+write for POSIX shared memory (shm_open).
+        // Required by PostgreSQL, Redis, and other programs.
+        // No execute — same policy as /tmp.
+        if let Ok(fd) = PathFd::new("/dev/shm") {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, access_tmp))
+                .map_err(ll_err)?;
+        }
+
         // /tmp: full read+write+create+remove
         if let Ok(fd) = PathFd::new("/tmp") {
             ruleset = ruleset
@@ -245,6 +265,17 @@ impl LandlockManager {
             ruleset = ruleset
                 .add_rule(PathBeneath::new(fd, access_read))
                 .map_err(ll_err)?;
+        }
+
+        // Volume mounts and other dynamically registered paths: full read+write
+        // (but no execute — same policy as /tmp to prevent drop-and-exec).
+        for path in &self.extra_rw_paths {
+            if let Ok(fd) = PathFd::new(path) {
+                debug!("Landlock: granting rw access to volume path {:?}", path);
+                ruleset = ruleset
+                    .add_rule(PathBeneath::new(fd, access_tmp))
+                    .map_err(ll_err)?;
+            }
         }
 
         let status = ruleset.restrict_self().map_err(ll_err)?;

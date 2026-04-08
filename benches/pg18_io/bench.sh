@@ -287,6 +287,22 @@ run_nucleus_bench() {
   # - Bind-mount pgdata + /nix (for PG binaries) + /tmp
   # - trusted + allow-degraded-security: minimize security overhead for apples-to-apples I/O benchmark
   # - native runtime: no gVisor, just namespace/cgroup isolation
+  # Clean up any stale container state from a previous run
+  nucleus delete "pg18-bench-${io_method}" 2>/dev/null || true
+
+  # For io_uring mode, use a custom seccomp profile that adds io_uring_*
+  # syscalls (excluded from nucleus defaults due to kernel CVE history).
+  local seccomp_args=()
+  if [ "$io_method" = "io_uring" ]; then
+    local profile_path
+    profile_path="$(cd "$(dirname "$0")" && pwd)/seccomp.json"
+    if [ -f "$profile_path" ]; then
+      seccomp_args=(--seccomp-profile "$profile_path")
+    else
+      echo "WARNING: seccomp.json not found at $profile_path, io_uring may be blocked" >&2
+    fi
+  fi
+
   nucleus create \
     --name "pg18-bench-${io_method}" \
     --user "$PG_UID" \
@@ -297,9 +313,11 @@ run_nucleus_bench() {
     --trust-level trusted \
     --allow-degraded-security \
     --allow-chroot-fallback \
+    --pids 0 \
     --volume "$pgdata:/pgdata" \
     --volume "/nix:/nix:ro" \
     --volume "/tmp:/tmp" \
+    "${seccomp_args[@]}" \
     -- "$PG_BIN/postgres" -D /pgdata -p "$port" &
 
   NUCLEUS_PID=$!

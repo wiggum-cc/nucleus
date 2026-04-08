@@ -63,7 +63,10 @@ impl SeccompManager {
             libc::SYS_fadvise64,
             libc::SYS_fsync,
             libc::SYS_fdatasync,
+            libc::SYS_sync_file_range,
             libc::SYS_flock,
+            libc::SYS_fstatfs,
+            libc::SYS_statfs,
             #[cfg(target_arch = "x86_64")]
             libc::SYS_sendfile,
             libc::SYS_copy_file_range,
@@ -76,6 +79,20 @@ impl SeccompManager {
             libc::SYS_mremap,
             libc::SYS_madvise,
             libc::SYS_msync,
+            libc::SYS_mlock,
+            libc::SYS_munlock,
+            libc::SYS_mlock2,
+            // SysV shared memory — used by PostgreSQL, Redis, and many databases
+            // for shared buffer pools. Safe in PID/IPC namespaces (isolated keyspace).
+            libc::SYS_shmget,
+            libc::SYS_shmat,
+            libc::SYS_shmdt,
+            libc::SYS_shmctl,
+            // POSIX semaphores (used by PostgreSQL for lightweight locking)
+            libc::SYS_semget,
+            libc::SYS_semop,
+            libc::SYS_semctl,
+            libc::SYS_semtimedop,
             // Process management
             // fork intentionally excluded — modern glibc/musl use clone(), which
             // has namespace-flag filtering. Removing SYS_fork forces all forks
@@ -101,18 +118,24 @@ impl SeccompManager {
             libc::SYS_rt_sigprocmask,
             libc::SYS_rt_sigreturn,
             libc::SYS_rt_sigsuspend,
+            libc::SYS_rt_sigtimedwait,
+            libc::SYS_rt_sigpending,
+            libc::SYS_rt_sigqueueinfo,
             libc::SYS_sigaltstack,
+            libc::SYS_restart_syscall,
             // L7: kill/tgkill are safe when PID namespace is active (container
             // can only signal its own processes). If PID namespace creation fails,
             // the runtime aborts, so this is safe.
             libc::SYS_kill,
             libc::SYS_tgkill,
-            // Time
+            // Time and timers
             libc::SYS_clock_gettime,
             libc::SYS_clock_getres,
             libc::SYS_clock_nanosleep,
             libc::SYS_gettimeofday,
             libc::SYS_nanosleep,
+            libc::SYS_setitimer,
+            libc::SYS_getitimer,
             // Directories
             libc::SYS_getcwd,
             libc::SYS_chdir,
@@ -134,9 +157,36 @@ impl SeccompManager {
             libc::SYS_times,
             libc::SYS_sched_yield,
             libc::SYS_sched_getaffinity,
+            libc::SYS_sched_setaffinity,
+            libc::SYS_sched_getparam,
+            libc::SYS_sched_getscheduler,
             libc::SYS_getcpu,
+            // Extended attributes — read-only queries, safe
+            libc::SYS_getxattr,
+            libc::SYS_lgetxattr,
+            libc::SYS_fgetxattr,
+            libc::SYS_listxattr,
+            libc::SYS_llistxattr,
+            libc::SYS_flistxattr,
             libc::SYS_rseq,
             libc::SYS_close_range,
+            // Ownership — safe after capability drop (CAP_CHOWN/CAP_FOWNER gone;
+            // operations on files not owned by the container UID will EPERM).
+            libc::SYS_fchown,
+            libc::SYS_fchownat,
+            // Legacy AIO — used by databases and storage engines. Operations are
+            // bounded by the process's existing fd permissions.
+            libc::SYS_io_setup,
+            libc::SYS_io_destroy,
+            libc::SYS_io_submit,
+            libc::SYS_io_getevents,
+            // NOTE: io_uring intentionally excluded from defaults — large kernel
+            // attack surface with a history of CVEs. Applications needing io_uring
+            // (e.g. PostgreSQL 18+ io_method=io_uring) should use a custom seccomp
+            // profile that adds io_uring_setup/io_uring_enter/io_uring_register.
+            // Process groups — safe in PID namespace (can only affect own pgrp).
+            libc::SYS_setpgid,
+            libc::SYS_getpgid,
             // NOTE: memfd_create intentionally excluded — combined with execveat
             // it enables fileless code execution bypassing all FS controls (SEC-02).
             // Landlock bootstrap (runtime applies seccomp before Landlock)
@@ -180,6 +230,9 @@ impl SeccompManager {
             libc::SYS_rmdir,
             libc::SYS_getdents,
             libc::SYS_getpgrp,
+            libc::SYS_chown,
+            libc::SYS_fchown,
+            libc::SYS_lchown,
             libc::SYS_arch_prctl,
             libc::SYS_getrlimit,
             libc::SYS_poll,
@@ -307,7 +360,6 @@ impl SeccompManager {
 
         // prctl: allow only safe operations (arg0 = option).
         // Notably absent (hit default deny):
-        //   PR_CAPBSET_READ (23) — leaks capability bounding set info
         //   PR_CAPBSET_DROP (24) — could weaken the capability bounding set
         //   PR_SET_SECUREBITS (28) — could disable secure-exec restrictions
         let prctl_allowed: &[u64] = &[
@@ -315,7 +367,16 @@ impl SeccompManager {
             2,  // PR_GET_PDEATHSIG
             15, // PR_SET_NAME
             16, // PR_GET_NAME
+            23, // PR_CAPBSET_READ — glibc probes this at startup to discover
+                // cap_last_cap when /proc/sys is masked. Read-only, harmless
+                // after capabilities have been dropped.
+            27, // PR_GET_SECUREBITS — read-only query of securebits flags
+            36, // PR_SET_CHILD_SUBREAPER — safe, only affects own descendants
+            37, // PR_GET_CHILD_SUBREAPER
             38, // PR_SET_NO_NEW_PRIVS
+            40, // PR_GET_TID_ADDRESS — read-only, returns thread ID address
+            47, // PR_CAP_AMBIENT — glibc probes ambient caps at startup (read-only
+                // IS_SET queries). Safe after caps are dropped.
             39, // PR_GET_NO_NEW_PRIVS
         ];
         let mut prctl_rules = Vec::new();
@@ -946,7 +1007,17 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "madvise" => Some(libc::SYS_madvise),
         "msync" => Some(libc::SYS_msync),
         "mlock" => Some(libc::SYS_mlock),
+        "mlock2" => Some(libc::SYS_mlock2),
         "munlock" => Some(libc::SYS_munlock),
+        // SysV IPC
+        "shmget" => Some(libc::SYS_shmget),
+        "shmat" => Some(libc::SYS_shmat),
+        "shmdt" => Some(libc::SYS_shmdt),
+        "shmctl" => Some(libc::SYS_shmctl),
+        "semget" => Some(libc::SYS_semget),
+        "semop" => Some(libc::SYS_semop),
+        "semctl" => Some(libc::SYS_semctl),
+        "semtimedop" => Some(libc::SYS_semtimedop),
         // Process
         #[cfg(target_arch = "x86_64")]
         "fork" => Some(libc::SYS_fork),
@@ -974,7 +1045,11 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "rt_sigprocmask" => Some(libc::SYS_rt_sigprocmask),
         "rt_sigreturn" => Some(libc::SYS_rt_sigreturn),
         "rt_sigsuspend" => Some(libc::SYS_rt_sigsuspend),
+        "rt_sigtimedwait" => Some(libc::SYS_rt_sigtimedwait),
+        "rt_sigpending" => Some(libc::SYS_rt_sigpending),
+        "rt_sigqueueinfo" => Some(libc::SYS_rt_sigqueueinfo),
         "sigaltstack" => Some(libc::SYS_sigaltstack),
+        "restart_syscall" => Some(libc::SYS_restart_syscall),
         "kill" => Some(libc::SYS_kill),
         "tgkill" => Some(libc::SYS_tgkill),
         // Time
@@ -1056,6 +1131,28 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "getcpu" => Some(libc::SYS_getcpu),
         "rseq" => Some(libc::SYS_rseq),
         "close_range" => Some(libc::SYS_close_range),
+        // Ownership
+        "fchown" => Some(libc::SYS_fchown),
+        "fchownat" => Some(libc::SYS_fchownat),
+        #[cfg(target_arch = "x86_64")]
+        "chown" => Some(libc::SYS_chown),
+        #[cfg(target_arch = "x86_64")]
+        "lchown" => Some(libc::SYS_lchown),
+        // io_uring
+        "io_uring_setup" => Some(libc::SYS_io_uring_setup),
+        "io_uring_enter" => Some(libc::SYS_io_uring_enter),
+        "io_uring_register" => Some(libc::SYS_io_uring_register),
+        // Legacy AIO
+        "io_setup" => Some(libc::SYS_io_setup),
+        "io_destroy" => Some(libc::SYS_io_destroy),
+        "io_submit" => Some(libc::SYS_io_submit),
+        "io_getevents" => Some(libc::SYS_io_getevents),
+        // Timers
+        "setitimer" => Some(libc::SYS_setitimer),
+        "getitimer" => Some(libc::SYS_getitimer),
+        // Process groups
+        "setpgid" => Some(libc::SYS_setpgid),
+        "getpgid" => Some(libc::SYS_getpgid),
         "memfd_create" => Some(libc::SYS_memfd_create),
         "ioctl" => Some(libc::SYS_ioctl),
         "prctl" => Some(libc::SYS_prctl),
@@ -1185,10 +1282,10 @@ mod tests {
         // execveat removed from base (arg-filtered separately).
         // sysinfo removed (L8: leaks host info).
         // prlimit64 moved to arg-filtered (M3).
-        assert_eq!(base.len(), 129);
+        assert_eq!(base.len(), 169);
         assert_eq!(net.len(), 11);
-        assert_eq!(base.len() + 8, 137);
-        assert_eq!(base.len() + net.len() + 8, 148);
+        assert_eq!(base.len() + 8, 177);
+        assert_eq!(base.len() + net.len() + 8, 188);
     }
 
     #[test]
@@ -1230,18 +1327,18 @@ mod tests {
     #[test]
     fn test_high_risk_syscalls_removed_from_base_allowlist() {
         let base = SeccompManager::base_allowed_syscalls();
+        // chown/fchown/lchown/fchownat: allowed — safe after CAP_CHOWN/CAP_FOWNER drop
+        // mlock/munlock: allowed — needed by databases, bounded by RLIMIT_MEMLOCK
         let removed = [
-            libc::SYS_chown,
-            libc::SYS_fchown,
-            libc::SYS_lchown,
-            libc::SYS_fchownat,
             libc::SYS_sync,
             libc::SYS_syncfs,
-            libc::SYS_mlock,
-            libc::SYS_munlock,
             libc::SYS_mincore,
             libc::SYS_vfork,
             libc::SYS_tkill,
+            // io_uring: large attack surface, many CVEs — require custom profile
+            libc::SYS_io_uring_setup,
+            libc::SYS_io_uring_enter,
+            libc::SYS_io_uring_register,
         ];
 
         for syscall in removed {
