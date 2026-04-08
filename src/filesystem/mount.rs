@@ -777,7 +777,7 @@ pub fn mount_procfs(
     }
 }
 
-/// Paths to mask with /dev/null (files) — matches OCI runtime spec masked paths.
+/// Paths to mask with /dev/null (files) – matches OCI runtime spec masked paths.
 /// Exposed for testing; the canonical list of sensitive /proc entries that must
 /// be hidden from container processes.
 pub const PROC_NULL_MASKED: &[&str] = &[

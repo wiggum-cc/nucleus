@@ -172,7 +172,7 @@ impl LandlockManager {
         // Read + execute for binary paths
         let access_read_exec = access_read | AccessFs::Execute;
 
-        // Write access set for /tmp — full read+write but no execute.
+        // Write access set for /tmp – full read+write but no execute.
         // Executing from /tmp is a common attack pattern (drop-and-exec).
         let mut access_tmp = access_all;
         access_tmp.remove(AccessFs::Execute);
@@ -232,7 +232,7 @@ impl LandlockManager {
 
         // /dev/shm: read+write for POSIX shared memory (shm_open).
         // Required by PostgreSQL, Redis, and other programs.
-        // No execute — same policy as /tmp.
+        // No execute – same policy as /tmp.
         if let Ok(fd) = PathFd::new("/dev/shm") {
             ruleset = ruleset
                 .add_rule(PathBeneath::new(fd, access_tmp))
@@ -268,7 +268,7 @@ impl LandlockManager {
         }
 
         // Volume mounts and other dynamically registered paths: full read+write
-        // (but no execute — same policy as /tmp to prevent drop-and-exec).
+        // (but no execute – same policy as /tmp to prevent drop-and-exec).
         for path in &self.extra_rw_paths {
             if let Ok(fd) = PathFd::new(path) {
                 debug!("Landlock: granting rw access to volume path {:?}", path);
@@ -360,7 +360,7 @@ mod tests {
         // Landlock policy must include rules for /nix/store (read+exec) and
         // /run/secrets (read) so NixOS binaries can execute and secrets are readable.
         // NOTE: The Landlock API does not expose the ruleset for inspection, so
-        // this remains a source-text check — but uses brace-matched function
+        // this remains a source-text check – but uses brace-matched function
         // body extraction instead of hardcoded char offsets.
         let source = include_str!("landlock.rs");
         let fn_body = extract_fn_body(source, "fn build_and_restrict");

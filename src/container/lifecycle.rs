@@ -35,7 +35,7 @@ impl ContainerLifecycle {
         let pid = Pid::from_raw(state.pid as i32);
 
         // Verify PID is still alive before sending signal.
-        // kill(pid, None) sends signal 0 — a no-op that returns ESRCH if the
+        // kill(pid, None) sends signal 0 – a no-op that returns ESRCH if the
         // PID doesn't exist, protecting against PID recycling TOCTOU races.
         if let Err(e) = kill(pid, None) {
             if e == nix::errno::Errno::ESRCH {

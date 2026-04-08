@@ -86,7 +86,7 @@ impl Container {
     /// This prevents leaking host sockets, pipes, and state files into the
     /// container. Uses close_range(2) when available, falls back to /proc/self/fd.
     fn sanitize_fds() {
-        // Try close_range(3, u32::MAX, CLOSE_RANGE_CLOEXEC) first — it's
+        // Try close_range(3, u32::MAX, CLOSE_RANGE_CLOEXEC) first – it's
         // O(1) on Linux 5.9+ and marks all FDs as close-on-exec.
         const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
         // SAFETY: close_range is a safe syscall that marks FDs as close-on-exec.
@@ -96,7 +96,7 @@ impl Container {
             return;
         }
         // Fallback: iterate /proc/self/fd and close individually.
-        // Collect fds first, then close — closing during iteration would
+        // Collect fds first, then close – closing during iteration would
         // invalidate the ReadDir's own directory fd.
         if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
             let fds: Vec<i32> = entries
@@ -591,7 +591,7 @@ impl Container {
         let dev_path = container_root.join("dev");
         create_dev_nodes(&dev_path, false)?;
 
-        // /dev/shm — POSIX shared memory (shm_open). Required by PostgreSQL,
+        // /dev/shm – POSIX shared memory (shm_open). Required by PostgreSQL,
         // Redis, and other programs that use POSIX shared memory segments.
         let shm_path = dev_path.join("shm");
         std::fs::create_dir_all(&shm_path).map_err(|e| {
@@ -771,7 +771,7 @@ impl Container {
 
         // 12b. RLIMIT backstop: defense-in-depth against fork bombs and fd exhaustion.
         // Must be applied BEFORE seccomp, since SYS_setrlimit is not in the allowlist.
-        // SEC-05: In production mode, RLIMIT failures are fatal — a container
+        // SEC-05: In production mode, RLIMIT failures are fatal – a container
         // without resource limits is a privilege escalation vector.
         {
             let is_production = self.config.service_mode == ServiceMode::Production;
@@ -925,7 +925,7 @@ impl Container {
                 &self.config.name,
                 AuditEventType::LandlockApplied,
                 if self.config.seccomp_mode == SeccompMode::Trace {
-                    "landlock applied, but seccomp in trace mode — not locked".to_string()
+                    "landlock applied, but seccomp in trace mode – not locked".to_string()
                 } else {
                     "security state locked: all hardening layers active".to_string()
                 },
@@ -1139,7 +1139,7 @@ impl CreatedContainer {
         let config = &self.config;
         let _enter = self._lifecycle_span.enter();
 
-        // Open the exec FIFO for reading — this unblocks the child's
+        // Open the exec FIFO for reading – this unblocks the child's
         // blocking open-for-write, allowing it to proceed to exec.
         if let Some(exec_fifo_path) = &self.exec_fifo_path {
             let file = std::fs::File::open(exec_fifo_path).map_err(|e| {
@@ -1743,7 +1743,7 @@ mod tests {
         let fn_body = &source[fn_start..fn_start + 600];
         assert!(
             !fn_body.contains(".expect("),
-            "prepare_oci_mountpoints must not use expect() — return Err instead"
+            "prepare_oci_mountpoints must not use expect() – return Err instead"
         );
     }
 

@@ -153,7 +153,7 @@ impl Cgroup {
         // This will fail if there are still processes in the cgroup
         if self.path.exists() {
             fs::remove_dir(&self.path).map_err(|e| {
-                // BUG-06: Do NOT set state to Removed on failure — Drop should
+                // BUG-06: Do NOT set state to Removed on failure – Drop should
                 // still attempt cleanup when the Cgroup is dropped.
                 NucleusError::CgroupError(format!("Failed to remove cgroup: {}", e))
             })?;

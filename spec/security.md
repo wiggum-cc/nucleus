@@ -73,9 +73,9 @@ Minimal set if needed:
 
 **Three modes of operation:**
 
-1. **Built-in allowlist** (default) — ~100 syscalls, network-aware, argument-level filtering on `socket()`, `ioctl()`, `prctl()`, `clone()`
-2. **Custom JSON profile** (`--seccomp-profile`) — OCI-format syscall allowlist loaded from file with optional SHA-256 verification
-3. **Trace mode** (`--seccomp-mode trace`) — allow-all with `SECCOMP_FILTER_FLAG_LOG` for profile generation; development only, rejected in production
+1. **Built-in allowlist** (default) – ~100 syscalls, network-aware, argument-level filtering on `socket()`, `ioctl()`, `prctl()`, `clone()`
+2. **Custom JSON profile** (`--seccomp-profile`) – OCI-format syscall allowlist loaded from file with optional SHA-256 verification
+3. **Trace mode** (`--seccomp-mode trace`) – allow-all with `SECCOMP_FILTER_FLAG_LOG` for profile generation; development only, rejected in production
 
 **Profile generation workflow:**
 ```bash
@@ -229,13 +229,13 @@ When `--runtime gvisor`:
 
 All security-critical actions emit structured JSON events via `tracing::info!(target: "nucleus::audit", ...)`:
 
-- `ContainerStart` / `ContainerStop` — lifecycle events
-- `CapabilitiesDropped` — all caps cleared or policy applied
-- `SeccompApplied` / `SeccompProfileLoaded` — filter enforcement
-- `LandlockApplied` — filesystem policy locked
-- `MountAuditPassed` — post-setup mount flag verification
-- `NoNewPrivsSet` — `PR_SET_NO_NEW_PRIVS` applied
-- `InitSupervisorStarted` — PID 1 mini-init active
+- `ContainerStart` / `ContainerStop` – lifecycle events
+- `CapabilitiesDropped` – all caps cleared or policy applied
+- `SeccompApplied` / `SeccompProfileLoaded` – filter enforcement
+- `LandlockApplied` – filesystem policy locked
+- `MountAuditPassed` – post-setup mount flag verification
+- `NoNewPrivsSet` – `PR_SET_NO_NEW_PRIVS` applied
+- `InitSupervisorStarted` – PID 1 mini-init active
 
 Events include container ID, name, timestamp, and detail string.
 

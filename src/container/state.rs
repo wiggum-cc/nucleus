@@ -427,7 +427,7 @@ impl ContainerStateManager {
             let fallback = PathBuf::from(format!("/tmp/nucleus-{}", uid));
             let fallback_ok = match std::fs::create_dir(&fallback) {
                 Ok(()) => {
-                    // We created it — it's ours with correct ownership.
+                    // We created it – it's ours with correct ownership.
                     true
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -438,13 +438,13 @@ impl ContainerStateManager {
                         Ok(meta) => {
                             if meta.file_type().is_symlink() {
                                 tracing::warn!(
-                                    "Skipping {} — it is a symlink (possible attack)",
+                                    "Skipping {} – it is a symlink (possible attack)",
                                     fallback.display()
                                 );
                                 false
                             } else if meta.uid() != uid {
                                 tracing::warn!(
-                                    "Skipping {} — owned by UID {} not {}",
+                                    "Skipping {} – owned by UID {} not {}",
                                     fallback.display(),
                                     meta.uid(),
                                     uid
@@ -455,13 +455,13 @@ impl ContainerStateManager {
                             }
                         }
                         Err(e) => {
-                            tracing::warn!("Skipping {} — cannot stat: {}", fallback.display(), e);
+                            tracing::warn!("Skipping {} – cannot stat: {}", fallback.display(), e);
                             false
                         }
                     }
                 }
                 Err(_) => {
-                    // Cannot create (e.g. /tmp read-only) — skip this candidate.
+                    // Cannot create (e.g. /tmp read-only) – skip this candidate.
                     false
                 }
             };
@@ -628,7 +628,7 @@ impl ContainerStateManager {
                 debug!("Deleted container state: {}", container_id);
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Already deleted — idempotent (handles TOCTOU race)
+                // Already deleted – idempotent (handles TOCTOU race)
                 debug!("Container state already deleted: {}", container_id);
             }
             Err(e) => {
@@ -1022,7 +1022,7 @@ mod tests {
     fn test_delete_state_handles_already_deleted() {
         // BUG-16: delete_state must not fail if file was already deleted (TOCTOU)
         let (mgr, _temp_dir) = temp_state_manager();
-        // Delete a state that doesn't exist — should succeed (idempotent)
+        // Delete a state that doesn't exist – should succeed (idempotent)
         let result = mgr.delete_state("nonexistent-id");
         assert!(
             result.is_ok(),

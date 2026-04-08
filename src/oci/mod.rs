@@ -491,7 +491,7 @@ impl OciHooks {
 
         // C-1: Validate hook binary ownership and permissions to prevent
         // execution of world-writable or unexpectedly-owned binaries.
-        // Similar to runsc's hook validation — reject hooks that could be
+        // Similar to runsc's hook validation – reject hooks that could be
         // tampered with by unprivileged users.
         Self::validate_hook_binary(hook_path, phase)?;
 
@@ -643,7 +643,7 @@ impl OciHooks {
         // Reject world-writable hooks
         if mode & 0o002 != 0 {
             return Err(NucleusError::HookError(format!(
-                "{} hook {} is world-writable (mode {:04o}) — refusing to execute",
+                "{} hook {} is world-writable (mode {:04o}) – refusing to execute",
                 phase,
                 hook_path.display(),
                 mode & 0o7777
@@ -653,7 +653,7 @@ impl OciHooks {
         // Reject group-writable hooks unless owned by root
         if mode & 0o020 != 0 && uid != 0 {
             return Err(NucleusError::HookError(format!(
-                "{} hook {} is group-writable and not owned by root (mode {:04o}, uid {}) — refusing to execute",
+                "{} hook {} is group-writable and not owned by root (mode {:04o}, uid {}) – refusing to execute",
                 phase,
                 hook_path.display(),
                 mode & 0o7777,
@@ -661,10 +661,10 @@ impl OciHooks {
             )));
         }
 
-        // Reject hooks owned by arbitrary UIDs — must be root or effective UID
+        // Reject hooks owned by arbitrary UIDs – must be root or effective UID
         if uid != 0 && uid != effective_uid {
             return Err(NucleusError::HookError(format!(
-                "{} hook {} is owned by UID {} (expected 0 or {}) — refusing to execute",
+                "{} hook {} is owned by UID {} (expected 0 or {}) – refusing to execute",
                 phase,
                 hook_path.display(),
                 uid,
@@ -675,7 +675,7 @@ impl OciHooks {
         // Reject hooks with setuid/setgid bits
         if mode & 0o6000 != 0 {
             return Err(NucleusError::HookError(format!(
-                "{} hook {} has setuid/setgid bits (mode {:04o}) — refusing to execute",
+                "{} hook {} has setuid/setgid bits (mode {:04o}) – refusing to execute",
                 phase,
                 hook_path.display(),
                 mode & 0o7777
@@ -1356,7 +1356,7 @@ impl OciBundle {
         fs::create_dir_all(&rootfs).map_err(|e| {
             NucleusError::GVisorError(format!("Failed to create rootfs directory: {}", e))
         })?;
-        // The rootfs is the container's "/" — it must be traversable by the
+        // The rootfs is the container's "/" – it must be traversable by the
         // container UID which may be non-root (via --user).  Mode 0755 matches
         // the standard Linux root directory permission and lets gVisor's VFS
         // permit path traversal for any UID.
@@ -1500,12 +1500,12 @@ mod tests {
         for path in &["/tmp/evil-inject-path", "/opt/attacker"] {
             assert!(
                 !mount_dests.iter().any(|d| d.contains(path)),
-                "with_host_runtime_binds must not use host $PATH — found {:?} in mount destinations",
+                "with_host_runtime_binds must not use host $PATH – found {:?} in mount destinations",
                 path
             );
             assert!(
                 !mount_srcs.iter().any(|s| s.contains(path)),
-                "with_host_runtime_binds must not use host $PATH — found {:?} in mount sources",
+                "with_host_runtime_binds must not use host $PATH – found {:?} in mount sources",
                 path
             );
         }
@@ -1517,7 +1517,7 @@ mod tests {
                     allowed_prefixes
                         .iter()
                         .any(|p| mount.destination.starts_with(p)),
-                    "unexpected bind mount destination: {} — only FHS paths allowed",
+                    "unexpected bind mount destination: {} – only FHS paths allowed",
                     mount.destination
                 );
             }

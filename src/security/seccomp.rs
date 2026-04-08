@@ -86,7 +86,7 @@ impl SeccompManager {
             libc::SYS_mlock,
             libc::SYS_munlock,
             libc::SYS_mlock2,
-            // SysV shared memory — used by PostgreSQL, Redis, and many databases
+            // SysV shared memory – used by PostgreSQL, Redis, and many databases
             // for shared buffer pools. Safe in PID/IPC namespaces (isolated keyspace).
             libc::SYS_shmget,
             libc::SYS_shmat,
@@ -98,7 +98,7 @@ impl SeccompManager {
             libc::SYS_semctl,
             libc::SYS_semtimedop,
             // Process management
-            // fork intentionally excluded — modern glibc/musl use clone(), which
+            // fork intentionally excluded – modern glibc/musl use clone(), which
             // has namespace-flag filtering. Removing SYS_fork forces all forks
             // through the filtered clone path (defense-in-depth against fork bombs
             // and unfiltered namespace creation).
@@ -153,7 +153,7 @@ impl SeccompManager {
             libc::SYS_set_tid_address,
             libc::SYS_set_robust_list,
             libc::SYS_get_robust_list,
-            // L8: sysinfo removed — leaks host RAM, uptime, and process count.
+            // L8: sysinfo removed – leaks host RAM, uptime, and process count.
             // Applications needing this info should use /proc/meminfo instead.
             libc::SYS_umask,
             // prlimit64 moved to arg-filtered section (M3)
@@ -165,7 +165,7 @@ impl SeccompManager {
             libc::SYS_sched_getparam,
             libc::SYS_sched_getscheduler,
             libc::SYS_getcpu,
-            // Extended attributes — read-only queries, safe
+            // Extended attributes – read-only queries, safe
             libc::SYS_getxattr,
             libc::SYS_lgetxattr,
             libc::SYS_fgetxattr,
@@ -174,24 +174,24 @@ impl SeccompManager {
             libc::SYS_flistxattr,
             libc::SYS_rseq,
             libc::SYS_close_range,
-            // Ownership — safe after capability drop (CAP_CHOWN/CAP_FOWNER gone;
+            // Ownership – safe after capability drop (CAP_CHOWN/CAP_FOWNER gone;
             // operations on files not owned by the container UID will EPERM).
             libc::SYS_fchown,
             libc::SYS_fchownat,
-            // Legacy AIO — used by databases and storage engines. Operations are
+            // Legacy AIO – used by databases and storage engines. Operations are
             // bounded by the process's existing fd permissions.
             libc::SYS_io_setup,
             libc::SYS_io_destroy,
             libc::SYS_io_submit,
             libc::SYS_io_getevents,
-            // NOTE: io_uring intentionally excluded from defaults — large kernel
+            // NOTE: io_uring intentionally excluded from defaults – large kernel
             // attack surface with a history of CVEs. Applications needing io_uring
             // (e.g. PostgreSQL 18+ io_method=io_uring) should use a custom seccomp
             // profile that adds io_uring_setup/io_uring_enter/io_uring_register.
-            // Process groups — safe in PID namespace (can only affect own pgrp).
+            // Process groups – safe in PID namespace (can only affect own pgrp).
             libc::SYS_setpgid,
             libc::SYS_getpgid,
-            // NOTE: memfd_create intentionally excluded — combined with execveat
+            // NOTE: memfd_create intentionally excluded – combined with execveat
             // it enables fileless code execution bypassing all FS controls (SEC-02).
             // Landlock bootstrap (runtime applies seccomp before Landlock)
             libc::SYS_landlock_create_ruleset,
@@ -314,17 +314,17 @@ impl SeccompManager {
         for name in extra_syscalls {
             if let Some(nr) = syscall_name_to_number(name) {
                 if rules.contains_key(&nr) {
-                    // Already allowed by default or arg-filtered — no-op.
+                    // Already allowed by default or arg-filtered – no-op.
                 } else if Self::OPT_IN_SYSCALLS.contains(&name.as_str()) {
                     rules.insert(nr, Vec::new());
                 } else {
                     warn!(
-                        "--seccomp-allow: syscall '{}' is not in the opt-in allowlist — blocked",
+                        "--seccomp-allow: syscall '{}' is not in the opt-in allowlist – blocked",
                         name
                     );
                 }
             } else {
-                warn!("--seccomp-allow: unknown syscall '{}' — blocked", name);
+                warn!("--seccomp-allow: unknown syscall '{}' – blocked", name);
             }
         }
 
@@ -363,7 +363,7 @@ impl SeccompManager {
             0x5413, // TIOCGWINSZ
             0x5429, // TIOCGSID
             0x541B, // FIONREAD
-            0x5421, // M12: FIONBIO — allowed because fcntl(F_SETFL, O_NONBLOCK)
+            0x5421, // M12: FIONBIO – allowed because fcntl(F_SETFL, O_NONBLOCK)
             // achieves the same result and is already permitted. Blocking
             // FIONBIO only breaks tokio/mio for no security gain.
             0x5451, // FIOCLEX
@@ -389,22 +389,22 @@ impl SeccompManager {
 
         // prctl: allow only safe operations (arg0 = option).
         // Notably absent (hit default deny):
-        //   PR_CAPBSET_DROP (24) — could weaken the capability bounding set
-        //   PR_SET_SECUREBITS (28) — could disable secure-exec restrictions
+        //   PR_CAPBSET_DROP (24) – could weaken the capability bounding set
+        //   PR_SET_SECUREBITS (28) – could disable secure-exec restrictions
         let prctl_allowed: &[u64] = &[
             1,  // PR_SET_PDEATHSIG
             2,  // PR_GET_PDEATHSIG
             15, // PR_SET_NAME
             16, // PR_GET_NAME
-            23, // PR_CAPBSET_READ — glibc probes this at startup to discover
+            23, // PR_CAPBSET_READ – glibc probes this at startup to discover
             // cap_last_cap when /proc/sys is masked. Read-only, harmless
             // after capabilities have been dropped.
-            27, // PR_GET_SECUREBITS — read-only query of securebits flags
-            36, // PR_SET_CHILD_SUBREAPER — safe, only affects own descendants
+            27, // PR_GET_SECUREBITS – read-only query of securebits flags
+            36, // PR_SET_CHILD_SUBREAPER – safe, only affects own descendants
             37, // PR_GET_CHILD_SUBREAPER
             38, // PR_SET_NO_NEW_PRIVS
-            40, // PR_GET_TID_ADDRESS — read-only, returns thread ID address
-            47, // PR_CAP_AMBIENT — glibc probes ambient caps at startup (read-only
+            40, // PR_GET_TID_ADDRESS – read-only, returns thread ID address
+            47, // PR_CAP_AMBIENT – glibc probes ambient caps at startup (read-only
             // IS_SET queries). Safe after caps are dropped.
             39, // PR_GET_NO_NEW_PRIVS
         ];
@@ -426,7 +426,7 @@ impl SeccompManager {
         }
         rules.insert(libc::SYS_prctl, prctl_rules);
 
-        // M3: prlimit64 — only allow GET (new_limit == NULL, i.e. arg2 == 0).
+        // M3: prlimit64 – only allow GET (new_limit == NULL, i.e. arg2 == 0).
         // SET operations could raise RLIMIT_NPROC to bypass fork-bomb protection.
         let prlimit_condition = SeccompCondition::new(
             2, // arg2 = new_limit pointer for prlimit64(pid, resource, new_limit, old_limit)
@@ -464,14 +464,14 @@ impl SeccompManager {
         // clone3: ALLOWED unconditionally. clone3 passes flags inside a struct
         // pointer that seccomp BPF cannot dereference, so namespace-flag filtering
         // is impossible at the BPF level. However, glibc 2.34+ and newer musl use
-        // clone3 internally for posix_spawn/fork — blocking it breaks
+        // clone3 internally for posix_spawn/fork – blocking it breaks
         // std::process::Command and any child-process spawning on modern systems.
         //
         // SECURITY INVARIANT: Namespace creation via clone3 is prevented solely by
         // dropping CAP_SYS_ADMIN (and other namespace caps) *before* this seccomp
         // filter is installed. If capability dropping is bypassed, clone3 becomes
         // an unfiltered path to namespace creation. This is a known single point
-        // of failure — see CapabilityManager::drop_all() which must run first.
+        // of failure – see CapabilityManager::drop_all() which must run first.
         //
         // Verify the invariant: CAP_SYS_ADMIN must not be in the effective set.
         // CAP_SYS_ADMIN = capability bit 21
@@ -503,7 +503,7 @@ impl SeccompManager {
         // execveat: allow but block AT_EMPTY_PATH (0x1000) to prevent fileless
         // execution. With AT_EMPTY_PATH, execveat can execute code from any open
         // fd (e.g., open + unlink, or even a socket fd), bypassing filesystem
-        // controls — not just memfd_create. Blocking memfd_create alone is
+        // controls – not just memfd_create. Blocking memfd_create alone is
         // insufficient. Normal execveat with dirfd+pathname (no AT_EMPTY_PATH)
         // remains allowed.
         let execveat_condition = SeccompCondition::new(
@@ -807,13 +807,13 @@ impl SeccompManager {
 
         info!("Applying seccomp trace filter (allow-all + LOG)");
 
-        // Create an empty rule set — with SeccompAction::Allow as default,
+        // Create an empty rule set – with SeccompAction::Allow as default,
         // every syscall is permitted. The LOG flag causes the kernel to
         // audit each syscall decision.
         let filter = SeccompFilter::new(
             BTreeMap::new(),
             SeccompAction::Allow, // default: allow everything
-            SeccompAction::Allow, // match action (unused — no rules)
+            SeccompAction::Allow, // match action (unused – no rules)
             std::env::consts::ARCH.try_into().map_err(|e| {
                 NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
             })?,
@@ -844,7 +844,7 @@ impl SeccompManager {
     /// to be enableable. Requesting a known syscall that is NOT in this list
     /// emits a WARN and is silently dropped (defense-in-depth).
     const OPT_IN_SYSCALLS: &'static [&'static str] = &[
-        // io_uring — large attack surface but needed by modern databases
+        // io_uring – large attack surface but needed by modern databases
         "io_uring_setup",
         "io_uring_enter",
         "io_uring_register",
@@ -1679,7 +1679,7 @@ mod tests {
 
     #[test]
     fn test_clone3_allowed_in_minimal_filter() {
-        // clone3 MUST be in the BPF rules map — glibc 2.34+ and newer musl
+        // clone3 MUST be in the BPF rules map – glibc 2.34+ and newer musl
         // use clone3 internally for posix_spawn/fork. Blocking it breaks
         // std::process::Command on modern systems. Namespace creation is
         // prevented by dropped capabilities (CAP_SYS_ADMIN etc.), not seccomp.
@@ -1703,15 +1703,15 @@ mod tests {
     #[test]
     fn test_high_risk_syscalls_removed_from_base_allowlist() {
         let base = SeccompManager::base_allowed_syscalls();
-        // chown/fchown/lchown/fchownat: allowed — safe after CAP_CHOWN/CAP_FOWNER drop
-        // mlock/munlock: allowed — needed by databases, bounded by RLIMIT_MEMLOCK
+        // chown/fchown/lchown/fchownat: allowed – safe after CAP_CHOWN/CAP_FOWNER drop
+        // mlock/munlock: allowed – needed by databases, bounded by RLIMIT_MEMLOCK
         let removed = [
             libc::SYS_sync,
             libc::SYS_syncfs,
             libc::SYS_mincore,
             libc::SYS_vfork,
             libc::SYS_tkill,
-            // io_uring: large attack surface, many CVEs — require custom profile
+            // io_uring: large attack surface, many CVEs – require custom profile
             libc::SYS_io_uring_setup,
             libc::SYS_io_uring_enter,
             libc::SYS_io_uring_register,
@@ -1740,7 +1740,7 @@ mod tests {
         // apply_profile_from_file can merge them.
         for name in SeccompManager::ARG_FILTERED_SYSCALLS {
             if *name == "clone3" {
-                // clone3 is allowed unconditionally — BPF cannot dereference
+                // clone3 is allowed unconditionally – BPF cannot dereference
                 // the clone_args struct, so arg filtering is impossible.
                 // Namespace defense relies on dropped capabilities.
                 continue;

@@ -4,8 +4,43 @@
 
 Nucleus is a minimalist container runtime for Linux. It provides isolated execution environments using Linux kernel primitives without the overhead of traditional container runtimes. Nucleus supports two operating modes:
 
-- **Agent mode** (default) — ephemeral, fast-startup sandboxes for AI agent workloads
-- **Production mode** — strict isolation for long-running, network-bound NixOS services with declarative configuration, egress policy enforcement, health checks, and systemd integration
+- **Agent mode** (default) – ephemeral, fast-startup sandboxes for AI agent workloads
+- **Production mode** – strict isolation for long-running, network-bound NixOS services with declarative configuration, egress policy enforcement, health checks, and systemd integration
+
+## Benchmarks
+
+### Cold Start
+
+| Runtime | Startup Time |
+|---|---|
+| **Nucleus** | **12 ms** |
+| Docker | ~500 ms |
+
+### PostgreSQL 18 (pgbench, 8 clients, 60s, scale 50)
+
+Nucleus runs PostgreSQL at **native speed or faster** with full isolation.
+
+**SELECT-only (read-heavy)**
+
+| Environment | I/O Method | Avg TPS | Avg Latency |
+|---|---|---|---|
+| Baremetal | worker | 100,222 | 0.080 ms |
+| Baremetal | io_uring | 84,895 | 0.096 ms |
+| **Nucleus** | **worker** | **105,965** | **0.075 ms** |
+| **Nucleus** | **io_uring** | **107,039** | **0.074 ms** |
+
+**TPC-B (mixed read/write)**
+
+| Environment | I/O Method | Avg TPS | Avg Latency |
+|---|---|---|---|
+| Baremetal | worker | 1,490 | 5.38 ms |
+| Baremetal | io_uring | 1,382 | 5.79 ms |
+| **Nucleus** | **worker** | **1,757** | **4.55 ms** |
+| **Nucleus** | **io_uring** | **1,585** | **5.05 ms** |
+
+> Measured on Linux 6.18 x86_64. Full results: [`benches/pg18_io/results/`](benches/pg18_io/results/)
+
+[![Crates.io](https://img.shields.io/crates/v/nucleus-container.svg)](https://crates.io/crates/nucleus-container)
 
 ## Why Nucleus?
 
@@ -198,7 +233,7 @@ nucleus run \
   -- /bin/my-service
 ```
 
-**Seccomp profile** (JSON — OCI-native format, tooling emits it directly):
+**Seccomp profile** (JSON – OCI-native format, tooling emits it directly):
 ```json
 {
   "defaultAction": "SCMP_ACT_KILL_PROCESS",
@@ -250,7 +285,7 @@ access = ["read", "write", "create", "remove"]
 Profiles shouldn't be hand-written from scratch. Use trace mode to record actual syscall usage, then generate a minimal profile:
 
 ```bash
-# 1. Run in trace mode — all syscalls allowed but logged
+# 1. Run in trace mode – all syscalls allowed but logged
 nucleus run \
   --seccomp-mode trace \
   --seccomp-log ./trace.ndjson \
@@ -262,7 +297,7 @@ nucleus run \
 nucleus seccomp generate ./trace.ndjson -o config/my-service.seccomp.json
 
 # 3. Review and tighten (remove anything surprising)
-# 4. Commit — Nix pins the SHA-256 hash
+# 4. Commit – Nix pins the SHA-256 hash
 # 5. Run in enforce mode
 nucleus run \
   --seccomp-profile ./config/my-service.seccomp.json \
@@ -270,7 +305,7 @@ nucleus run \
   -- /bin/my-service
 ```
 
-Trace mode requires root or `CAP_SYSLOG` (reads `/dev/kmsg`). It is rejected in production mode — it is a development tool only.
+Trace mode requires root or `CAP_SYSLOG` (reads `/dev/kmsg`). It is rejected in production mode – it is a development tool only.
 
 ### Multi-Container Topologies
 
@@ -438,10 +473,10 @@ in
 
       # Networking
       network = "bridge";
-      dns = [ "10.0.0.1" ];  # internal resolver — no public DNS default
+      dns = [ "10.0.0.1" ];  # internal resolver – no public DNS default
       portForwards = [ "127.0.0.1:8080:8080" "127.0.0.1:8443:8443" ];
 
-      # Egress policy — audited outbound access
+      # Egress policy – audited outbound access
       egressAllow = [ "10.0.0.0/8" ];
       egressTcpPorts = [ 443 8443 ];
 
@@ -549,7 +584,7 @@ This produces a Nix store path containing `/bin`, `/lib`, `/etc`, etc. from the 
 
 ## Security Notes
 
-**Do not pass secrets via `-e` / `--env`.** Environment variables are visible in `/proc/<pid>/environ` to any process that can read it (mitigated by `hidepid=2` in production mode, but not in agent mode). Use `--secret` instead — secrets are mounted on an in-memory tmpfs at `/run/secrets` with volatile source buffer zeroing.
+**Do not pass secrets via `-e` / `--env`.** Environment variables are visible in `/proc/<pid>/environ` to any process that can read it (mitigated by `hidepid=2` in production mode, but not in agent mode). Use `--secret` instead – secrets are mounted on an in-memory tmpfs at `/run/secrets` with volatile source buffer zeroing.
 
 **Privilege dropping is explicit.** Nucleus must start with elevated privileges to create namespaces, mount filesystems, and configure cgroups/networking. Use `--user` / `--group` (or the NixOS module's `user` / `group` options) so the workload itself does not continue running as root after setup. In production mode, staged secrets under `/run/secrets` are re-owned to that workload identity.
 

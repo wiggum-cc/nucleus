@@ -131,7 +131,7 @@ impl GVisorRuntime {
         // If the candidate is a shell wrapper script (common on NixOS where
         // nix wraps binaries to inject PATH), look for the real ELF binary
         // next to it.  runsc's gofer subprocess re-execs via /proc/self/exe,
-        // which must point to the real binary — not a bash wrapper.
+        // which must point to the real binary – not a bash wrapper.
         let resolved = Self::unwrap_nix_wrapper(&canonical).unwrap_or_else(|| canonical.clone());
 
         let metadata = std::fs::metadata(&resolved).map_err(|e| {
@@ -149,7 +149,7 @@ impl GVisorRuntime {
             return Ok(None);
         }
 
-        // Reject binaries owned by other non-root users — a malicious user
+        // Reject binaries owned by other non-root users – a malicious user
         // could place a trojan runsc earlier in PATH.
         use std::os::unix::fs::MetadataExt;
         let owner = metadata.uid();
@@ -422,7 +422,7 @@ impl GVisorRuntime {
 
         // Hardcode safe values instead of leaking host identity/paths.
         // HOME could point to an attacker-controlled directory; USER/LOGNAME
-        // leak host identity information — none of which gVisor needs.
+        // leak host identity information – none of which gVisor needs.
         push("HOME", "/root".to_string())?;
         push("USER", "root".to_string())?;
         push("LOGNAME", "root".to_string())?;

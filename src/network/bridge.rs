@@ -106,7 +106,7 @@ impl BridgeNetwork {
         if start_ticks == 0 {
             drop(rollback);
             return Err(NucleusError::NetworkError(format!(
-                "Cannot read start_ticks for PID {} — process may have exited",
+                "Cannot read start_ticks for PID {} – process may have exited",
                 pid
             )));
         }
@@ -952,7 +952,7 @@ impl BridgeNetwork {
             NucleusError::NetworkError(format!("Failed to bind mount resolv.conf: {}", e))
         })?;
 
-        // memfd dropped here — the mount holds a kernel reference to the file,
+        // memfd dropped here – the mount holds a kernel reference to the file,
         // so it survives the fd close.
 
         info!("Bind-mounted resolv.conf for bridge networking (rootfs mode, memfd)");

@@ -23,13 +23,13 @@ use tracing::{info, warn};
 /// Reconciliation action for a single service.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReconcileAction {
-    /// Service is running with correct config — no action needed.
+    /// Service is running with correct config – no action needed.
     NoChange,
     /// Service needs to be started (new or previously stopped).
     Start,
-    /// Service config changed — stop then restart.
+    /// Service config changed – stop then restart.
     Restart,
-    /// Service is running but not in desired state — stop it.
+    /// Service is running but not in desired state – stop it.
     Stop,
 }
 
@@ -131,7 +131,7 @@ pub fn execute_reconcile(
                         }
                     }
                     Err(_) => {
-                        // Container not found — already stopped
+                        // Container not found – already stopped
                     }
                 }
             }
@@ -159,7 +159,7 @@ pub fn execute_reconcile(
                 }
             }
             Err(_) => {
-                // Container not found — already stopped
+                // Container not found – already stopped
             }
         }
     }
@@ -566,7 +566,7 @@ fn wait_for_healthy(
 }
 
 /// Characters that are safe in shell commands passed to `sh -c`.
-/// Only allow these characters — everything else is rejected.
+/// Only allow these characters – everything else is rejected.
 const SAFE_HEALTH_CHECK_CHARS: &[char] = &[
     'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's',
     't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L',
@@ -575,7 +575,7 @@ const SAFE_HEALTH_CHECK_CHARS: &[char] = &[
 ];
 
 /// Validate that a health check command contains only safe characters.
-/// Uses an allowlist approach — only alphanumeric, spaces, and a few
+/// Uses an allowlist approach – only alphanumeric, spaces, and a few
 /// safe punctuation marks are permitted.
 fn validate_health_check_command(command: &str) -> Result<()> {
     if command.is_empty() {
@@ -794,21 +794,21 @@ volumes = [
         assert!(validate_health_check_command("pg_isready").is_ok());
         assert!(validate_health_check_command("curl -f http://localhost:8080/health").is_ok());
 
-        // Semicolon injection — not in allowlist
+        // Semicolon injection – not in allowlist
         assert!(validate_health_check_command("pg_isready; rm -rf /").is_err());
-        // Pipe — not in allowlist
+        // Pipe – not in allowlist
         assert!(validate_health_check_command("echo test | sh").is_err());
-        // Command substitution — not in allowlist
+        // Command substitution – not in allowlist
         assert!(validate_health_check_command("$(cat /etc/shadow)").is_err());
-        // Backtick — not in allowlist
+        // Backtick – not in allowlist
         assert!(validate_health_check_command("`cat /etc/shadow`").is_err());
-        // Dollar sign — not in allowlist
+        // Dollar sign – not in allowlist
         assert!(validate_health_check_command("$HOME").is_err());
-        // Background ampersand — not in allowlist
+        // Background ampersand – not in allowlist
         assert!(validate_health_check_command("malware &").is_err());
         // Empty
         assert!(validate_health_check_command("").is_err());
-        // Newline — not in allowlist
+        // Newline – not in allowlist
         assert!(validate_health_check_command("test\ngood").is_err());
     }
 

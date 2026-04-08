@@ -1,7 +1,7 @@
 //! Compose-equivalent topology management for multi-container deployments.
 //!
 //! Provides declarative multi-container topology with dependency ordering,
-//! shared networks, volume management, and a reconciliation loop — equivalent
+//! shared networks, volume management, and a reconciliation loop – equivalent
 //! to Docker Compose but native to Nucleus and Nix.
 //!
 //! # Architecture

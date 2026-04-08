@@ -1,7 +1,7 @@
 //! Bitmap-based BPF compiler for seccomp filters.
 //!
 //! Replaces seccompiler's default linear-scan BPF generation with a bitmap
-//! lookup that resolves unconditional syscall allows in O(1) — a constant
+//! lookup that resolves unconditional syscall allows in O(1) – a constant
 //! ~10 BPF instructions regardless of allowlist size.
 //!
 //! Program structure:
@@ -118,7 +118,7 @@ pub fn compile_bitmap_bpf(
         }
     }
 
-    // Build arg section first — we need its size for dispatch jump offsets.
+    // Build arg section first – we need its size for dispatch jump offsets.
     let arg_section = build_arg_section(arg_filtered, mismatch_val, match_val);
 
     // Only emit dispatch entries for non-zero bitmap words.
@@ -221,7 +221,7 @@ fn build_arg_section(
     }
 
     let mut section = Vec::new();
-    // Reload nr — the bitmap test section clobbered A and X.
+    // Reload nr – the bitmap test section clobbered A and X.
     section.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
 
     for (syscall_nr, chain) in arg_filtered {

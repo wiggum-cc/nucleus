@@ -270,7 +270,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Process isolation — PID namespace virtualisation
+    // Process isolation – PID namespace virtualisation
     // -----------------------------------------------------------------------
 
     #[test]
@@ -302,7 +302,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // /proc virtualisation — gVisor's Sentry intercepts procfs
+    // /proc virtualisation – gVisor's Sentry intercepts procfs
     // -----------------------------------------------------------------------
 
     #[test]
@@ -464,7 +464,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Syscall interception — gVisor's Sentry mediates all syscalls
+    // Syscall interception – gVisor's Sentry mediates all syscalls
     // -----------------------------------------------------------------------
 
     #[test]
@@ -497,7 +497,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Security hardening — capabilities, no_new_privileges
+    // Security hardening – capabilities, no_new_privileges
     // -----------------------------------------------------------------------
 
     #[test]
@@ -767,7 +767,7 @@ mod tests {
             ],
         )
         .unwrap_or(-1);
-        // Either dmesg is not found or returns error — both acceptable
+        // Either dmesg is not found or returns error – both acceptable
         let _ = exit_code;
     }
 

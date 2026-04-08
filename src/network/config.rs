@@ -32,7 +32,7 @@ impl Default for BridgeConfig {
             bridge_name: "nucleus0".to_string(),
             subnet: "10.0.42.0/24".to_string(),
             container_ip: None,
-            // Empty by default — production services must configure DNS explicitly.
+            // Empty by default – production services must configure DNS explicitly.
             // Agent mode callers can use BridgeConfig::with_public_dns() for convenience.
             dns: Vec::new(),
             port_forwards: Vec::new(),
@@ -102,7 +102,7 @@ fn validate_ipv4_addr(s: &str) -> Result<(), String> {
         }
         if part.len() > 1 && part.starts_with('0') {
             return Err(format!(
-                "Invalid IPv4 address: '{}' — octet '{}' has leading zero",
+                "Invalid IPv4 address: '{}' – octet '{}' has leading zero",
                 s, part
             ));
         }

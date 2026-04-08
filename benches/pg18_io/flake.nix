@@ -14,7 +14,7 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
-        # PostgreSQL 18 — nixpkgs already builds with --with-liburing,
+        # PostgreSQL 18 – nixpkgs already builds with --with-liburing,
         # so both io_method=worker and io_method=io_uring use the same binary.
         pg18 = pkgs.postgresql_18;
 

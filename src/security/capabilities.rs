@@ -91,7 +91,7 @@ impl CapabilityManager {
             NucleusError::CapabilityError(format!("Failed to clear inheritable caps: {}", e))
         })?;
 
-        // Effective/permitted are intentionally kept — they hold CAP_SETUID,
+        // Effective/permitted are intentionally kept – they hold CAP_SETUID,
         // CAP_SETGID, and CAP_SETPCAP needed for the identity switch.
 
         self.phase = CapPhase::BoundingDropped;
@@ -115,7 +115,7 @@ impl CapabilityManager {
         }
 
         if self.phase == CapPhase::Initial {
-            // Caller skipped phase 1 — do full drop for backwards compat
+            // Caller skipped phase 1 – do full drop for backwards compat
             self.drop_bounding_set()?;
         }
 
@@ -276,7 +276,7 @@ impl CapabilityManager {
         if !leaked.is_empty() {
             let msg = format!(
                 "SEC-CLONE3: namespace-creating capabilities still present after drop: [{}]. \
-                 clone3 syscall is allowed without argument filtering — these caps \
+                 clone3 syscall is allowed without argument filtering – these caps \
                  must be absent to prevent namespace escape.",
                 leaked.join(", ")
             );
@@ -313,7 +313,7 @@ mod tests {
     fn test_drop_idempotent() {
         let mut mgr = CapabilityManager::new();
         // First drop may fail in unprivileged test environments (M4 verification).
-        // That's expected — the important thing is idempotency of the dropped flag.
+        // That's expected – the important thing is idempotency of the dropped flag.
         match mgr.drop_all() {
             Ok(()) => {
                 assert!(mgr.is_dropped());

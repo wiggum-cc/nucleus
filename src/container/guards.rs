@@ -53,7 +53,7 @@ impl Container {
                         return Err(NucleusError::ConfigError(
                             "Untrusted workloads require gVisor (runsc). \
                              Install runsc: https://gvisor.dev/docs/user_guide/install/ \
-                             — or pass --allow-degraded-security to run with native \
+                             – or pass --allow-degraded-security to run with native \
                              kernel isolation only, or --trust-level trusted to skip \
                              this check."
                                 .to_string(),

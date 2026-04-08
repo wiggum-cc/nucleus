@@ -6,7 +6,7 @@
 //! SECCOMP audit records matching the container PID and writes unique
 //! syscalls to an NDJSON trace file.
 //!
-//! This is a development tool — requires root or CAP_SYSLOG for
+//! This is a development tool – requires root or CAP_SYSLOG for
 //! `/dev/kmsg` access.
 
 use crate::error::{NucleusError, Result};
@@ -91,7 +91,7 @@ impl Drop for SeccompTraceReader {
     }
 }
 
-/// Main recording loop — reads /dev/kmsg and extracts SECCOMP records.
+/// Main recording loop – reads /dev/kmsg and extracts SECCOMP records.
 fn record_loop(pid: u32, output_path: &Path, stop: &AtomicBool) -> Result<()> {
     let mut syscalls: BTreeMap<i64, u64> = BTreeMap::new();
 
@@ -99,7 +99,7 @@ fn record_loop(pid: u32, output_path: &Path, stop: &AtomicBool) -> Result<()> {
     let kmsg_path = std::path::Path::new("/dev/kmsg");
     if let Ok(meta) = std::fs::symlink_metadata(kmsg_path) {
         if meta.file_type().is_symlink() {
-            warn!("/dev/kmsg is a symlink — refusing to open for seccomp tracing");
+            warn!("/dev/kmsg is a symlink – refusing to open for seccomp tracing");
             write_trace_file(output_path, &syscalls)?;
             return Ok(());
         }
@@ -148,7 +148,7 @@ fn record_loop(pid: u32, output_path: &Path, stop: &AtomicBool) -> Result<()> {
             Ok(l) => l,
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::WouldBlock {
-                    // No data available — poll with 2s timeout, then check stop flag
+                    // No data available – poll with 2s timeout, then check stop flag
                     let mut pfd = libc::pollfd {
                         fd,
                         events: libc::POLLIN,
@@ -264,12 +264,12 @@ impl Drop for SeccompDenyLogger {
     }
 }
 
-/// Main deny-log loop — reads /dev/kmsg and emits WARN for denied syscalls.
+/// Main deny-log loop – reads /dev/kmsg and emits WARN for denied syscalls.
 fn deny_log_loop(pid: u32, stop: &AtomicBool) -> Result<()> {
     let kmsg_path = std::path::Path::new("/dev/kmsg");
     if let Ok(meta) = std::fs::symlink_metadata(kmsg_path) {
         if meta.file_type().is_symlink() {
-            warn!("/dev/kmsg is a symlink — refusing to open for seccomp deny logging");
+            warn!("/dev/kmsg is a symlink – refusing to open for seccomp deny logging");
             return Ok(());
         }
     }

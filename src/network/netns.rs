@@ -1,9 +1,9 @@
 //! Network namespace helpers replacing external `nsenter` usage.
 //!
-//! * [`in_netns`] — enter a netns via `setns()` in a scoped thread to run
+//! * [`in_netns`] – enter a netns via `setns()` in a scoped thread to run
 //!   native Rust code (e.g. netlink operations) inside a container's network
 //!   namespace.
-//! * [`exec_in_netns`] — fork+setns+exec a program (e.g. `iptables`) inside
+//! * [`exec_in_netns`] – fork+setns+exec a program (e.g. `iptables`) inside
 //!   a container's network namespace using `Command::pre_exec`.
 
 use crate::error::{NucleusError, Result};

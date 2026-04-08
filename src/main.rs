@@ -1156,7 +1156,7 @@ fn main() -> Result<()> {
                 config = config.with_bundle_dir(bundle_dir.clone());
             }
 
-            // Console socket — canonicalize parent to prevent symlink traversal
+            // Console socket – canonicalize parent to prevent symlink traversal
             if let Some(ref socket_path) = console_socket {
                 let socket = PathBuf::from(socket_path);
                 let canonical = if let Some(parent) = socket.parent() {
@@ -1369,7 +1369,7 @@ fn main() -> Result<()> {
                 });
             }
 
-            // Tmpfs volumes — format: DEST[:SIZE][:ro|rw]
+            // Tmpfs volumes – format: DEST[:SIZE][:ro|rw]
             // SIZE must match a numeric-with-suffix pattern (e.g. "64M", "1G", "512k").
             for spec in &tmpfs {
                 let parts: Vec<&str> = spec.split(':').collect();
@@ -1465,7 +1465,7 @@ fn main() -> Result<()> {
                 config.hooks = Some(oci_hooks);
             }
 
-            // PID file path — canonicalize parent to prevent symlink traversal
+            // PID file path – canonicalize parent to prevent symlink traversal
             if let Some(ref pid_path) = pid_file {
                 let pid = PathBuf::from(pid_path);
                 let canonical = if let Some(parent) = pid.parent() {

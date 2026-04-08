@@ -79,7 +79,7 @@ pub enum ServiceMode {
 
 /// CLI-level runtime selection.
 ///
-/// Parsed by clap at argument time — invalid values are caught immediately.
+/// Parsed by clap at argument time – invalid values are caught immediately.
 /// The variant triggers additional logic in `apply_runtime_selection`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum RuntimeSelection {
@@ -385,10 +385,10 @@ pub struct ContainerConfig {
 /// Seccomp operating mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum SeccompMode {
-    /// Normal enforcement — deny unlisted syscalls.
+    /// Normal enforcement – deny unlisted syscalls.
     #[default]
     Enforce,
-    /// Trace mode — allow all syscalls but log them for profile generation.
+    /// Trace mode – allow all syscalls but log them for profile generation.
     /// Development only; rejected in production mode.
     Trace,
 }

@@ -105,7 +105,7 @@ impl Container {
                         let canonical_str = canonical.to_string_lossy();
                         canonical_str.starts_with("/run/") || canonical_str.starts_with("/var/run/")
                     } else {
-                        // Path doesn't exist yet — check the string directly
+                        // Path doesn't exist yet – check the string directly
                         notify_socket.starts_with("/run/") || notify_socket.starts_with("/var/run/")
                     }
                 } else {
@@ -180,7 +180,7 @@ impl Container {
         Self::assert_single_threaded_for_fork("init supervisor fork")?;
         match unsafe { fork() }? {
             ForkResult::Parent { child } => {
-                // PID 1: mini-init — reap zombies and forward signals
+                // PID 1: mini-init – reap zombies and forward signals
 
                 // Set up signal forwarding to the workload child
                 let mut sigset = SigSet::empty();
@@ -240,7 +240,7 @@ impl Container {
                             debug!("Init: reaped zombie PID {} (killed by {:?})", pid, signal);
                         }
                         Err(nix::errno::Errno::ECHILD) => {
-                            // No more children — workload must have exited
+                            // No more children – workload must have exited
                             debug!("Init: no more children, exiting");
                             break 1;
                         }
