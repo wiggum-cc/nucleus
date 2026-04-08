@@ -289,7 +289,6 @@ run_nucleus_bench() {
   # - native runtime: no gVisor, just namespace/cgroup isolation
   nucleus create \
     --name "pg18-bench-${io_method}" \
-    --rootless \
     --user "$PG_UID" \
     --group "$PG_GID" \
     --network host \

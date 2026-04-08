@@ -25,6 +25,11 @@ impl CapabilityManager {
     ///
     /// This implements the transition: Privileged -> CapabilitiesDropped
     /// in the security state machine (Nucleus_Security_SecurityEnforcement.tla)
+    ///
+    /// Ordering follows Docker/runc convention: bounding set is cleared first
+    /// while CAP_SETPCAP is still in the effective set. PR_CAPBSET_DROP requires
+    /// CAP_SETPCAP, so clearing effective/permitted before bounding causes EPERM
+    /// for every bounding drop — the process then fails the M4 verification.
     pub fn drop_all(&mut self) -> Result<()> {
         if self.dropped {
             debug!("Capabilities already dropped, skipping");
@@ -33,27 +38,10 @@ impl CapabilityManager {
 
         info!("Dropping all capabilities");
 
-        // Clear all capability sets
-        caps::clear(None, CapSet::Permitted).map_err(|e| {
-            NucleusError::CapabilityError(format!("Failed to clear permitted caps: {}", e))
-        })?;
-
-        caps::clear(None, CapSet::Effective).map_err(|e| {
-            NucleusError::CapabilityError(format!("Failed to clear effective caps: {}", e))
-        })?;
-
-        caps::clear(None, CapSet::Inheritable).map_err(|e| {
-            NucleusError::CapabilityError(format!("Failed to clear inheritable caps: {}", e))
-        })?;
-
-        caps::clear(None, CapSet::Ambient).map_err(|e| {
-            NucleusError::CapabilityError(format!("Failed to clear ambient caps: {}", e))
-        })?;
-
-        // Clear bounding set: prevents regaining capabilities through exec of setuid binaries
+        // 1. Clear bounding set FIRST (requires CAP_SETPCAP in effective set).
+        //    Prevents regaining capabilities through exec of setuid binaries.
         for cap in caps::all() {
             if let Err(e) = caps::drop(None, CapSet::Bounding, cap) {
-                // Some capabilities may not be in the bounding set; log and continue
                 debug!(
                     "Failed to drop bounding cap {:?}: {} (may not be present)",
                     cap, e
@@ -73,6 +61,26 @@ impl CapabilityManager {
             )));
         }
 
+        // 2. Clear ambient set (must be cleared before permitted, since
+        //    ambient caps are constrained to permitted ∩ inheritable).
+        caps::clear(None, CapSet::Ambient).map_err(|e| {
+            NucleusError::CapabilityError(format!("Failed to clear ambient caps: {}", e))
+        })?;
+
+        // 3. Clear inheritable, permitted, effective — in that order so we
+        //    never hold effective caps that exceed the permitted set.
+        caps::clear(None, CapSet::Inheritable).map_err(|e| {
+            NucleusError::CapabilityError(format!("Failed to clear inheritable caps: {}", e))
+        })?;
+
+        caps::clear(None, CapSet::Permitted).map_err(|e| {
+            NucleusError::CapabilityError(format!("Failed to clear permitted caps: {}", e))
+        })?;
+
+        caps::clear(None, CapSet::Effective).map_err(|e| {
+            NucleusError::CapabilityError(format!("Failed to clear effective caps: {}", e))
+        })?;
+
         self.dropped = true;
         info!("Successfully dropped all capabilities (including bounding set)");
 
@@ -91,25 +99,14 @@ impl CapabilityManager {
 
         info!("Dropping capabilities except: {:?}", keep);
 
-        // Get all capabilities
         let all_caps = caps::all();
 
-        // Drop each capability that's not in the keep list
-        for cap in all_caps {
-            if !keep.contains(&cap) {
-                caps::drop(None, CapSet::Permitted, cap).map_err(|e| {
-                    NucleusError::CapabilityError(format!("Failed to drop {cap:?}: {e}"))
-                })?;
-
-                caps::drop(None, CapSet::Effective, cap).map_err(|e| {
-                    NucleusError::CapabilityError(format!("Failed to drop {cap:?}: {e}"))
-                })?;
-
-                caps::drop(None, CapSet::Inheritable, cap).map_err(|e| {
-                    NucleusError::CapabilityError(format!("Failed to drop {cap:?}: {e}"))
-                })?;
-
-                if let Err(e) = caps::drop(None, CapSet::Bounding, cap) {
+        // 1. Drop bounding set entries FIRST (requires CAP_SETPCAP in effective).
+        //    If CAP_SETPCAP is not in `keep`, we must drop it from bounding while
+        //    it is still in the effective set.
+        for cap in &all_caps {
+            if !keep.contains(cap) {
+                if let Err(e) = caps::drop(None, CapSet::Bounding, *cap) {
                     debug!(
                         "Failed to drop bounding cap {:?}: {} (may not be present)",
                         cap, e
@@ -118,10 +115,27 @@ impl CapabilityManager {
             }
         }
 
-        // Always clear ambient capabilities
+        // 2. Clear ambient set (constrained to permitted ∩ inheritable).
         caps::clear(None, CapSet::Ambient).map_err(|e| {
             NucleusError::CapabilityError(format!("Failed to clear ambient caps: {}", e))
         })?;
+
+        // 3. Drop from inheritable, permitted, effective for each non-kept cap.
+        for cap in &all_caps {
+            if !keep.contains(cap) {
+                caps::drop(None, CapSet::Inheritable, *cap).map_err(|e| {
+                    NucleusError::CapabilityError(format!("Failed to drop {cap:?}: {e}"))
+                })?;
+
+                caps::drop(None, CapSet::Permitted, *cap).map_err(|e| {
+                    NucleusError::CapabilityError(format!("Failed to drop {cap:?}: {e}"))
+                })?;
+
+                caps::drop(None, CapSet::Effective, *cap).map_err(|e| {
+                    NucleusError::CapabilityError(format!("Failed to drop {cap:?}: {e}"))
+                })?;
+            }
+        }
 
         self.dropped = true;
         info!("Successfully dropped capabilities");
