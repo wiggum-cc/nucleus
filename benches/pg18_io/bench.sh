@@ -297,16 +297,19 @@ run_nucleus_bench() {
   # `nucleus create` runs the container in the foreground, so we background it.
   # - Host network: pgbench on host connects via 127.0.0.1
   # - Bind-mount pgdata + /nix (for PG binaries) + /tmp
-  # - gVisor runtime: full security (sentry-level syscall interception)
+  # - trusted: host network is explicitly allowed for the benchmark harness
+  # - native runtime: namespace/cgroup isolation without gVisor syscall emulation
   # Clean up any stale container state from a previous run
   "$NUCLEUS_BIN" delete "pg18-bench-${io_method}" 2>/dev/null || true
 
-  # PostgreSQL 18 io_method=io_uring needs both the experimental runsc
-  # sentry path and a larger memlock limit for ring buffers.
-  local gvisor_args=()
+  # PostgreSQL 18 io_method=io_uring needs the io_uring syscalls to be
+  # opt-in allowed and a larger memlock limit for ring buffers.
+  local native_args=()
   if [ "$io_method" = "io_uring" ]; then
-    gvisor_args=(
-      --gvisor-iouring
+    native_args=(
+      --seccomp-allow io_uring_setup
+      --seccomp-allow io_uring_enter
+      --seccomp-allow io_uring_register
       --memlock 8M
     )
   fi
@@ -317,13 +320,15 @@ run_nucleus_bench() {
     --group "$PG_GID" \
     --network host \
     --allow-host-network \
-    --runtime gvisor \
+    --runtime native \
     --trust-level trusted \
+    --allow-chroot-fallback \
+    --seccomp-log-denied \
     --pids 0 \
     --volume "$pgdata:/pgdata" \
     --volume "/nix:/nix:ro" \
     --volume "/tmp:/tmp" \
-    "${gvisor_args[@]}" \
+    "${native_args[@]}" \
     -- "$PG_BIN/postgres" -D /pgdata -p "$port" &
 
   NUCLEUS_PID=$!

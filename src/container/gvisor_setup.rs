@@ -154,7 +154,6 @@ impl Container {
             gvisor_net,
             rootless_oci,
             self.config.gvisor_platform,
-            self.config.gvisor_iouring,
         )?;
 
         Ok(())

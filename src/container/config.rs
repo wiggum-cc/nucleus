@@ -335,9 +335,6 @@ pub struct ContainerConfig {
     /// Select the gVisor platform backend.
     pub gvisor_platform: GVisorPlatform,
 
-    /// Enable experimental io_uring support in the gVisor sentry.
-    pub gvisor_iouring: bool,
-
     /// Path to a per-service seccomp profile (JSON, OCI subset format).
     /// When set, this profile is used instead of the built-in allowlist.
     pub seccomp_profile: Option<PathBuf>,
@@ -462,7 +459,6 @@ impl ContainerConfig {
             verify_rootfs_attestation: false,
             seccomp_log_denied: false,
             gvisor_platform: GVisorPlatform::default(),
-            gvisor_iouring: false,
             seccomp_profile: None,
             seccomp_profile_sha256: None,
             seccomp_mode: SeccompMode::default(),
@@ -668,12 +664,6 @@ impl ContainerConfig {
     #[must_use]
     pub fn with_gvisor_platform(mut self, platform: GVisorPlatform) -> Self {
         self.gvisor_platform = platform;
-        self
-    }
-
-    #[must_use]
-    pub fn with_gvisor_iouring(mut self, enabled: bool) -> Self {
-        self.gvisor_iouring = enabled;
         self
     }
 
@@ -936,12 +926,6 @@ impl ContainerConfig {
             }
         }
 
-        if self.gvisor_iouring && !self.use_gvisor {
-            return Err(crate::error::NucleusError::ConfigError(
-                "--gvisor-iouring requires --runtime gvisor".to_string(),
-            ));
-        }
-
         if !self.use_gvisor {
             return Ok(());
         }
@@ -1132,7 +1116,6 @@ mod tests {
         assert!(!cfg.verify_rootfs_attestation);
         assert!(!cfg.seccomp_log_denied);
         assert_eq!(cfg.gvisor_platform, GVisorPlatform::Systrap);
-        assert!(!cfg.gvisor_iouring);
     }
 
     #[test]
@@ -1517,17 +1500,6 @@ mod tests {
             .with_verify_context_integrity(true);
 
         assert!(cfg.validate_runtime_support().is_ok());
-    }
-
-    #[test]
-    fn test_gvisor_iouring_requires_gvisor_runtime() {
-        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
-            .unwrap()
-            .with_gvisor_iouring(true)
-            .with_gvisor(false);
-
-        let err = cfg.validate_runtime_support().unwrap_err();
-        assert!(err.to_string().contains("--gvisor-iouring"));
     }
 
     #[test]
