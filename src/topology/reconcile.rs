@@ -328,6 +328,11 @@ fn build_service_run_args(
         args.push(dns.clone());
     }
 
+    if !svc.networks.is_empty() {
+        args.push("--nat-backend".to_string());
+        args.push(svc.nat_backend.as_str().to_string());
+    }
+
     for cidr in &svc.egress_allow {
         args.push("--egress-allow".to_string());
         args.push(cidr.clone());
@@ -786,6 +791,47 @@ volumes = [
         assert!(args
             .windows(2)
             .any(|pair| { pair[0] == "--tmpfs" && pair[1] == "/var/cache/postgresql:64M:ro" }));
+    }
+
+    #[test]
+    fn test_build_service_run_args_include_nat_backend_for_bridge_services() {
+        let toml = r#"
+name = "test"
+
+[networks.internal]
+subnet = "10.42.0.0/24"
+
+[services.web]
+rootfs = "/nix/store/web"
+command = ["/bin/web"]
+memory = "256M"
+networks = ["internal"]
+nat_backend = "userspace"
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        let svc = config.services.get("web").unwrap();
+        let args = build_service_run_args(&config, "web", svc, "test-web", 42, None).unwrap();
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--nat-backend" && pair[1] == "userspace"));
+    }
+
+    #[test]
+    fn test_build_service_run_args_omit_nat_backend_for_network_none_services() {
+        let toml = r#"
+name = "test"
+
+[services.web]
+rootfs = "/nix/store/web"
+command = ["/bin/web"]
+memory = "256M"
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        let svc = config.services.get("web").unwrap();
+        let args = build_service_run_args(&config, "web", svc, "test-web", 42, None).unwrap();
+
+        assert!(!args.iter().any(|arg| arg == "--nat-backend"));
     }
 
     #[test]

@@ -363,6 +363,7 @@ rootfs = "/nix/store/...-web"
 command = ["/bin/web-server"]
 memory = "512M"
 networks = ["internal"]
+nat_backend = "userspace"
 port_forwards = ["8443:8443"]
 egress_allow = ["10.42.0.0/24"]
 
@@ -492,6 +493,7 @@ in
 
       # Networking
       network = "bridge";
+      natBackend = "auto";  # or "userspace" to force slirp4netns
       dns = [ "10.0.0.1" ];  # internal resolver – no public DNS default
       portForwards = [ "127.0.0.1:8080:8080" "127.0.0.1:8443:8443" ];
 

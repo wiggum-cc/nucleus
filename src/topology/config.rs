@@ -135,6 +135,10 @@ pub struct ServiceDef {
     #[serde(default)]
     pub dns: Vec<String>,
 
+    /// Native bridge NAT backend.
+    #[serde(default = "default_nat_backend")]
+    pub nat_backend: crate::network::NatBackend,
+
     /// Number of replicas for scaling
     #[serde(default = "default_replicas")]
     pub replicas: u32,
@@ -162,6 +166,10 @@ fn default_health_interval() -> u64 {
 
 fn default_replicas() -> u32 {
     1
+}
+
+fn default_nat_backend() -> crate::network::NatBackend {
+    crate::network::NatBackend::Auto
 }
 
 fn default_runtime() -> String {
@@ -465,6 +473,7 @@ command = ["/bin/web-server"]
 memory = "512M"
 cpus = 1.0
 networks = ["internal"]
+nat_backend = "userspace"
 port_forwards = ["8443:8443"]
 egress_allow = ["10.42.0.0/24"]
 
@@ -477,7 +486,28 @@ condition = "healthy"
         assert_eq!(config.services.len(), 2);
         assert_eq!(config.networks.len(), 1);
         assert_eq!(config.volumes.len(), 1);
+        assert_eq!(
+            config.services["web"].nat_backend,
+            crate::network::NatBackend::Userspace
+        );
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_nat_backend_defaults_to_auto() {
+        let toml = r#"
+name = "test-stack"
+
+[services.web]
+rootfs = "/nix/store/abc-web"
+command = ["/bin/web-server"]
+memory = "512M"
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        assert_eq!(
+            config.services["web"].nat_backend,
+            crate::network::NatBackend::Auto
+        );
     }
 
     #[test]

@@ -15,7 +15,10 @@ pub enum NetworkMode {
 ///
 /// `Auto` preserves the historical behavior for privileged callers while
 /// enabling a userspace NAT path for rootless/native containers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum NatBackend {
     /// Select kernel bridge + iptables when privileged, otherwise userspace NAT.
     #[value(name = "auto")]
@@ -26,6 +29,16 @@ pub enum NatBackend {
     /// Require the userspace NAT backend.
     #[value(name = "userspace")]
     Userspace,
+}
+
+impl NatBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Kernel => "kernel",
+            Self::Userspace => "userspace",
+        }
+    }
 }
 
 /// Configuration for bridge networking

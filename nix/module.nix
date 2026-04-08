@@ -76,6 +76,12 @@ let
         description = "DNS servers for the container. Must be set explicitly for production.";
       };
 
+      natBackend = mkOption {
+        type = types.enum [ "auto" "kernel" "userspace" ];
+        default = "auto";
+        description = "Native bridge NAT backend selection.";
+      };
+
       egressAllow = mkOption {
         type = types.listOf types.str;
         default = [ ];
@@ -405,6 +411,7 @@ let
         ++ lib.optionals (containerCfg.requireKernelLockdown != null) [
           "--require-kernel-lockdown" (e containerCfg.requireKernelLockdown)
         ]
+        ++ lib.optionals (containerCfg.network == "bridge") [ "--nat-backend" (e containerCfg.natBackend) ]
         ++ (lib.concatMap (d: [ "--dns" (e d) ]) containerCfg.dns)
         ++ (lib.concatMap (c: [ "--egress-allow" (e c) ]) containerCfg.egressAllow)
         ++ (lib.concatMap (p: [ "--egress-tcp-port" (e (toString p)) ]) containerCfg.egressTcpPorts)

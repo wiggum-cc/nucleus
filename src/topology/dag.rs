@@ -172,6 +172,7 @@ mod tests {
                     additional_groups: vec![],
                     secrets: vec![],
                     dns: vec![],
+                    nat_backend: crate::network::NatBackend::Auto,
                     replicas: 1,
                     runtime: "native".to_string(),
                     hooks: None,
