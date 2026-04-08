@@ -18,7 +18,9 @@ Nucleus is a minimalist container runtime for Linux. It provides isolated execut
 
 ### PostgreSQL 18 (pgbench, 8 clients, 60s, scale 50)
 
-Nucleus runs PostgreSQL at **native speed or faster** with full isolation.
+In the native runtime, PostgreSQL stays near bare-metal performance under Nucleus
+isolation. In this harness, occasional wins over bare metal should be treated as
+benchmark noise rather than a guaranteed speedup.
 
 **SELECT-only (read-heavy)**
 
@@ -38,7 +40,10 @@ Nucleus runs PostgreSQL at **native speed or faster** with full isolation.
 | **Nucleus** | **worker** | **1,757** | **4.55 ms** |
 | **Nucleus** | **io_uring** | **1,585** | **5.05 ms** |
 
-> Measured on Linux 6.18 x86_64. Full results: [`benches/pg18_io/results/`](benches/pg18_io/results/)
+> Measured on Linux 6.18 x86_64. This benchmark uses the native runtime with a
+> bind-mounted host `pgdata` directory and `--network host`, so it measures the
+> steady-state cost of Nucleus isolation rather than VM or gVisor emulation
+> overhead. Full results: [`benches/pg18_io/results/`](benches/pg18_io/results/)
 
 [![Crates.io](https://img.shields.io/crates/v/nucleus-container.svg)](https://crates.io/crates/nucleus-container)
 
