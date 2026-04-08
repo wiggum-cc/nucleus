@@ -917,20 +917,20 @@ impl BridgeNetwork {
         // preventing double-close on any error path.
         let memfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) };
 
-        // Write content to memfd
-        // SAFETY: memfd is a valid open fd. content is a valid byte buffer
-        // with correct length. write() may return -1 on error.
-        let write_result = unsafe {
-            libc::write(
-                memfd.as_raw_fd(),
-                content.as_ptr() as *const libc::c_void,
-                content.len(),
-            )
-        };
-        if write_result < 0 {
-            // memfd dropped here, closing the fd automatically
+        // Write content to memfd using File I/O to handle partial writes correctly.
+        use std::io::Write as _;
+        let mut memfd_file = std::fs::File::from(memfd);
+        if memfd_file.write_all(content.as_bytes()).is_err() {
+            // memfd_file dropped here, closing the fd automatically
             return Self::bind_mount_resolv_conf_staging(root, dns);
         }
+        // Re-extract the OwnedFd for the proc path below
+        use std::os::fd::IntoRawFd;
+        let memfd = {
+            let raw = memfd_file.into_raw_fd();
+            // SAFETY: raw is the valid fd we just extracted from the File.
+            unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }
+        };
 
         // Ensure the mount target exists
         let target = root.join("etc/resolv.conf");

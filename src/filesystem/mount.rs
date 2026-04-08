@@ -466,30 +466,86 @@ pub fn bind_mount_host_paths(root: &Path, best_effort: bool) -> Result<()> {
 }
 
 /// H7: Sensitive host paths that must not be bind-mounted into containers.
-const DENIED_BIND_MOUNT_SOURCES: &[&str] = &[
+const DENIED_BIND_MOUNT_SOURCES_EXACT: &[&str] = &[
     "/",
-    "/proc",
-    "/sys",
-    "/dev",
-    "/boot",
     "/etc/shadow",
     "/etc/sudoers",
     "/etc/passwd",
     "/etc/gshadow",
 ];
 
-/// Validate that a bind mount source is not a sensitive host path.
-fn validate_bind_mount_source(source: &Path) -> Result<()> {
-    let source_str = source.to_string_lossy();
-    for denied in DENIED_BIND_MOUNT_SOURCES {
-        if source_str == *denied {
-            return Err(NucleusError::FilesystemError(format!(
+/// Sensitive host subtrees that must not be exposed to a container at all.
+const DENIED_BIND_MOUNT_SOURCE_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/boot"];
+
+fn normalize_bind_mount_source_for_policy(source: &Path) -> Result<PathBuf> {
+    if !source.is_absolute() {
+        return Err(NucleusError::ConfigError(format!(
+            "Bind mount source must be absolute: {:?}",
+            source
+        )));
+    }
+
+    let mut normalized = PathBuf::from("/");
+
+    for component in source.components() {
+        match component {
+            Component::RootDir => {}
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                normalized.pop();
+                if normalized.as_os_str().is_empty() {
+                    normalized.push("/");
+                }
+            }
+            Component::Prefix(_) => {
+                return Err(NucleusError::ConfigError(format!(
+                    "Unsupported bind mount source prefix: {:?}",
+                    source
+                )));
+            }
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn reject_denied_bind_mount_source(source: &Path) -> Result<()> {
+    for denied in DENIED_BIND_MOUNT_SOURCES_EXACT {
+        if source == Path::new(denied) {
+            return Err(NucleusError::ConfigError(format!(
                 "Bind mount source '{}' is a sensitive host path and cannot be mounted into containers",
                 source.display()
             )));
         }
     }
+
+    for denied in DENIED_BIND_MOUNT_SOURCE_PREFIXES {
+        let denied_path = Path::new(denied);
+        if source == denied_path || source.starts_with(denied_path) {
+            return Err(NucleusError::ConfigError(format!(
+                "Bind mount source '{}' is under sensitive host path '{}' and cannot be mounted into containers",
+                source.display(),
+                denied
+            )));
+        }
+    }
+
     Ok(())
+}
+
+/// Validate that a bind mount source is not a sensitive host path or subtree.
+pub fn validate_bind_mount_source(source: &Path) -> Result<()> {
+    let normalized = normalize_bind_mount_source_for_policy(source)?;
+    reject_denied_bind_mount_source(&normalized)?;
+
+    let canonical = std::fs::canonicalize(source).map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Failed to resolve bind mount source {:?}: {}",
+            source, e
+        ))
+    })?;
+    reject_denied_bind_mount_source(&canonical)
 }
 
 /// Mount persistent bind volumes and ephemeral tmpfs volumes into the container root.
@@ -1264,6 +1320,35 @@ fn mount_secrets_inmemory_inner(
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn test_validate_bind_mount_source_rejects_sensitive_subtrees() {
+        for path in ["/proc/sys", "/sys/fs/cgroup", "/dev/kmsg", "/boot"] {
+            let err = validate_bind_mount_source(Path::new(path)).unwrap_err();
+            assert!(
+                err.to_string().contains("sensitive host path"),
+                "expected sensitive-path rejection for {path}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_bind_mount_source_allows_regular_host_paths() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let safe_path = temp.path().join("data");
+        std::fs::create_dir(&safe_path).unwrap();
+
+        validate_bind_mount_source(&safe_path).unwrap();
+    }
+
+    #[test]
+    fn test_validate_bind_mount_source_normalizes_parent_components_before_filtering() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let safe_path = temp.path().join("data");
+        std::fs::create_dir(&safe_path).unwrap();
+
+        validate_bind_mount_source(&safe_path.join("../data")).unwrap();
+    }
 
     #[test]
     fn test_proc_mask_includes_sysrq_trigger() {

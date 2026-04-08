@@ -533,13 +533,17 @@ impl OciHooks {
                     rlim_cur: 1024,
                     rlim_max: 1024,
                 };
-                libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc);
+                if libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
 
                 let rlim_nofile = libc::rlimit {
                     rlim_cur: 1024,
                     rlim_max: 1024,
                 };
-                libc::setrlimit(libc::RLIMIT_NOFILE, &rlim_nofile);
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim_nofile) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
 
                 Ok(())
             });
@@ -1026,6 +1030,7 @@ impl OciConfig {
             let dest = normalize_container_destination(&volume.dest)?;
             match &volume.source {
                 VolumeSource::Bind { source } => {
+                    crate::filesystem::validate_bind_mount_source(source)?;
                     let mut options = vec![
                         "bind".to_string(),
                         "nosuid".to_string(),
@@ -1545,6 +1550,21 @@ mod tests {
                 && mount.mount_type == "tmpfs"
                 && mount.options.contains(&"size=64M".to_string())
         }));
+    }
+
+    #[test]
+    fn test_volume_mounts_reject_sensitive_host_sources() {
+        let err = OciConfig::new(vec!["/bin/sh".to_string()], None)
+            .with_volume_mounts(&[crate::container::VolumeMount {
+                source: crate::container::VolumeSource::Bind {
+                    source: std::path::PathBuf::from("/proc/sys"),
+                },
+                dest: std::path::PathBuf::from("/host-proc"),
+                read_only: true,
+            }])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("sensitive host path"));
     }
 
     #[test]

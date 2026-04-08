@@ -397,15 +397,15 @@ impl SeccompManager {
             15, // PR_SET_NAME
             16, // PR_GET_NAME
             23, // PR_CAPBSET_READ — glibc probes this at startup to discover
-                // cap_last_cap when /proc/sys is masked. Read-only, harmless
-                // after capabilities have been dropped.
+            // cap_last_cap when /proc/sys is masked. Read-only, harmless
+            // after capabilities have been dropped.
             27, // PR_GET_SECUREBITS — read-only query of securebits flags
             36, // PR_SET_CHILD_SUBREAPER — safe, only affects own descendants
             37, // PR_GET_CHILD_SUBREAPER
             38, // PR_SET_NO_NEW_PRIVS
             40, // PR_GET_TID_ADDRESS — read-only, returns thread ID address
             47, // PR_CAP_AMBIENT — glibc probes ambient caps at startup (read-only
-                // IS_SET queries). Safe after caps are dropped.
+            // IS_SET queries). Safe after caps are dropped.
             39, // PR_GET_NO_NEW_PRIVS
         ];
         let mut prctl_rules = Vec::new();
@@ -527,25 +527,28 @@ impl SeccompManager {
     ///
     /// This is useful for benchmarking filter compilation overhead
     /// without the irreversible side effect of applying the filter.
+    ///
+    /// Uses bitmap-based BPF compilation for O(1) syscall dispatch.
     pub fn compile_minimal_filter() -> Result<BpfProgram> {
         let rules = Self::minimal_filter(true, &[])?;
-        let filter = SeccompFilter::new(
+        let target_arch = std::env::consts::ARCH.try_into().map_err(|e| {
+            NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
+        })?;
+        super::seccomp_bpf::compile_bitmap_bpf(
             rules,
             SeccompAction::KillProcess,
             SeccompAction::Allow,
-            std::env::consts::ARCH.try_into().map_err(|e| {
-                NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
-            })?,
+            target_arch,
         )
-        .map_err(|e| {
-            NucleusError::SeccompError(format!("Failed to create seccomp filter: {}", e))
-        })?;
+    }
 
-        let bpf_prog: BpfProgram = filter.try_into().map_err(|e| {
-            NucleusError::SeccompError(format!("Failed to compile BPF program: {}", e))
-        })?;
-
-        Ok(bpf_prog)
+    /// Expose minimal_filter for tests in sibling modules.
+    #[cfg(test)]
+    pub(crate) fn minimal_filter_for_test(
+        allow_network: bool,
+        extra_syscalls: &[String],
+    ) -> BTreeMap<i64, Vec<SeccompRule>> {
+        Self::minimal_filter(allow_network, extra_syscalls).unwrap()
     }
 
     /// Apply seccomp filter
@@ -607,31 +610,24 @@ impl SeccompManager {
             }
         };
 
-        let filter = match SeccompFilter::new(
-            rules,
-            SeccompAction::KillProcess, // Default: kill on blocked syscall
-            SeccompAction::Allow,       // Match action: allow
-            std::env::consts::ARCH.try_into().map_err(|e| {
-                NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
-            })?,
-        ) {
-            Ok(f) => f,
+        let target_arch = match std::env::consts::ARCH.try_into() {
+            Ok(a) => a,
             Err(e) => {
+                let msg = format!("Unsupported architecture: {:?}", e);
                 if best_effort {
-                    warn!(
-                        "Failed to create seccomp filter: {} (continuing without seccomp)",
-                        e
-                    );
+                    warn!("{} (continuing without seccomp)", msg);
                     return Ok(false);
                 }
-                return Err(NucleusError::SeccompError(format!(
-                    "Failed to create seccomp filter: {}",
-                    e
-                )));
+                return Err(NucleusError::SeccompError(msg));
             }
         };
 
-        let bpf_prog: BpfProgram = match filter.try_into() {
+        let bpf_prog: BpfProgram = match super::seccomp_bpf::compile_bitmap_bpf(
+            rules,
+            SeccompAction::KillProcess,
+            SeccompAction::Allow,
+            target_arch,
+        ) {
             Ok(p) => p,
             Err(e) => {
                 if best_effort {
@@ -641,10 +637,7 @@ impl SeccompManager {
                     );
                     return Ok(false);
                 }
-                return Err(NucleusError::SeccompError(format!(
-                    "Failed to compile BPF program: {}",
-                    e
-                )));
+                return Err(e);
             }
         };
 
@@ -778,24 +771,16 @@ impl SeccompManager {
             rules.insert(libc::SYS_clone3, Vec::new());
         }
 
-        let filter = SeccompFilter::new(
+        let target_arch = std::env::consts::ARCH.try_into().map_err(|e| {
+            NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
+        })?;
+
+        let bpf_prog: BpfProgram = super::seccomp_bpf::compile_bitmap_bpf(
             rules,
             SeccompAction::KillProcess,
             SeccompAction::Allow,
-            std::env::consts::ARCH.try_into().map_err(|e| {
-                NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
-            })?,
-        )
-        .map_err(|e| {
-            NucleusError::SeccompError(format!(
-                "Failed to create seccomp filter from profile: {}",
-                e
-            ))
-        })?;
-
-        let bpf_prog: BpfProgram = filter.try_into().map_err(|e| {
-            NucleusError::SeccompError(format!("Failed to compile BPF program from profile: {}", e))
-        })?;
+            target_arch,
+        )?;
 
         match Self::apply_bpf_program(&bpf_prog, audit_mode) {
             Ok(_) => {

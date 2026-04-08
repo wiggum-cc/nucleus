@@ -3,12 +3,18 @@ use crate::checkpoint::state::CheckpointState;
 use crate::container::ContainerState;
 use crate::error::{NucleusError, Result, StateTransition};
 use nix::unistd::Uid;
+use sha2::{Digest, Sha256};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::Builder;
 use tracing::info;
+
+const CHECKPOINT_HMAC_FILE: &str = "checkpoint.hmac";
+const CHECKPOINT_HMAC_KEY_SIZE: usize = 32;
 
 /// CRIU runtime for checkpoint/restore
 ///
@@ -184,6 +190,7 @@ impl CriuRuntime {
         // Write metadata
         let metadata = CheckpointMetadata::from_state(state);
         metadata.save(output_dir)?;
+        Self::write_checkpoint_hmac(output_dir)?;
 
         // State transition: Dumping -> Dumped
         self.state = self.state.transition(CheckpointState::Dumped)?;
@@ -218,39 +225,7 @@ impl CriuRuntime {
             )));
         }
 
-        // H8: Verify checkpoint image integrity via HMAC if available
-        let hmac_path = input_dir.join("checkpoint.hmac");
-        if hmac_path.exists() {
-            info!("Verifying checkpoint HMAC integrity");
-            // HMAC is present — verify it
-            let expected = std::fs::read_to_string(&hmac_path).map_err(|e| {
-                NucleusError::CheckpointError(format!("Failed to read checkpoint HMAC: {}", e))
-            })?;
-            let expected = expected.trim();
-
-            // Compute HMAC over the metadata file
-            let metadata_path = input_dir.join("metadata.json");
-            let metadata_content = std::fs::read(&metadata_path).map_err(|e| {
-                NucleusError::CheckpointError(format!(
-                    "Failed to read checkpoint metadata for HMAC: {}",
-                    e
-                ))
-            })?;
-            let actual = crate::security::sha256_hex(&metadata_content);
-            if actual != expected {
-                return Err(NucleusError::CheckpointError(format!(
-                    "Checkpoint integrity verification failed: hash mismatch (expected {}, got {})",
-                    expected, actual
-                )));
-            }
-            info!("Checkpoint integrity verified");
-        } else {
-            tracing::warn!(
-                "No checkpoint HMAC found at {:?}; skipping integrity verification. \
-                 Consider generating HMACs during checkpoint for tamper detection.",
-                hmac_path
-            );
-        }
+        Self::verify_checkpoint_hmac(input_dir)?;
 
         // State transition: None -> Restoring
         self.state = self.state.transition(CheckpointState::Restoring)?;
@@ -346,6 +321,408 @@ impl CriuRuntime {
         Ok(images_dir)
     }
 
+    fn write_checkpoint_hmac(dir: &Path) -> Result<()> {
+        let key = Self::load_or_create_checkpoint_hmac_key()?;
+        let hmac_path = dir.join(CHECKPOINT_HMAC_FILE);
+        let tmp_path = dir.join(format!("{}.tmp", CHECKPOINT_HMAC_FILE));
+
+        match fs::symlink_metadata(&tmp_path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(NucleusError::CheckpointError(format!(
+                    "Refusing symlink checkpoint HMAC temp file {:?}",
+                    tmp_path
+                )));
+            }
+            Ok(_) => {
+                fs::remove_file(&tmp_path).map_err(|e| {
+                    NucleusError::CheckpointError(format!(
+                        "Failed to remove stale checkpoint HMAC temp file {:?}: {}",
+                        tmp_path, e
+                    ))
+                })?;
+            }
+            Err(_) => {}
+        }
+
+        let digest = Self::compute_checkpoint_hmac(dir, &key)?;
+
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp_path)
+            .map_err(|e| {
+                NucleusError::CheckpointError(format!(
+                    "Failed to open checkpoint HMAC temp file {:?}: {}",
+                    tmp_path, e
+                ))
+            })?;
+        file.write_all(digest.as_bytes()).map_err(|e| {
+            NucleusError::CheckpointError(format!(
+                "Failed to write checkpoint HMAC {:?}: {}",
+                tmp_path, e
+            ))
+        })?;
+        file.sync_all().map_err(|e| {
+            NucleusError::CheckpointError(format!(
+                "Failed to sync checkpoint HMAC {:?}: {}",
+                tmp_path, e
+            ))
+        })?;
+        fs::rename(&tmp_path, &hmac_path).map_err(|e| {
+            NucleusError::CheckpointError(format!(
+                "Failed to atomically replace checkpoint HMAC {:?}: {}",
+                hmac_path, e
+            ))
+        })?;
+
+        Ok(())
+    }
+
+    fn verify_checkpoint_hmac(dir: &Path) -> Result<()> {
+        let hmac_path = dir.join(CHECKPOINT_HMAC_FILE);
+        let expected = Self::read_file_nofollow_bytes(&hmac_path).map_err(|e| {
+            NucleusError::CheckpointError(format!(
+                "Failed to read checkpoint HMAC {:?}: {}",
+                hmac_path, e
+            ))
+        })?;
+        let expected = std::str::from_utf8(&expected)
+            .map_err(|e| {
+                NucleusError::CheckpointError(format!(
+                    "Checkpoint HMAC {:?} is not valid UTF-8: {}",
+                    hmac_path, e
+                ))
+            })?
+            .trim()
+            .to_string();
+        if expected.is_empty() {
+            return Err(NucleusError::CheckpointError(format!(
+                "Checkpoint HMAC {:?} is empty",
+                hmac_path
+            )));
+        }
+
+        info!("Verifying checkpoint HMAC integrity");
+        let key = Self::load_or_create_checkpoint_hmac_key()?;
+        let actual = Self::compute_checkpoint_hmac(dir, &key)?;
+        if actual != expected {
+            return Err(NucleusError::CheckpointError(format!(
+                "Checkpoint integrity verification failed: HMAC mismatch (expected {}, got {})",
+                expected, actual
+            )));
+        }
+
+        info!("Checkpoint integrity verified");
+        Ok(())
+    }
+
+    fn checkpoint_hmac_key_path() -> PathBuf {
+        if let Some(path) =
+            std::env::var_os("NUCLEUS_CHECKPOINT_HMAC_KEY_FILE").filter(|path| !path.is_empty())
+        {
+            return PathBuf::from(path);
+        }
+
+        if Uid::effective().is_root() {
+            PathBuf::from("/var/lib/nucleus/checkpoint-hmac.key")
+        } else {
+            dirs::data_local_dir()
+                .map(|dir| dir.join("nucleus/checkpoint-hmac.key"))
+                .or_else(|| dirs::home_dir().map(|dir| dir.join(".nucleus/checkpoint-hmac.key")))
+                .unwrap_or_else(|| PathBuf::from("/tmp/nucleus-checkpoint-hmac.key"))
+        }
+    }
+
+    fn load_or_create_checkpoint_hmac_key() -> Result<Vec<u8>> {
+        let key_path = Self::checkpoint_hmac_key_path();
+        let parent = key_path.parent().ok_or_else(|| {
+            NucleusError::CheckpointError(format!(
+                "Checkpoint HMAC key path {:?} has no parent directory",
+                key_path
+            ))
+        })?;
+        Self::ensure_secure_key_parent_dir(parent)?;
+        Self::reject_symlink_path(&key_path, "checkpoint HMAC key file")?;
+
+        if key_path.exists() {
+            let metadata = fs::metadata(&key_path).map_err(|e| {
+                NucleusError::CheckpointError(format!(
+                    "Failed to stat checkpoint HMAC key {:?}: {}",
+                    key_path, e
+                ))
+            })?;
+            let mode = metadata.permissions().mode() & 0o777;
+            let owner = metadata.uid();
+            let euid = Uid::effective().as_raw();
+            if owner != euid {
+                return Err(NucleusError::CheckpointError(format!(
+                    "Checkpoint HMAC key {:?} is owned by uid {} (expected {})",
+                    key_path, owner, euid
+                )));
+            }
+            if mode & 0o077 != 0 {
+                return Err(NucleusError::CheckpointError(format!(
+                    "Checkpoint HMAC key {:?} has insecure mode {:o}; expected owner-only access",
+                    key_path, mode
+                )));
+            }
+            let key = Self::read_file_nofollow_bytes(&key_path).map_err(|e| {
+                NucleusError::CheckpointError(format!(
+                    "Failed to read checkpoint HMAC key {:?}: {}",
+                    key_path, e
+                ))
+            })?;
+            if key.len() < CHECKPOINT_HMAC_KEY_SIZE {
+                return Err(NucleusError::CheckpointError(format!(
+                    "Checkpoint HMAC key {:?} is too short ({} bytes)",
+                    key_path,
+                    key.len()
+                )));
+            }
+            return Ok(key);
+        }
+
+        let mut key = vec![0u8; CHECKPOINT_HMAC_KEY_SIZE];
+        Self::fill_secure_random(&mut key)?;
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&key_path)
+            .map_err(|e| {
+                NucleusError::CheckpointError(format!(
+                    "Failed to create checkpoint HMAC key {:?}: {}",
+                    key_path, e
+                ))
+            })?;
+        file.write_all(&key).map_err(|e| {
+            NucleusError::CheckpointError(format!(
+                "Failed to write checkpoint HMAC key {:?}: {}",
+                key_path, e
+            ))
+        })?;
+        file.sync_all().map_err(|e| {
+            NucleusError::CheckpointError(format!(
+                "Failed to sync checkpoint HMAC key {:?}: {}",
+                key_path, e
+            ))
+        })?;
+        Ok(key)
+    }
+
+    fn ensure_secure_key_parent_dir(path: &Path) -> Result<()> {
+        Self::reject_symlink_path(path, "checkpoint HMAC key directory")?;
+
+        if path.exists() {
+            let metadata = fs::metadata(path).map_err(|e| {
+                NucleusError::CheckpointError(format!(
+                    "Failed to stat checkpoint HMAC key directory {:?}: {}",
+                    path, e
+                ))
+            })?;
+            if !metadata.is_dir() {
+                return Err(NucleusError::CheckpointError(format!(
+                    "Checkpoint HMAC key directory {:?} is not a directory",
+                    path
+                )));
+            }
+            let mode = metadata.permissions().mode() & 0o777;
+            let owner = metadata.uid();
+            let euid = Uid::effective().as_raw();
+            if owner != euid {
+                return Err(NucleusError::CheckpointError(format!(
+                    "Checkpoint HMAC key directory {:?} is owned by uid {} (expected {})",
+                    path, owner, euid
+                )));
+            }
+            if mode & 0o077 != 0 {
+                return Err(NucleusError::CheckpointError(format!(
+                    "Checkpoint HMAC key directory {:?} has insecure mode {:o}; expected owner-only access",
+                    path, mode
+                )));
+            }
+            return Ok(());
+        }
+
+        fs::create_dir_all(path).map_err(|e| {
+            NucleusError::CheckpointError(format!(
+                "Failed to create checkpoint HMAC key directory {:?}: {}",
+                path, e
+            ))
+        })?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            NucleusError::CheckpointError(format!(
+                "Failed to secure checkpoint HMAC key directory {:?}: {}",
+                path, e
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn fill_secure_random(buf: &mut [u8]) -> Result<()> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open("/dev/urandom")
+            .map_err(|e| {
+                NucleusError::CheckpointError(format!(
+                    "Failed to open /dev/urandom for checkpoint HMAC key generation: {}",
+                    e
+                ))
+            })?;
+        let metadata = file.metadata().map_err(|e| {
+            NucleusError::CheckpointError(format!("Failed to stat /dev/urandom: {}", e))
+        })?;
+        use std::os::unix::fs::FileTypeExt;
+        if !metadata.file_type().is_char_device() {
+            return Err(NucleusError::CheckpointError(
+                "/dev/urandom is not a character device".to_string(),
+            ));
+        }
+        let mut file = file;
+        file.read_exact(buf).map_err(|e| {
+            NucleusError::CheckpointError(format!(
+                "Failed to read /dev/urandom for checkpoint HMAC key generation: {}",
+                e
+            ))
+        })
+    }
+
+    fn read_file_nofollow_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        let mut content = Vec::new();
+        file.read_to_end(&mut content)?;
+        Ok(content)
+    }
+
+    fn compute_checkpoint_hmac(dir: &Path, key: &[u8]) -> Result<String> {
+        let mut key_block = [0u8; 64];
+        if key.len() > key_block.len() {
+            let digest = Sha256::digest(key);
+            key_block[..digest.len()].copy_from_slice(&digest);
+        } else {
+            key_block[..key.len()].copy_from_slice(key);
+        }
+
+        let mut ipad = [0x36u8; 64];
+        let mut opad = [0x5cu8; 64];
+        for (dst, src) in ipad.iter_mut().zip(key_block.iter()) {
+            *dst ^= *src;
+        }
+        for (dst, src) in opad.iter_mut().zip(key_block.iter()) {
+            *dst ^= *src;
+        }
+
+        let mut inner = Sha256::new();
+        inner.update(ipad);
+        Self::update_checkpoint_hmac_inner(&mut inner, dir, dir)?;
+        let inner_hash = inner.finalize();
+
+        let mut outer = Sha256::new();
+        outer.update(opad);
+        outer.update(inner_hash);
+        Ok(hex::encode(outer.finalize()))
+    }
+
+    fn update_checkpoint_hmac_inner(hasher: &mut Sha256, root: &Path, dir: &Path) -> Result<()> {
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(dir).map_err(|e| {
+            NucleusError::CheckpointError(format!(
+                "Failed to read checkpoint directory {:?}: {}",
+                dir, e
+            ))
+        })? {
+            let entry = entry.map_err(|e| {
+                NucleusError::CheckpointError(format!(
+                    "Failed to read checkpoint entry in {:?}: {}",
+                    dir, e
+                ))
+            })?;
+            entries.push(entry.path());
+        }
+        entries.sort();
+
+        for path in entries {
+            let relative = path.strip_prefix(root).map_err(|e| {
+                NucleusError::CheckpointError(format!(
+                    "Failed to compute checkpoint-relative path for {:?}: {}",
+                    path, e
+                ))
+            })?;
+            if relative == Path::new(CHECKPOINT_HMAC_FILE) {
+                continue;
+            }
+
+            let metadata = fs::symlink_metadata(&path).map_err(|e| {
+                NucleusError::CheckpointError(format!(
+                    "Failed to stat checkpoint path {:?}: {}",
+                    path, e
+                ))
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(NucleusError::CheckpointError(format!(
+                    "Checkpoint integrity scan refuses symlink path {:?}",
+                    path
+                )));
+            }
+
+            let relative = relative.to_str().ok_or_else(|| {
+                NucleusError::CheckpointError(format!(
+                    "Checkpoint path {:?} is not valid UTF-8",
+                    relative
+                ))
+            })?;
+
+            if metadata.is_dir() {
+                hasher.update(b"D\0");
+                hasher.update(relative.as_bytes());
+                hasher.update(b"\0");
+                Self::update_checkpoint_hmac_inner(hasher, root, &path)?;
+            } else if metadata.is_file() {
+                hasher.update(b"F\0");
+                hasher.update(relative.as_bytes());
+                hasher.update(b"\0");
+                hasher.update(metadata.len().to_le_bytes());
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&path)
+                    .map_err(|e| {
+                        NucleusError::CheckpointError(format!(
+                            "Failed to open checkpoint file {:?}: {}",
+                            path, e
+                        ))
+                    })?;
+                let mut buf = [0u8; 8192];
+                loop {
+                    let read = file.read(&mut buf).map_err(|e| {
+                        NucleusError::CheckpointError(format!(
+                            "Failed to read checkpoint file {:?}: {}",
+                            path, e
+                        ))
+                    })?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..read]);
+                }
+            } else {
+                return Err(NucleusError::CheckpointError(format!(
+                    "Checkpoint integrity scan rejects special file {:?}",
+                    path
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     fn ensure_secure_dir(path: &Path, label: &str) -> Result<()> {
         Self::reject_symlink_path(path, label)?;
 
@@ -389,9 +766,45 @@ impl CriuRuntime {
 #[cfg(test)]
 mod tests {
     use super::CriuRuntime;
+    use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    fn checkpoint_key_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct CheckpointKeyEnvGuard {
+        previous: Option<OsString>,
+    }
+
+    impl CheckpointKeyEnvGuard {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("NUCLEUS_CHECKPOINT_HMAC_KEY_FILE");
+            std::env::set_var("NUCLEUS_CHECKPOINT_HMAC_KEY_FILE", path);
+            Self { previous }
+        }
+    }
+
+    impl Drop for CheckpointKeyEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("NUCLEUS_CHECKPOINT_HMAC_KEY_FILE", value),
+                None => std::env::remove_var("NUCLEUS_CHECKPOINT_HMAC_KEY_FILE"),
+            }
+        }
+    }
+
+    fn prepare_secure_checkpoint_key_dir(tmp: &TempDir) -> PathBuf {
+        let key_dir = tmp.path().join("keys");
+        fs::create_dir(&key_dir).unwrap();
+        fs::set_permissions(&key_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        key_dir
+    }
 
     #[test]
     fn test_parse_pid_text_plain() {
@@ -587,5 +1000,61 @@ mod tests {
             & 0o777;
         assert_eq!(output_mode, 0o700);
         assert_eq!(images_mode, 0o700);
+    }
+
+    #[test]
+    fn test_checkpoint_hmac_detects_tampering_in_images() {
+        let _guard = checkpoint_key_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let key_dir = prepare_secure_checkpoint_key_dir(&tmp);
+        let key_path = key_dir.join("checkpoint.key");
+        let _env = CheckpointKeyEnvGuard::set(&key_path);
+
+        let checkpoint_dir = tmp.path().join("checkpoint");
+        fs::create_dir(&checkpoint_dir).unwrap();
+        fs::create_dir(checkpoint_dir.join("images")).unwrap();
+        fs::write(checkpoint_dir.join("metadata.json"), "{\"id\":\"abc\"}").unwrap();
+        fs::write(
+            checkpoint_dir.join("images").join("pages-1.img"),
+            b"snapshot",
+        )
+        .unwrap();
+
+        CriuRuntime::write_checkpoint_hmac(&checkpoint_dir).unwrap();
+        CriuRuntime::verify_checkpoint_hmac(&checkpoint_dir).unwrap();
+
+        fs::write(
+            checkpoint_dir.join("images").join("pages-1.img"),
+            b"tampered",
+        )
+        .unwrap();
+        let err = CriuRuntime::verify_checkpoint_hmac(&checkpoint_dir).unwrap_err();
+        assert!(err.to_string().contains("HMAC mismatch"));
+    }
+
+    #[test]
+    fn test_checkpoint_hmac_rejects_symlinks_in_checkpoint_tree() {
+        let _guard = checkpoint_key_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let key_dir = prepare_secure_checkpoint_key_dir(&tmp);
+        let key_path = key_dir.join("checkpoint.key");
+        let _env = CheckpointKeyEnvGuard::set(&key_path);
+
+        let checkpoint_dir = tmp.path().join("checkpoint");
+        fs::create_dir(&checkpoint_dir).unwrap();
+        fs::create_dir(checkpoint_dir.join("images")).unwrap();
+        fs::write(checkpoint_dir.join("metadata.json"), "{\"id\":\"abc\"}").unwrap();
+        symlink(
+            checkpoint_dir.join("metadata.json"),
+            checkpoint_dir.join("images").join("metadata-link"),
+        )
+        .unwrap();
+
+        let err = CriuRuntime::write_checkpoint_hmac(&checkpoint_dir).unwrap_err();
+        assert!(err.to_string().contains("refuses symlink"));
     }
 }

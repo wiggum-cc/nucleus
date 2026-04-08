@@ -978,8 +978,9 @@ fn main() -> Result<()> {
                 }
 
                 // Insert --quiet-id and --preset-id right after "create"
-                if let Some(create_pos) =
-                    inner_args.iter().position(|a| a.eq_ignore_ascii_case("create"))
+                if let Some(create_pos) = inner_args
+                    .iter()
+                    .position(|a| a.eq_ignore_ascii_case("create"))
                 {
                     inner_args.insert(create_pos + 1, format!("--preset-id={}", id));
                     inner_args.insert(create_pos + 1, "--quiet-id".to_string());

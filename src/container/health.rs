@@ -7,24 +7,44 @@ use tracing::{debug, error, info, warn};
 use super::runtime::Container;
 
 /// L2: Attempt to open a pidfd for the given PID.
-/// Returns the raw fd on success, or -1 if the kernel doesn't support pidfd_open.
-fn pidfd_open(pid: u32) -> i32 {
-    // SAFETY: pidfd_open is a safe syscall that returns a file descriptor.
-    unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_uint, 0i32) as i32 }
+/// Returns `Some(OwnedFd)` on success, or `None` if the kernel doesn't support pidfd_open.
+fn pidfd_open(pid: u32) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: pidfd_open is a safe syscall that returns a file descriptor or -1.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_uint, 0i32) as i32 };
+    if raw >= 0 {
+        // SAFETY: raw is a valid, newly-created fd from pidfd_open.
+        Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+    } else {
+        None
+    }
 }
 
 /// L2: Send a signal via pidfd to avoid PID-reuse TOCTOU.
 /// Falls back to kill(2) with start_ticks verification if pidfd is unavailable.
-fn pidfd_send_signal_or_kill(pid: u32, pidfd: i32, signal: Signal, expected_ticks: u64) {
-    if pidfd >= 0 {
+fn pidfd_send_signal_or_kill(
+    pid: u32,
+    pidfd: Option<&std::os::fd::OwnedFd>,
+    signal: Signal,
+    expected_ticks: u64,
+) {
+    if let Some(fd) = pidfd {
+        use std::os::fd::AsRawFd;
         // SAFETY: pidfd_send_signal is safe with a valid pidfd.
-        unsafe {
+        let ret = unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
-                pidfd,
+                fd.as_raw_fd(),
                 signal as libc::c_int,
                 std::ptr::null::<libc::siginfo_t>(),
                 0u32,
+            )
+        };
+        if ret != 0 {
+            warn!(
+                "pidfd_send_signal failed for PID {}: {}",
+                pid,
+                std::io::Error::last_os_error()
             );
         }
     } else {
@@ -211,7 +231,7 @@ impl Container {
 
         // Capture start_ticks as a fallback for PID ownership verification.
         let expected_ticks = read_start_ticks(pid);
-        if expected_ticks == 0 && pidfd < 0 {
+        if expected_ticks == 0 && pidfd.is_none() {
             warn!(
                 "Health check: could not read start_ticks for PID {} and pidfd unavailable, aborting",
                 pid
@@ -282,7 +302,12 @@ impl Container {
                             "Container {} is unhealthy after {} consecutive failures",
                             container_name, consecutive_failures
                         );
-                        pidfd_send_signal_or_kill(pid, pidfd, Signal::SIGTERM, expected_ticks);
+                        pidfd_send_signal_or_kill(
+                            pid,
+                            pidfd.as_ref(),
+                            Signal::SIGTERM,
+                            expected_ticks,
+                        );
                         return;
                     }
                 }
@@ -291,7 +316,7 @@ impl Container {
                         "Health check execution failed for {}: {}",
                         container_name, e
                     );
-                    pidfd_send_signal_or_kill(pid, pidfd, Signal::SIGTERM, expected_ticks);
+                    pidfd_send_signal_or_kill(pid, pidfd.as_ref(), Signal::SIGTERM, expected_ticks);
                     return;
                 }
             }

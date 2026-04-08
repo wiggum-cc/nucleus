@@ -327,8 +327,7 @@ fn deny_log_loop(pid: u32, stop: &AtomicBool) -> Result<()> {
 
         if line.contains("type=1326") && line.contains(&pid_pattern) {
             if let Some(nr) = extract_syscall_nr(&line) {
-                let name = super::seccomp_generate::syscall_number_to_name(nr)
-                    .unwrap_or("unknown");
+                let name = super::seccomp_generate::syscall_number_to_name(nr).unwrap_or("unknown");
                 warn!(
                     syscall = nr,
                     name = name,

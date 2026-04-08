@@ -297,22 +297,12 @@ run_nucleus_bench() {
   # `nucleus create` runs the container in the foreground, so we background it.
   # - Host network: pgbench on host connects via 127.0.0.1
   # - Bind-mount pgdata + /nix (for PG binaries) + /tmp
-  # - trusted: allow host network and bind-mounts
-  # - gVisor runtime: full sandboxing for realistic production-like isolation
+  # - gVisor runtime: full security (sentry-level syscall interception)
   # Clean up any stale container state from a previous run
   "$NUCLEUS_BIN" delete "pg18-bench-${io_method}" 2>/dev/null || true
 
-  # For io_uring mode, opt in to io_uring_* syscalls via --seccomp-allow
-  # (excluded from nucleus defaults due to kernel CVE history).
-  local seccomp_args=()
-  if [ "$io_method" = "io_uring" ]; then
-    seccomp_args=(
-      --seccomp-allow io_uring_setup
-      --seccomp-allow io_uring_enter
-      --seccomp-allow io_uring_register
-      --memlock 8M
-    )
-  fi
+  # In gVisor mode, the sentry handles syscall filtering and io_uring
+  # support internally — no --seccomp-allow or --memlock flags needed.
 
   RUST_LOG=warn "$NUCLEUS_BIN" create \
     --name "pg18-bench-${io_method}" \
@@ -321,11 +311,10 @@ run_nucleus_bench() {
     --network host \
     --allow-host-network \
     --runtime gvisor \
-    --trust-level trusted \
-    --allow-chroot-fallback \
     --pids 0 \
     --volume "$pgdata:/pgdata" \
-    "${seccomp_args[@]}" \
+    --volume "/nix:/nix:ro" \
+    --volume "/tmp:/tmp" \
     -- "$PG_BIN/postgres" -D /pgdata -p "$port" &
 
   NUCLEUS_PID=$!

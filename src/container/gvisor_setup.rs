@@ -5,6 +5,8 @@ use crate::filesystem::{
 };
 use crate::network::{BridgeNetwork, NetworkMode};
 use crate::security::{GVisorNetworkMode, GVisorRuntime, OciBundle, OciConfig, OciMount};
+use nix::unistd::Uid;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use tracing::info;
 
 use super::runtime::Container;
@@ -31,6 +33,8 @@ impl Container {
 
         let mut oci_config =
             OciConfig::new(self.config.command.clone(), self.config.hostname.clone());
+        let artifact_dir = Self::gvisor_artifact_dir(&self.config.id);
+        Self::ensure_secure_gvisor_artifact_dir(&artifact_dir)?;
         let context_manifest = if self.config.verify_context_integrity {
             self.config
                 .context_dir
@@ -80,7 +84,7 @@ impl Container {
         }
 
         if !self.config.secrets.is_empty() {
-            let secret_stage_dir = Self::gvisor_secret_stage_dir(&self.config.id);
+            let secret_stage_dir = artifact_dir.join("secrets-stage");
             Self::mount_gvisor_secret_stage_tmpfs(&secret_stage_dir)?;
             Self::apply_secret_dir_identity(&secret_stage_dir, &self.config.process_identity)?;
             let staged_secrets = Self::stage_gvisor_secret_files(
@@ -101,13 +105,6 @@ impl Container {
             oci_config = oci_config.with_hooks(hooks.clone());
         }
 
-        let artifact_dir = Self::gvisor_artifact_dir(&self.config.id);
-        std::fs::create_dir_all(&artifact_dir).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to create gVisor artifact dir {:?}: {}",
-                artifact_dir, e
-            ))
-        })?;
         // Use --bundle path if provided, otherwise default
         let bundle_path = self
             .config
@@ -213,9 +210,7 @@ impl Container {
     }
 
     pub(super) fn gvisor_artifact_dir(container_id: &str) -> std::path::PathBuf {
-        std::env::temp_dir()
-            .join("nucleus-gvisor")
-            .join(container_id)
+        Self::gvisor_artifact_base().join(container_id)
     }
 
     pub(super) fn gvisor_bundle_path(container_id: &str) -> std::path::PathBuf {
@@ -226,13 +221,106 @@ impl Container {
         Self::gvisor_artifact_dir(container_id).join("secrets-stage")
     }
 
-    fn mount_gvisor_secret_stage_tmpfs(stage_dir: &std::path::Path) -> Result<()> {
-        std::fs::create_dir_all(stage_dir).map_err(|e| {
-            NucleusError::FilesystemError(format!(
-                "Failed to create gVisor secret stage dir {:?}: {}",
-                stage_dir, e
-            ))
+    fn gvisor_artifact_base() -> std::path::PathBuf {
+        if let Some(path) =
+            std::env::var_os("NUCLEUS_GVISOR_ARTIFACT_BASE").filter(|path| !path.is_empty())
+        {
+            return std::path::PathBuf::from(path);
+        }
+
+        if Uid::effective().is_root() {
+            std::path::PathBuf::from("/run/nucleus-gvisor")
+        } else {
+            dirs::runtime_dir()
+                .map(|dir| dir.join("nucleus-gvisor"))
+                .unwrap_or_else(|| {
+                    std::env::temp_dir()
+                        .join(format!("nucleus-gvisor-{}", Uid::effective().as_raw()))
+                })
+        }
+    }
+
+    fn ensure_secure_gvisor_artifact_dir(path: &std::path::Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            Self::ensure_secure_gvisor_dir(parent, "gVisor artifact base")?;
+        }
+        Self::ensure_secure_gvisor_dir(path, "gVisor artifact dir")
+    }
+
+    fn ensure_secure_gvisor_dir(path: &std::path::Path, label: &str) -> Result<()> {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(NucleusError::FilesystemError(format!(
+                    "Refusing symlink {} {:?}",
+                    label, path
+                )));
+            }
+            Ok(_) | Err(_) => {}
+        }
+
+        std::fs::create_dir_all(path).map_err(|e| {
+            NucleusError::FilesystemError(format!("Failed to create {} {:?}: {}", label, path, e))
         })?;
+
+        let metadata = std::fs::metadata(path).map_err(|e| {
+            NucleusError::FilesystemError(format!("Failed to stat {} {:?}: {}", label, path, e))
+        })?;
+        let mode = metadata.permissions().mode() & 0o777;
+        let owner = metadata.uid();
+        let euid = Uid::effective().as_raw();
+        if owner != euid {
+            return Err(NucleusError::FilesystemError(format!(
+                "{} {:?} is owned by uid {} (expected {})",
+                label, path, owner, euid
+            )));
+        }
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
+                |e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to secure {} permissions {:?}: {}",
+                        label, path, e
+                    ))
+                },
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn mount_gvisor_secret_stage_tmpfs(stage_dir: &std::path::Path) -> Result<()> {
+        match std::fs::symlink_metadata(stage_dir) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(NucleusError::FilesystemError(format!(
+                    "Refusing symlink gVisor secret stage dir {:?}",
+                    stage_dir
+                )));
+            }
+            Ok(_) | Err(_) => {}
+        }
+
+        std::fs::create_dir(stage_dir)
+            .or_else(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
+            .map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to create gVisor secret stage dir {:?}: {}",
+                    stage_dir, e
+                ))
+            })?;
+        std::fs::set_permissions(stage_dir, std::fs::Permissions::from_mode(0o700)).map_err(
+            |e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to secure gVisor secret stage dir {:?}: {}",
+                    stage_dir, e
+                ))
+            },
+        )?;
 
         nix::mount::mount(
             Some("tmpfs"),
@@ -374,5 +462,32 @@ impl Container {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ensure_secure_gvisor_artifact_dir_sets_owner_only_permissions() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let artifact_dir = temp.path().join("artifacts").join("container-a");
+
+        Container::ensure_secure_gvisor_artifact_dir(&artifact_dir).unwrap();
+
+        let parent_mode = std::fs::metadata(artifact_dir.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let artifact_mode = std::fs::metadata(&artifact_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(parent_mode, 0o700);
+        assert_eq!(artifact_mode, 0o700);
     }
 }

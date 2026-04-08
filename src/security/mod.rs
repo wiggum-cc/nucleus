@@ -5,6 +5,7 @@ mod landlock;
 mod landlock_policy;
 mod policy;
 mod seccomp;
+mod seccomp_bpf;
 mod seccomp_generate;
 mod seccomp_trace;
 mod state;

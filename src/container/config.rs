@@ -920,6 +920,7 @@ impl ContainerConfig {
                             source
                         )));
                     }
+                    crate::filesystem::validate_bind_mount_source(source)?;
                 }
                 VolumeSource::Tmpfs { .. } => {}
             }
@@ -1399,6 +1400,22 @@ mod tests {
 
         let err = cfg.validate_runtime_support().unwrap_err();
         assert!(err.to_string().contains("Volume source does not exist"));
+    }
+
+    #[test]
+    fn test_bind_volume_source_rejects_sensitive_host_subtrees() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_volume(VolumeMount {
+                source: VolumeSource::Bind {
+                    source: PathBuf::from("/proc/sys"),
+                },
+                dest: PathBuf::from("/host-proc"),
+                read_only: true,
+            });
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("sensitive host path"));
     }
 
     #[test]

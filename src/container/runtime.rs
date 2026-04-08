@@ -95,16 +95,18 @@ impl Container {
         if ret == 0 {
             return;
         }
-        // Fallback: iterate /proc/self/fd and close individually
+        // Fallback: iterate /proc/self/fd and close individually.
+        // Collect fds first, then close — closing during iteration would
+        // invalidate the ReadDir's own directory fd.
         if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
-            for entry in entries.flatten() {
-                if let Ok(fd_str) = entry.file_name().into_string() {
-                    if let Ok(fd) = fd_str.parse::<i32>() {
-                        if fd > 2 {
-                            unsafe { libc::close(fd) };
-                        }
-                    }
-                }
+            let fds: Vec<i32> = entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter_map(|s| s.parse::<i32>().ok())
+                .filter(|&fd| fd > 2)
+                .collect();
+            for fd in fds {
+                unsafe { libc::close(fd) };
             }
         }
     }
@@ -599,9 +601,12 @@ impl Container {
             Some("shm"),
             &shm_path,
             Some("tmpfs"),
-            nix::mount::MsFlags::MS_NOSUID | nix::mount::MsFlags::MS_NODEV | nix::mount::MsFlags::MS_NOEXEC,
+            nix::mount::MsFlags::MS_NOSUID
+                | nix::mount::MsFlags::MS_NODEV
+                | nix::mount::MsFlags::MS_NOEXEC,
             Some("mode=1777,size=64m"),
-        ).map_err(|e| {
+        )
+        .map_err(|e| {
             NucleusError::FilesystemError(format!("Failed to mount tmpfs on /dev/shm: {}", e))
         })?;
         debug!("Mounted tmpfs on /dev/shm");
@@ -1384,6 +1389,29 @@ mod tests {
     use super::*;
     use crate::container::KernelLockdownMode;
     use crate::network::NetworkMode;
+    use std::ffi::OsString;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     fn extract_fn_body<'a>(source: &'a str, fn_signature: &str) -> &'a str {
         let fn_start = source
@@ -1654,6 +1682,11 @@ mod tests {
 
     #[test]
     fn test_cleanup_gvisor_artifacts_removes_artifact_dir() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _artifact_base = EnvVarGuard::set(
+            "NUCLEUS_GVISOR_ARTIFACT_BASE",
+            temp.path().join("gvisor-artifacts"),
+        );
         let artifact_dir = Container::gvisor_artifact_dir("cleanup-test");
         std::fs::create_dir_all(&artifact_dir).unwrap();
         std::fs::write(artifact_dir.join("config.json"), "{}").unwrap();
