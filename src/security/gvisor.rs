@@ -247,6 +247,7 @@ impl GVisorRuntime {
             GVisorNetworkMode::None,
             false,
             GVisorPlatform::Systrap,
+            false,
         )
     }
 
@@ -265,12 +266,14 @@ impl GVisorRuntime {
         network_mode: GVisorNetworkMode,
         rootless: bool,
         platform: GVisorPlatform,
+        enable_iouring: bool,
     ) -> Result<()> {
         info!(
-            "Executing with gVisor using OCI bundle at {:?} (network: {:?}, platform: {:?})",
+            "Executing with gVisor using OCI bundle at {:?} (network: {:?}, platform: {:?}, iouring: {})",
             bundle.bundle_path(),
             network_mode,
             platform,
+            enable_iouring,
         );
 
         let network_flag = match network_mode {
@@ -314,28 +317,15 @@ impl GVisorRuntime {
         // Build runsc command with OCI bundle.
         // Global flags (--root, --network, --platform) must come BEFORE the subcommand.
         // runsc --root <dir> --network <mode> --platform <plat> run --bundle <path> <id>
-        let mut args = vec![
-            self.runsc_path.clone(),
-            "--root".to_string(),
-            runsc_root.to_string_lossy().to_string(),
-        ];
-
-        // Rootless OCI mode relies on user namespace mappings in config.json.
-        // We intentionally do not pass runsc's CLI `--rootless` flag here.
-        if rootless {
-            args.push("--ignore-cgroups".to_string());
-        }
-
-        args.extend([
-            "--network".to_string(),
-            network_flag.to_string(),
-            "--platform".to_string(),
-            platform.as_flag().to_string(),
-            "run".to_string(),
-            "--bundle".to_string(),
-            bundle.bundle_path().to_string_lossy().to_string(),
-            container_id.to_string(),
-        ]);
+        let args = self.build_oci_run_args(
+            container_id,
+            bundle,
+            &runsc_root,
+            network_flag,
+            rootless,
+            platform,
+            enable_iouring,
+        );
 
         debug!("runsc OCI args: {:?}", args);
 
@@ -443,11 +433,52 @@ impl GVisorRuntime {
 
         Ok(env)
     }
+
+    fn build_oci_run_args(
+        &self,
+        container_id: &str,
+        bundle: &OciBundle,
+        runsc_root: &Path,
+        network_flag: &str,
+        rootless: bool,
+        platform: GVisorPlatform,
+        enable_iouring: bool,
+    ) -> Vec<String> {
+        let mut args = vec![
+            self.runsc_path.clone(),
+            "--root".to_string(),
+            runsc_root.to_string_lossy().to_string(),
+        ];
+
+        // Rootless OCI mode relies on user namespace mappings in config.json.
+        // We intentionally do not pass runsc's CLI `--rootless` flag here.
+        if rootless {
+            args.push("--ignore-cgroups".to_string());
+        }
+
+        if enable_iouring {
+            args.push("--iouring".to_string());
+        }
+
+        args.extend([
+            "--network".to_string(),
+            network_flag.to_string(),
+            "--platform".to_string(),
+            platform.as_flag().to_string(),
+            "run".to_string(),
+            "--bundle".to_string(),
+            bundle.bundle_path().to_string_lossy().to_string(),
+            container_id.to_string(),
+        ]);
+
+        args
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oci::OciConfig;
     use std::path::Path;
 
     #[test]
@@ -576,5 +607,53 @@ mod tests {
             4242,
             1000
         ));
+    }
+
+    #[test]
+    fn test_build_oci_run_args_include_iouring_when_enabled() {
+        let rt = GVisorRuntime::with_path("/usr/bin/runsc".to_string());
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = OciBundle::new(
+            tmp.path().join("bundle"),
+            OciConfig::new(vec!["/bin/sh".to_string()], None),
+        );
+        let args = rt.build_oci_run_args(
+            "test-id",
+            &bundle,
+            &tmp.path().join("runsc-root"),
+            "host",
+            false,
+            GVisorPlatform::Systrap,
+            true,
+        );
+
+        assert!(
+            args.contains(&"--iouring".to_string()),
+            "runsc args must include --iouring when enabled"
+        );
+    }
+
+    #[test]
+    fn test_build_oci_run_args_omit_iouring_when_disabled() {
+        let rt = GVisorRuntime::with_path("/usr/bin/runsc".to_string());
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = OciBundle::new(
+            tmp.path().join("bundle"),
+            OciConfig::new(vec!["/bin/sh".to_string()], None),
+        );
+        let args = rt.build_oci_run_args(
+            "test-id",
+            &bundle,
+            &tmp.path().join("runsc-root"),
+            "host",
+            false,
+            GVisorPlatform::Systrap,
+            false,
+        );
+
+        assert!(
+            !args.contains(&"--iouring".to_string()),
+            "runsc args must omit --iouring by default"
+        );
     }
 }

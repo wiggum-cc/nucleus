@@ -406,6 +406,10 @@ enum Commands {
         #[arg(long = "gvisor-platform", default_value = "systrap")]
         gvisor_platform: GVisorPlatform,
 
+        /// Enable experimental io_uring support in the gVisor sentry.
+        #[arg(long = "gvisor-iouring")]
+        gvisor_iouring: bool,
+
         /// Enable time namespace isolation
         #[arg(long = "time-namespace")]
         time_namespace: bool,
@@ -939,6 +943,7 @@ fn main() -> Result<()> {
             verify_rootfs_attestation,
             require_kernel_lockdown,
             gvisor_platform,
+            gvisor_iouring,
             time_namespace,
             disable_cgroup_namespace,
             hooks,
@@ -1125,6 +1130,8 @@ fn main() -> Result<()> {
                 .with_verify_context_integrity(verify_context_integrity)
                 .with_verify_rootfs_attestation(verify_rootfs_attestation)
                 .with_gvisor_platform(gvisor_platform);
+
+            config = config.with_gvisor_iouring(gvisor_iouring);
 
             if let Some(mode) = require_kernel_lockdown {
                 config = config.with_required_kernel_lockdown(mode);

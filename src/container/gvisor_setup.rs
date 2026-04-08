@@ -48,6 +48,7 @@ impl Container {
         oci_config = oci_config.with_resources(&self.config.limits);
         oci_config = oci_config.with_namespace_config(&self.config.namespaces);
         oci_config = oci_config.with_process_identity(&self.config.process_identity);
+        oci_config = oci_config.with_rlimits(&self.config.limits);
 
         // Inject user-configured environment variables
         if !self.config.environment.is_empty() {
@@ -153,6 +154,7 @@ impl Container {
             gvisor_net,
             rootless_oci,
             self.config.gvisor_platform,
+            self.config.gvisor_iouring,
         )?;
 
         Ok(())

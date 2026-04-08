@@ -1243,29 +1243,35 @@ impl OciConfig {
         self
     }
 
-    /// Set process rlimits from the hardcoded Nucleus defaults.
+    /// Set process rlimits from the Nucleus runtime defaults and configured limits.
     ///
     /// Mirrors the RLIMIT backstops applied in-process for native containers
     /// (runtime.rs), expressed as OCI config so gVisor can enforce them.
-    pub fn with_rlimits(mut self, pids_max: Option<u64>) -> Self {
-        let nproc_limit = pids_max.unwrap_or(512);
-        self.process.rlimits = vec![
-            OciRlimit {
+    pub fn with_rlimits(mut self, limits: &ResourceLimits) -> Self {
+        let mut rlimits = Vec::with_capacity(3);
+
+        if let Some(nproc_limit) = limits.pids_max {
+            rlimits.push(OciRlimit {
                 limit_type: "RLIMIT_NPROC".to_string(),
                 hard: nproc_limit,
                 soft: nproc_limit,
-            },
-            OciRlimit {
-                limit_type: "RLIMIT_NOFILE".to_string(),
-                hard: 1024,
-                soft: 1024,
-            },
-            OciRlimit {
-                limit_type: "RLIMIT_MEMLOCK".to_string(),
-                hard: 64 * 1024,
-                soft: 64 * 1024,
-            },
-        ];
+            });
+        }
+
+        rlimits.push(OciRlimit {
+            limit_type: "RLIMIT_NOFILE".to_string(),
+            hard: 1024,
+            soft: 1024,
+        });
+
+        let memlock_limit = limits.memlock_bytes.unwrap_or(64 * 1024);
+        rlimits.push(OciRlimit {
+            limit_type: "RLIMIT_MEMLOCK".to_string(),
+            hard: memlock_limit,
+            soft: memlock_limit,
+        });
+
+        self.process.rlimits = rlimits;
         self
     }
 
@@ -1580,6 +1586,45 @@ mod tests {
         assert_eq!(config.process.user.uid, 1001);
         assert_eq!(config.process.user.gid, 1002);
         assert_eq!(config.process.user.additional_gids, Some(vec![1003, 1004]));
+    }
+
+    #[test]
+    fn test_oci_config_with_rlimits_uses_configured_memlock() {
+        let limits = ResourceLimits::default()
+            .with_pids(99)
+            .unwrap()
+            .with_memlock("8M")
+            .unwrap();
+
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None).with_rlimits(&limits);
+
+        assert!(config.process.rlimits.iter().any(|limit| {
+            limit.limit_type == "RLIMIT_NPROC" && limit.soft == 99 && limit.hard == 99
+        }));
+        assert!(config.process.rlimits.iter().any(|limit| {
+            limit.limit_type == "RLIMIT_MEMLOCK"
+                && limit.soft == 8 * 1024 * 1024
+                && limit.hard == 8 * 1024 * 1024
+        }));
+    }
+
+    #[test]
+    fn test_oci_config_with_rlimits_omits_nproc_when_unlimited() {
+        let limits = ResourceLimits {
+            pids_max: None,
+            ..ResourceLimits::default()
+        };
+
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None).with_rlimits(&limits);
+
+        assert!(
+            !config
+                .process
+                .rlimits
+                .iter()
+                .any(|limit| limit.limit_type == "RLIMIT_NPROC"),
+            "RLIMIT_NPROC must be omitted when pids_max is unlimited"
+        );
     }
 
     #[test]

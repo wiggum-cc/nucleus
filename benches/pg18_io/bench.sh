@@ -301,8 +301,15 @@ run_nucleus_bench() {
   # Clean up any stale container state from a previous run
   "$NUCLEUS_BIN" delete "pg18-bench-${io_method}" 2>/dev/null || true
 
-  # In gVisor mode, the sentry handles syscall filtering and io_uring
-  # support internally — no --seccomp-allow or --memlock flags needed.
+  # PostgreSQL 18 io_method=io_uring needs both the experimental runsc
+  # sentry path and a larger memlock limit for ring buffers.
+  local gvisor_args=()
+  if [ "$io_method" = "io_uring" ]; then
+    gvisor_args=(
+      --gvisor-iouring
+      --memlock 8M
+    )
+  fi
 
   RUST_LOG=warn "$NUCLEUS_BIN" create \
     --name "pg18-bench-${io_method}" \
@@ -311,23 +318,25 @@ run_nucleus_bench() {
     --network host \
     --allow-host-network \
     --runtime gvisor \
+    --trust-level trusted \
     --pids 0 \
     --volume "$pgdata:/pgdata" \
     --volume "/nix:/nix:ro" \
     --volume "/tmp:/tmp" \
+    "${gvisor_args[@]}" \
     -- "$PG_BIN/postgres" -D /pgdata -p "$port" &
 
   NUCLEUS_PID=$!
 
   # Wait for PG to come up inside the container
   for _ in $(seq 1 30); do
-    if pg_isready -h 127.0.0.1 -p "$port" -q 2>/dev/null; then
+    if as_pg pg_isready -h 127.0.0.1 -p "$port" -q 2>/dev/null; then
       break
     fi
     sleep 0.5
   done
 
-  if ! pg_isready -h 127.0.0.1 -p "$port" -q 2>/dev/null; then
+  if ! as_pg pg_isready -h 127.0.0.1 -p "$port" -q 2>/dev/null; then
     echo "ERROR: PostgreSQL inside Nucleus failed to start (io_method=$io_method)" >&2
     cat "$pgdata/server.log" 2>/dev/null >&2 || true
     kill "$NUCLEUS_PID" 2>/dev/null || true
