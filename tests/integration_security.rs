@@ -298,7 +298,7 @@ mod tests {
         assert_eq!(meta.permissions().mode() & 0o777, 0o700);
 
         let rootfs_meta = std::fs::metadata(bundle_path.join("rootfs")).unwrap();
-        assert_eq!(rootfs_meta.permissions().mode() & 0o777, 0o700);
+        assert_eq!(rootfs_meta.permissions().mode() & 0o777, 0o755);
 
         let config_meta = std::fs::metadata(bundle_path.join("config.json")).unwrap();
         assert_eq!(config_meta.permissions().mode() & 0o777, 0o600);

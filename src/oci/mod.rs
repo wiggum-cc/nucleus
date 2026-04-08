@@ -750,6 +750,18 @@ impl OciConfig {
                     ],
                 },
                 OciMount {
+                    destination: "/dev/shm".to_string(),
+                    source: "shm".to_string(),
+                    mount_type: "tmpfs".to_string(),
+                    options: vec![
+                        "nosuid".to_string(),
+                        "noexec".to_string(),
+                        "nodev".to_string(),
+                        "mode=1777".to_string(),
+                        "size=65536k".to_string(),
+                    ],
+                },
+                OciMount {
                     destination: "/tmp".to_string(),
                     source: "tmpfs".to_string(),
                     mount_type: "tmpfs".to_string(),
@@ -1333,9 +1345,13 @@ impl OciBundle {
         fs::create_dir_all(&rootfs).map_err(|e| {
             NucleusError::GVisorError(format!("Failed to create rootfs directory: {}", e))
         })?;
-        fs::set_permissions(&rootfs, fs::Permissions::from_mode(0o700)).map_err(|e| {
+        // The rootfs is the container's "/" — it must be traversable by the
+        // container UID which may be non-root (via --user).  Mode 0755 matches
+        // the standard Linux root directory permission and lets gVisor's VFS
+        // permit path traversal for any UID.
+        fs::set_permissions(&rootfs, fs::Permissions::from_mode(0o755)).map_err(|e| {
             NucleusError::GVisorError(format!(
-                "Failed to secure rootfs directory permissions {:?}: {}",
+                "Failed to set rootfs directory permissions {:?}: {}",
                 rootfs, e
             ))
         })?;

@@ -2,7 +2,9 @@
   description = "PostgreSQL 18 benchmark: default I/O vs io_uring, baremetal vs Nucleus";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # Use the same nixpkgs revision as the main nucleus flake so gvisor
+    # builds match and we avoid version skew (e.g. Go build failures).
+    nixpkgs.follows = "nucleus/nixpkgs";
     flake-utils.url = "github:numtide/flake-utils";
     nucleus.url = "path:../..";
   };
@@ -23,6 +25,7 @@
           runtimeInputs = [
             pg18
             nucleusPkg
+            pkgs.gvisor
             pkgs.coreutils
             pkgs.gnugrep
             pkgs.gawk

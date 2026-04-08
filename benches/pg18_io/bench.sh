@@ -83,7 +83,7 @@ write_pg_conf() {
 # --- Benchmark tuning ---
 listen_addresses = '127.0.0.1'
 port = $port
-unix_socket_directories = '$pgdata'
+unix_socket_directories = '/tmp'
 max_connections = 100
 
 # Memory
@@ -217,10 +217,20 @@ declare -a WORKLOADS=("tpcb" "select")
 
 TMPBASE="$(mktemp -d /tmp/pg18bench.XXXXXX)"
 chown "$PG_USER" "$TMPBASE"
-trap 'cleanup_pg "$TMPBASE/pgdata_bare_worker" "$PG_PORT_BARE" 2>/dev/null; cleanup_pg "$TMPBASE/pgdata_bare_io_uring" "$PG_PORT_BARE" 2>/dev/null; cleanup_pg "$TMPBASE/pgdata_nucleus_worker" "$PG_PORT_NUCLEUS" 2>/dev/null; cleanup_pg "$TMPBASE/pgdata_nucleus_io_uring" "$PG_PORT_NUCLEUS" 2>/dev/null; rm -rf "$TMPBASE"' EXIT
+trap 'cleanup_pg "$TMPBASE/pgdata_bare_worker" "$PG_PORT_BARE" 2>/dev/null; cleanup_pg "$TMPBASE/pgdata_bare_io_uring" "$PG_PORT_BARE" 2>/dev/null; cleanup_pg "$TMPBASE/pgdata_nucleus_worker" "$PG_PORT_NUCLEUS" 2>/dev/null; cleanup_pg "$TMPBASE/pgdata_nucleus_io_uring" "$PG_PORT_NUCLEUS" 2>/dev/null; [ "${RUNSC_SYMLINKED:-}" = "1" ] && rm -f /usr/local/bin/runsc; rm -rf "$TMPBASE"' EXIT
 
 PG_BIN="$(dirname "$(command -v initdb)")"
 NUCLEUS_BIN="${NUCLEUS_BIN:-$(command -v nucleus)}"
+
+# Nucleus running as root only looks for runsc in trusted system paths.
+# Symlink the Nix-provided runsc into /usr/local/bin so Nucleus can find it.
+RUNSC_NIX="$(command -v runsc 2>/dev/null || true)"
+if [ -n "$RUNSC_NIX" ] && [ ! -e /usr/local/bin/runsc ]; then
+  mkdir -p /usr/local/bin
+  ln -sf "$RUNSC_NIX" /usr/local/bin/runsc
+  RUNSC_SYMLINKED=1
+fi
+
 echo "PG binary dir: $PG_BIN"
 echo "PG version: $(postgres --version)"
 echo "Nucleus binary: $NUCLEUS_BIN"
@@ -287,8 +297,8 @@ run_nucleus_bench() {
   # `nucleus create` runs the container in the foreground, so we background it.
   # - Host network: pgbench on host connects via 127.0.0.1
   # - Bind-mount pgdata + /nix (for PG binaries) + /tmp
-  # - trusted + allow-degraded-security: minimize security overhead for apples-to-apples I/O benchmark
-  # - native runtime: no gVisor, just namespace/cgroup isolation
+  # - trusted: allow host network and bind-mounts
+  # - gVisor runtime: full sandboxing for realistic production-like isolation
   # Clean up any stale container state from a previous run
   "$NUCLEUS_BIN" delete "pg18-bench-${io_method}" 2>/dev/null || true
 
@@ -310,15 +320,11 @@ run_nucleus_bench() {
     --group "$PG_GID" \
     --network host \
     --allow-host-network \
-    --runtime native \
+    --runtime gvisor \
     --trust-level trusted \
-    --allow-degraded-security \
     --allow-chroot-fallback \
-    --seccomp-log-denied \
     --pids 0 \
     --volume "$pgdata:/pgdata" \
-    --volume "/nix:/nix:ro" \
-    --volume "/tmp:/tmp" \
     "${seccomp_args[@]}" \
     -- "$PG_BIN/postgres" -D /pgdata -p "$port" &
 
