@@ -220,8 +220,10 @@ chown "$PG_USER" "$TMPBASE"
 trap 'cleanup_pg "$TMPBASE/pgdata_bare_worker" "$PG_PORT_BARE" 2>/dev/null; cleanup_pg "$TMPBASE/pgdata_bare_io_uring" "$PG_PORT_BARE" 2>/dev/null; cleanup_pg "$TMPBASE/pgdata_nucleus_worker" "$PG_PORT_NUCLEUS" 2>/dev/null; cleanup_pg "$TMPBASE/pgdata_nucleus_io_uring" "$PG_PORT_NUCLEUS" 2>/dev/null; rm -rf "$TMPBASE"' EXIT
 
 PG_BIN="$(dirname "$(command -v initdb)")"
+NUCLEUS_BIN="${NUCLEUS_BIN:-$(command -v nucleus)}"
 echo "PG binary dir: $PG_BIN"
 echo "PG version: $(postgres --version)"
+echo "Nucleus binary: $NUCLEUS_BIN"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -288,7 +290,7 @@ run_nucleus_bench() {
   # - trusted + allow-degraded-security: minimize security overhead for apples-to-apples I/O benchmark
   # - native runtime: no gVisor, just namespace/cgroup isolation
   # Clean up any stale container state from a previous run
-  nucleus delete "pg18-bench-${io_method}" 2>/dev/null || true
+  "$NUCLEUS_BIN" delete "pg18-bench-${io_method}" 2>/dev/null || true
 
   # For io_uring mode, use a custom seccomp profile that adds io_uring_*
   # syscalls (excluded from nucleus defaults due to kernel CVE history).
@@ -303,7 +305,7 @@ run_nucleus_bench() {
     fi
   fi
 
-  nucleus create \
+  "$NUCLEUS_BIN" create \
     --name "pg18-bench-${io_method}" \
     --user "$PG_UID" \
     --group "$PG_GID" \

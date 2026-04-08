@@ -39,6 +39,10 @@ impl SeccompManager {
             libc::SYS_fcntl,
             libc::SYS_readv,
             libc::SYS_writev,
+            libc::SYS_preadv,
+            libc::SYS_pwritev,
+            libc::SYS_preadv2,
+            libc::SYS_pwritev2,
             libc::SYS_pread64,
             libc::SYS_pwrite64,
             libc::SYS_readlinkat,
@@ -1282,10 +1286,10 @@ mod tests {
         // execveat removed from base (arg-filtered separately).
         // sysinfo removed (L8: leaks host info).
         // prlimit64 moved to arg-filtered (M3).
-        assert_eq!(base.len(), 169);
+        assert_eq!(base.len(), 173);
         assert_eq!(net.len(), 11);
-        assert_eq!(base.len() + 8, 177);
-        assert_eq!(base.len() + net.len() + 8, 188);
+        assert_eq!(base.len() + 8, 181);
+        assert_eq!(base.len() + net.len() + 8, 192);
     }
 
     #[test]
