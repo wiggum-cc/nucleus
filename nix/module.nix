@@ -501,6 +501,8 @@ let
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
 
+      path = [ pkgs.iptables pkgs.slirp4netns ] ++ lib.optionals (pkgs ? gvisor) [ pkgs.gvisor ];
+
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
