@@ -706,6 +706,7 @@ impl BridgeNetwork {
     }
 
     fn is_trusted_store_network_binary(path: &std::path::Path, mode: u32) -> bool {
+        use std::os::unix::fs::MetadataExt;
         if !path.starts_with("/nix/store") {
             return false;
         }
