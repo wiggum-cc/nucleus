@@ -676,28 +676,48 @@ impl BridgeNetwork {
     }
 
     /// Validate a network binary's ownership and permissions.
-    /// Rejects binaries that are group/world-writable or not owned by root/euid.
+    /// Rejects binaries that are group/world-writable or not owned by root/euid,
+    /// except for immutable Nix store artifacts.
     fn validate_network_binary(path: &std::path::Path, name: &str) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
 
-        let meta = std::fs::metadata(path)
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let meta = std::fs::metadata(&resolved)
             .map_err(|e| NucleusError::NetworkError(format!("Cannot stat {}: {}", name, e)))?;
         let mode = meta.mode();
         if mode & 0o022 != 0 {
             return Err(NucleusError::NetworkError(format!(
                 "Binary '{}' at {:?} is writable by group/others (mode {:o}), refusing to execute",
-                name, path, mode
+                name, resolved, mode
             )));
         }
         let owner = meta.uid();
         let euid = nix::unistd::Uid::effective().as_raw();
-        if owner != 0 && owner != euid {
+        if owner != 0
+            && owner != euid
+            && !Self::is_trusted_store_network_binary(&resolved, mode)
+        {
             return Err(NucleusError::NetworkError(format!(
                 "Binary '{}' at {:?} owned by UID {} (expected root or euid {}), refusing to execute",
-                name, path, owner, euid
+                name, resolved, owner, euid
             )));
         }
         Ok(())
+    }
+
+    fn is_trusted_store_network_binary(path: &std::path::Path, mode: u32) -> bool {
+        if !path.starts_with("/nix/store") {
+            return false;
+        }
+        if mode & 0o200 != 0 {
+            return false;
+        }
+        if let Some(parent) = path.parent() {
+            if let Ok(parent_meta) = std::fs::metadata(parent) {
+                return parent_meta.mode() & 0o222 == 0;
+            }
+        }
+        false
     }
 
     fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
