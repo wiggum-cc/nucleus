@@ -39,6 +39,7 @@ impl BridgeDriver {
                 pid,
                 config,
                 container_id,
+                host_is_root,
                 rootless,
             )?)),
             NatBackend::Auto => Err(NucleusError::NetworkError(
@@ -88,6 +89,7 @@ impl UserspaceNetwork {
         pid: u32,
         config: &BridgeConfig,
         container_id: &str,
+        host_is_root: bool,
         rootless: bool,
     ) -> Result<Self> {
         config.validate()?;
@@ -110,10 +112,17 @@ impl UserspaceNetwork {
         Self::clear_cloexec(&exit_read)?;
 
         let slirp = BridgeNetwork::resolve_bin("slirp4netns")?;
+        // Only join the container's user namespace when the host process is
+        // genuinely unprivileged.  A root-owned process can already access any
+        // network namespace via /proc/{pid}/ns/net.  Entering the container's
+        // user namespace would cause the host root mount to become a *locked
+        // mount* in the new mount namespace slirp4netns creates for its sandbox,
+        // and pivot_root(2) cannot pivot away from a locked mount.
+        let needs_userns = rootless && !host_is_root;
         let args = Self::command_args(
             pid,
             config,
-            rootless,
+            needs_userns,
             &api_socket_path,
             ready_write.as_raw_fd(),
             exit_read.as_raw_fd(),
@@ -399,7 +408,7 @@ impl UserspaceNetwork {
     fn command_args(
         pid: u32,
         config: &BridgeConfig,
-        rootless: bool,
+        join_userns: bool,
         api_socket_path: &Path,
         ready_fd: i32,
         exit_fd: i32,
@@ -422,7 +431,7 @@ impl UserspaceNetwork {
             args.push("--disable-dns".to_string());
         }
 
-        if rootless {
+        if join_userns {
             args.push("--userns-path".to_string());
             args.push(format!("/proc/{}/ns/user", pid));
         }
