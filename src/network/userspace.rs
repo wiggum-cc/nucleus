@@ -104,13 +104,6 @@ impl UserspaceNetwork {
         Self::ensure_runtime_dir(&runtime_dir)?;
         let api_socket_path = runtime_dir.join("slirp4netns.sock");
 
-        let (ready_read, ready_write) = nix::unistd::pipe()
-            .map_err(|e| NucleusError::NetworkError(format!("ready pipe: {}", e)))?;
-        let (exit_read, exit_write) = nix::unistd::pipe()
-            .map_err(|e| NucleusError::NetworkError(format!("exit pipe: {}", e)))?;
-        Self::clear_cloexec(&ready_write)?;
-        Self::clear_cloexec(&exit_read)?;
-
         let slirp = BridgeNetwork::resolve_bin("slirp4netns")?;
         // Only join the container's user namespace when the host process is
         // genuinely unprivileged.  A root-owned process can already access any
@@ -119,29 +112,35 @@ impl UserspaceNetwork {
         // mount* in the new mount namespace slirp4netns creates for its sandbox,
         // and pivot_root(2) cannot pivot away from a locked mount.
         let needs_userns = rootless && !host_is_root;
-        let args = Self::command_args(
+
+        let slirp_path = Path::new(&slirp);
+        let (child, exit_write) = match Self::spawn_slirp(
+            slirp_path,
             pid,
             config,
             needs_userns,
             &api_socket_path,
-            ready_write.as_raw_fd(),
-            exit_read.as_raw_fd(),
-        );
-
-        let mut child = Command::new(&slirp)
-            .args(&args)
-            .spawn()
-            .map_err(|e| NucleusError::NetworkError(format!("spawn slirp4netns: {}", e)))?;
-
-        drop(ready_write);
-        drop(exit_read);
-
-        if let Err(e) = Self::wait_until_ready(&mut child, ready_read) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = std::fs::remove_dir_all(&runtime_dir);
-            return Err(e);
-        }
+            true,
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                warn!(
+                    "slirp4netns sandbox failed ({}), retrying without --enable-sandbox",
+                    e
+                );
+                // The sandbox uses pivot_root(2) which can fail in constrained
+                // environments (e.g. QEMU test VMs, nested containers) where
+                // mount propagation or /tmp restrictions prevent the pivot.
+                // Retry without --enable-sandbox; slirp4netns is still
+                // process-isolated via its network namespace.
+                let _ = std::fs::remove_file(&api_socket_path);
+                Self::spawn_slirp(slirp_path, pid, config, needs_userns, &api_socket_path, false)
+                    .map_err(|retry_err| {
+                        let _ = std::fs::remove_dir_all(&runtime_dir);
+                        retry_err
+                    })?
+            }
+        };
 
         let mut network = Self {
             config: config.clone(),
@@ -405,6 +404,49 @@ impl UserspaceNetwork {
         Ok(())
     }
 
+    fn spawn_slirp(
+        slirp_bin: &Path,
+        pid: u32,
+        config: &BridgeConfig,
+        needs_userns: bool,
+        api_socket_path: &Path,
+        enable_sandbox: bool,
+    ) -> Result<(Child, OwnedFd)> {
+        let (ready_read, ready_write) = nix::unistd::pipe()
+            .map_err(|e| NucleusError::NetworkError(format!("ready pipe: {}", e)))?;
+        let (exit_read, exit_write) = nix::unistd::pipe()
+            .map_err(|e| NucleusError::NetworkError(format!("exit pipe: {}", e)))?;
+        Self::clear_cloexec(&ready_write)?;
+        Self::clear_cloexec(&exit_read)?;
+
+        let args = Self::command_args(
+            pid,
+            config,
+            needs_userns,
+            api_socket_path,
+            ready_write.as_raw_fd(),
+            exit_read.as_raw_fd(),
+            enable_sandbox,
+        );
+
+        let mut child = Command::new(slirp_bin)
+            .args(&args)
+            .spawn()
+            .map_err(|e| NucleusError::NetworkError(format!("spawn slirp4netns: {}", e)))?;
+
+        drop(ready_write);
+        drop(exit_read);
+
+        match Self::wait_until_ready(&mut child, ready_read) {
+            Ok(()) => Ok((child, exit_write)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(e)
+            }
+        }
+    }
+
     fn command_args(
         pid: u32,
         config: &BridgeConfig,
@@ -412,6 +454,7 @@ impl UserspaceNetwork {
         api_socket_path: &Path,
         ready_fd: i32,
         exit_fd: i32,
+        enable_sandbox: bool,
     ) -> Vec<String> {
         let mut args = vec![
             "--configure".to_string(),
@@ -424,8 +467,11 @@ impl UserspaceNetwork {
             "--cidr".to_string(),
             config.subnet.clone(),
             "--disable-host-loopback".to_string(),
-            "--enable-sandbox".to_string(),
         ];
+
+        if enable_sandbox {
+            args.push("--enable-sandbox".to_string());
+        }
 
         if !config.dns.is_empty() {
             args.push("--disable-dns".to_string());
@@ -575,7 +621,7 @@ mod tests {
     fn test_slirp_command_args_disable_builtin_dns_when_explicit_dns_is_set() {
         let cfg = BridgeConfig::default().with_dns(vec!["1.1.1.1".to_string()]);
         let args =
-            UserspaceNetwork::command_args(4242, &cfg, true, Path::new("/tmp/slirp.sock"), 5, 6);
+            UserspaceNetwork::command_args(4242, &cfg, true, Path::new("/tmp/slirp.sock"), 5, 6, true);
 
         assert!(args.iter().any(|arg| arg == "--disable-dns"));
         assert!(args.iter().any(|arg| arg == "--userns-path"));
