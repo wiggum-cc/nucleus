@@ -188,7 +188,7 @@ impl CriuRuntime {
         }
 
         // Write metadata
-        let metadata = CheckpointMetadata::from_state(state);
+        let metadata = CheckpointMetadata::from_state(state)?;
         metadata.save(output_dir)?;
         Self::write_checkpoint_hmac(output_dir)?;
 

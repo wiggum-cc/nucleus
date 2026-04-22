@@ -1,10 +1,16 @@
 use crate::error::{NucleusError, Result, StateTransition};
 use crate::resources::{CgroupState, ResourceLimits};
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use std::thread;
+use std::time::Duration;
+use tracing::{debug, info, warn};
 
 const CGROUP_V2_ROOT: &str = "/sys/fs/cgroup";
+const CGROUP_CLEANUP_RETRIES: usize = 50;
+const CGROUP_CLEANUP_SLEEP: Duration = Duration::from_millis(20);
 
 /// Cgroup v2 manager
 ///
@@ -57,6 +63,13 @@ impl Cgroup {
         if let Some(swap_max) = limits.memory_swap_max {
             self.write_value("memory.swap.max", &swap_max.to_string())?;
             debug!("Set memory.swap.max = {}", swap_max);
+        }
+        if limits.memory_bytes.is_some()
+            || limits.memory_high.is_some()
+            || limits.memory_swap_max.is_some()
+        {
+            self.write_value("memory.oom.group", "1")?;
+            debug!("Set memory.oom.group = 1");
         }
 
         // Set CPU limit
@@ -125,6 +138,121 @@ impl Cgroup {
         })
     }
 
+    fn set_frozen(&self, frozen: bool) -> Result<bool> {
+        let freeze_path = self.path.join("cgroup.freeze");
+        if !freeze_path.exists() {
+            return Ok(false);
+        }
+        self.write_value("cgroup.freeze", if frozen { "1" } else { "0" })?;
+        debug!("Set cgroup.freeze = {}", if frozen { 1 } else { 0 });
+        Ok(true)
+    }
+
+    fn parse_cgroup_events_populated(events: &str) -> Result<bool> {
+        for line in events.lines() {
+            if let Some(value) = line.strip_prefix("populated ") {
+                return match value.trim() {
+                    "0" => Ok(false),
+                    "1" => Ok(true),
+                    other => Err(NucleusError::CgroupError(format!(
+                        "Unexpected populated value in cgroup.events: {}",
+                        other
+                    ))),
+                };
+            }
+        }
+        Err(NucleusError::CgroupError(
+            "Missing populated entry in cgroup.events".to_string(),
+        ))
+    }
+
+    fn read_pids(&self) -> Result<Vec<Pid>> {
+        let file_path = self.path.join("cgroup.procs");
+        if !file_path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = fs::read_to_string(&file_path).map_err(|e| {
+            NucleusError::CgroupError(format!("Failed to read {:?}: {}", file_path, e))
+        })?;
+        content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                line.trim().parse::<i32>().map(Pid::from_raw).map_err(|e| {
+                    NucleusError::CgroupError(format!(
+                        "Failed to parse pid '{}' from {:?}: {}",
+                        line.trim(),
+                        file_path,
+                        e
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn is_populated(&self) -> Result<bool> {
+        let events_path = self.path.join("cgroup.events");
+        if events_path.exists() {
+            let events = fs::read_to_string(&events_path).map_err(|e| {
+                NucleusError::CgroupError(format!("Failed to read {:?}: {}", events_path, e))
+            })?;
+            return Self::parse_cgroup_events_populated(&events);
+        }
+        Ok(!self.read_pids()?.is_empty())
+    }
+
+    fn kill_visible_processes(&self) -> Result<()> {
+        for pid in self.read_pids()? {
+            match kill(pid, Signal::SIGKILL) {
+                Ok(()) => {}
+                Err(nix::errno::Errno::ESRCH) => {}
+                Err(e) => {
+                    return Err(NucleusError::CgroupError(format!(
+                        "Failed to SIGKILL pid {} in {:?}: {}",
+                        pid, self.path, e
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn kill_all_processes(&self) -> Result<()> {
+        let kill_path = self.path.join("cgroup.kill");
+        if kill_path.exists() {
+            self.write_value("cgroup.kill", "1")?;
+            debug!("Triggered cgroup.kill for {:?}", self.path);
+        }
+        self.kill_visible_processes()
+    }
+
+    fn wait_until_empty(&self) -> Result<()> {
+        for attempt in 0..CGROUP_CLEANUP_RETRIES {
+            if !self.is_populated()? {
+                return Ok(());
+            }
+            if attempt + 1 < CGROUP_CLEANUP_RETRIES {
+                self.kill_visible_processes()?;
+                thread::sleep(CGROUP_CLEANUP_SLEEP);
+            }
+        }
+
+        let remaining = self
+            .read_pids()?
+            .into_iter()
+            .map(|pid| pid.to_string())
+            .collect::<Vec<_>>();
+        Err(NucleusError::CgroupError(format!(
+            "Timed out waiting for cgroup {:?} to drain (remaining pids: {})",
+            self.path,
+            if remaining.is_empty() {
+                "<unknown>".to_string()
+            } else {
+                remaining.join(", ")
+            }
+        )))
+    }
+
     /// Get current memory usage
     pub fn memory_current(&self) -> Result<u64> {
         let value = self.read_value("memory.current")?;
@@ -149,14 +277,27 @@ impl Cgroup {
     pub fn cleanup(mut self) -> Result<()> {
         info!("Cleaning up cgroup {:?}", self.path);
 
-        // Try to remove the cgroup directory
-        // This will fail if there are still processes in the cgroup
         if self.path.exists() {
-            fs::remove_dir(&self.path).map_err(|e| {
-                // BUG-06: Do NOT set state to Removed on failure – Drop should
-                // still attempt cleanup when the Cgroup is dropped.
-                NucleusError::CgroupError(format!("Failed to remove cgroup: {}", e))
-            })?;
+            let froze = self.set_frozen(true)?;
+            let cleanup_result: Result<()> = (|| {
+                self.kill_all_processes()?;
+                self.wait_until_empty()?;
+                fs::remove_dir(&self.path).map_err(|e| {
+                    // BUG-06: Do NOT set state to Removed on failure – Drop should
+                    // still attempt cleanup when the Cgroup is dropped.
+                    NucleusError::CgroupError(format!("Failed to remove cgroup: {}", e))
+                })?;
+                Ok(())
+            })();
+            if cleanup_result.is_err() && froze {
+                if let Err(e) = self.set_frozen(false) {
+                    warn!(
+                        "Failed to unfreeze cgroup {:?} after cleanup error: {}",
+                        self.path, e
+                    );
+                }
+            }
+            cleanup_result?;
         }
 
         // Only mark as terminal after successful removal
@@ -170,7 +311,13 @@ impl Cgroup {
 impl Drop for Cgroup {
     fn drop(&mut self) {
         if !self.state.is_terminal() && self.path.exists() {
+            let froze = self.set_frozen(true).unwrap_or(false);
+            let _ = self.kill_all_processes();
+            let _ = self.wait_until_empty();
             let _ = fs::remove_dir(&self.path);
+            if self.path.exists() && froze {
+                let _ = self.set_frozen(false);
+            }
         }
     }
 }
@@ -228,6 +375,71 @@ mod tests {
         assert!(
             removed_pos > remove_dir_pos,
             "CgroupState::Removed must be set AFTER remove_dir succeeds, not before"
+        );
+    }
+
+    #[test]
+    fn test_parse_cgroup_events_populated() {
+        assert!(Cgroup::parse_cgroup_events_populated("populated 1\nfrozen 0\n").unwrap());
+        assert!(!Cgroup::parse_cgroup_events_populated("frozen 0\npopulated 0\n").unwrap());
+    }
+
+    #[test]
+    fn test_set_limits_source_enables_memory_oom_group() {
+        let source = include_str!("cgroup.rs");
+        let fn_start = source.find("pub fn set_limits").unwrap();
+        let after = &source[fn_start..];
+        let open = after.find('{').unwrap();
+        let mut depth = 0u32;
+        let mut fn_end = open;
+        for (i, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        fn_end = open + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &after[..fn_end];
+        assert!(
+            body.contains("memory.oom.group"),
+            "set_limits must enable memory.oom.group when memory controls are configured"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_source_kills_processes_before_remove_dir() {
+        let source = include_str!("cgroup.rs");
+        let fn_start = source.find("pub fn cleanup").unwrap();
+        let after = &source[fn_start..];
+        let open = after.find('{').unwrap();
+        let mut depth = 0u32;
+        let mut fn_end = open;
+        for (i, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        fn_end = open + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &after[..fn_end];
+        let freeze_pos = body.find("set_frozen(true)").unwrap();
+        let kill_pos = body.find("kill_all_processes").unwrap();
+        let remove_dir_pos = body.find("remove_dir").unwrap();
+        assert!(
+            freeze_pos < kill_pos && kill_pos < remove_dir_pos,
+            "cleanup must freeze and kill the cgroup before attempting remove_dir"
         );
     }
 }

@@ -157,36 +157,79 @@ pub(crate) fn read_regular_file_nofollow(path: &Path) -> Result<Vec<u8>> {
     Ok(content)
 }
 
+fn decode_mountinfo_field(field: &str) -> String {
+    let mut decoded = String::with_capacity(field.len());
+    let mut chars = field.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            let code: String = chars.by_ref().take(3).collect();
+            match code.as_str() {
+                "040" => decoded.push(' '),
+                "011" => decoded.push('\t'),
+                "012" => decoded.push('\n'),
+                "134" => decoded.push('\\'),
+                _ => {
+                    decoded.push('\\');
+                    decoded.push_str(&code);
+                }
+            }
+        } else {
+            decoded.push(ch);
+        }
+    }
+
+    decoded
+}
+
+fn parse_mountinfo_line(line: &str) -> Option<(String, std::collections::HashSet<String>)> {
+    let (left, _) = line.split_once(" - ")?;
+    let fields: Vec<&str> = left.split_whitespace().collect();
+    if fields.len() < 6 {
+        return None;
+    }
+
+    let mount_point = decode_mountinfo_field(fields[4]);
+    let options = fields[5]
+        .split(',')
+        .map(str::trim)
+        .filter(|opt| !opt.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    Some((mount_point, options))
+}
+
 /// Audit all mounts in the container's mount namespace.
 ///
-/// Reads /proc/self/mounts and verifies that each known mount point carries
-/// its expected flags. In production mode, any missing flag is fatal.
+/// Reads `/proc/self/mountinfo` and verifies that each known mount point carries
+/// its expected per-mount flags. In production mode, any missing flag is fatal.
 /// Returns Ok(()) if all checks pass, or a list of violations.
 pub fn audit_mounts(production_mode: bool) -> Result<()> {
-    let mounts_content = std::fs::read_to_string("/proc/self/mounts").map_err(|e| {
-        NucleusError::FilesystemError(format!("Failed to read /proc/self/mounts: {}", e))
+    let mounts_content = std::fs::read_to_string("/proc/self/mountinfo").map_err(|e| {
+        NucleusError::FilesystemError(format!("Failed to read /proc/self/mountinfo: {}", e))
     })?;
+    let mount_table: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        mounts_content
+            .lines()
+            .filter_map(parse_mountinfo_line)
+            .collect();
 
     let mut violations = Vec::new();
 
     for expectation in PRODUCTION_MOUNT_EXPECTATIONS {
-        // Find the mount entry for this path
-        let mount_entry = mounts_content.lines().find(|line| {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            parts.len() >= 4 && parts[1] == expectation.path
-        });
-
-        if let Some(entry) = mount_entry {
-            let parts: Vec<&str> = entry.split_whitespace().collect();
-            if parts.len() >= 4 {
-                let options = parts[3];
-                for &flag in expectation.required_flags {
-                    if !options.split(',').any(|opt| opt == flag) {
-                        violations.push(format!(
-                            "Mount {} missing required flag '{}' (has: {})",
-                            expectation.path, flag, options
-                        ));
-                    }
+        if let Some(options) = mount_table.get(expectation.path) {
+            for &flag in expectation.required_flags {
+                if !options.contains(flag) {
+                    let rendered = options
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    violations.push(format!(
+                        "Mount {} missing required flag '{}' (has: {})",
+                        expectation.path, flag, rendered
+                    ));
                 }
             }
         } else if expectation.critical && production_mode {
@@ -795,8 +838,45 @@ pub const PROC_NULL_MASKED: &[&str] = &[
     "kpagecgroup",
 ];
 
+/// Paths to remount read-only – matches OCI runtime spec readonlyPaths.
+pub const PROC_READONLY_PATHS: &[&str] = &["bus", "fs", "irq", "sys"];
+
 /// Paths to mask with empty tmpfs (directories).
-pub const PROC_TMPFS_MASKED: &[&str] = &["acpi", "bus", "irq", "scsi", "sys"];
+pub const PROC_TMPFS_MASKED: &[&str] = &["acpi", "scsi"];
+
+fn remount_proc_path_readonly(target: &Path) -> Result<()> {
+    mount(
+        Some(target),
+        target,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to bind-mount {:?} onto itself for read-only remount: {}",
+            target, e
+        ))
+    })?;
+
+    mount(
+        None::<&str>,
+        target,
+        None::<&str>,
+        MsFlags::MS_REMOUNT
+            | MsFlags::MS_BIND
+            | MsFlags::MS_RDONLY
+            | MsFlags::MS_NOSUID
+            | MsFlags::MS_NODEV
+            | MsFlags::MS_NOEXEC,
+        None::<&str>,
+    )
+    .map_err(|e| {
+        NucleusError::FilesystemError(format!("Failed to remount {:?} read-only: {}", target, e))
+    })?;
+
+    Ok(())
+}
 
 /// Mask sensitive /proc paths by bind-mounting /dev/null or tmpfs over them
 ///
@@ -809,6 +889,28 @@ pub fn mask_proc_paths(proc_path: &Path, production: bool) -> Result<()> {
     info!("Masking sensitive /proc paths");
 
     const CRITICAL_PROC_PATHS: &[&str] = &["kcore", "kallsyms", "sysrq-trigger"];
+
+    for name in PROC_READONLY_PATHS {
+        let target = proc_path.join(name);
+        if !target.exists() {
+            continue;
+        }
+        match remount_proc_path_readonly(&target) {
+            Ok(_) => debug!("Remounted /proc/{} read-only", name),
+            Err(e) => {
+                if production {
+                    return Err(NucleusError::FilesystemError(format!(
+                        "Failed to remount /proc/{} read-only in production mode: {}",
+                        name, e
+                    )));
+                }
+                warn!(
+                    "Failed to remount /proc/{} read-only: {} (continuing)",
+                    name, e
+                );
+            }
+        }
+    }
 
     let dev_null = Path::new("/dev/null");
 
@@ -957,6 +1059,34 @@ fn pivot_root_impl(new_root: &Path) -> Result<()> {
 ///
 /// chroot is less secure than pivot_root but works in more situations
 fn chroot_impl(new_root: &Path) -> Result<()> {
+    fn close_non_stdio_fds_after_chroot() -> Result<()> {
+        // Any pre-chroot fd can still reach outside the jail, so close every
+        // non-stdio descriptor before continuing setup inside the fallback root.
+        let ret = unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) };
+        if ret == 0 {
+            return Ok(());
+        }
+
+        let max_fd = match unsafe { libc::sysconf(libc::_SC_OPEN_MAX) } {
+            n if n > 3 && n <= i32::MAX as libc::c_long => n as i32,
+            _ => 1024,
+        };
+
+        for fd in 3..max_fd {
+            if unsafe { libc::close(fd) } != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EBADF) {
+                    return Err(NucleusError::PivotRootError(format!(
+                        "Failed to close inherited fd {} after chroot: {}",
+                        fd, err
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     chroot(new_root)
         .map_err(|e| NucleusError::PivotRootError(format!("chroot syscall failed: {}", e)))?;
 
@@ -964,8 +1094,9 @@ fn chroot_impl(new_root: &Path) -> Result<()> {
     std::env::set_current_dir("/")
         .map_err(|e| NucleusError::PivotRootError(format!("Failed to chdir to /: {}", e)))?;
 
+    close_non_stdio_fds_after_chroot()?;
+
     // L3: Drop CAP_SYS_CHROOT after chroot to prevent escape via nested chroot.
-    // Also close any FDs pointing outside the new root.
     if let Err(e) = caps::drop(
         None,
         caps::CapSet::Bounding,
@@ -1387,13 +1518,74 @@ mod tests {
                 path
             );
         }
-        for path in &["acpi", "bus", "scsi", "sys"] {
+        for path in &["acpi", "scsi"] {
             assert!(
                 PROC_TMPFS_MASKED.contains(path),
                 "/proc/{} must be in tmpfs-masked list (OCI spec)",
                 path
             );
         }
+        for path in &["bus", "fs", "irq", "sys"] {
+            assert!(
+                PROC_READONLY_PATHS.contains(path),
+                "/proc/{} must be in read-only remount list (OCI spec)",
+                path
+            );
+            assert!(
+                !PROC_TMPFS_MASKED.contains(path),
+                "/proc/{} must stay visible read-only, not hidden behind tmpfs",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_mountinfo_line_uses_mountinfo_mount_point_and_flags() {
+        let line =
+            "36 25 0:32 / /run/secrets rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=1024k";
+        let (mount_point, flags) = parse_mountinfo_line(line).unwrap();
+
+        assert_eq!(mount_point, "/run/secrets");
+        assert!(flags.contains("nosuid"));
+        assert!(flags.contains("nodev"));
+        assert!(flags.contains("noexec"));
+    }
+
+    #[test]
+    fn test_parse_mountinfo_line_decodes_escaped_mount_points() {
+        let line = "41 25 0:40 / /path\\040with\\040spaces ro,nosuid,nodev - ext4 /dev/root ro";
+        let (mount_point, flags) = parse_mountinfo_line(line).unwrap();
+
+        assert_eq!(mount_point, "/path with spaces");
+        assert!(flags.contains("ro"));
+    }
+
+    #[test]
+    fn test_chroot_impl_closes_non_stdio_fds() {
+        let source = include_str!("mount.rs");
+        let fn_start = source.find("fn chroot_impl").unwrap();
+        let after = &source[fn_start..];
+        let open = after.find('{').unwrap();
+        let mut depth = 0u32;
+        let mut fn_end = open;
+        for (i, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        fn_end = open + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &after[..fn_end];
+        assert!(
+            body.contains("close_non_stdio_fds_after_chroot()?"),
+            "chroot fallback must close inherited non-stdio fds before continuing setup"
+        );
     }
 
     #[test]

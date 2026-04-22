@@ -4,7 +4,7 @@ use std::path::Path;
 use tracing::info;
 
 /// Context population mode
-#[derive(Debug, Clone, clap::ValueEnum)]
+#[derive(Debug, Clone, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum ContextMode {
     /// Traditional copy (default, backward compatible)
     Copy,

@@ -971,7 +971,6 @@ impl SeccompManager {
         "clock_settime",
         "clock_adjtime",
         "adjtimex",
-        "unshare",
         "kcmp",
         "epoll_pwait2",
         // Futex (non-default)
@@ -1961,6 +1960,16 @@ mod tests {
         assert!(
             !rules.contains_key(&libc::SYS_kexec_load),
             "kexec_load must be blocked even when requested via --seccomp-allow"
+        );
+    }
+
+    #[test]
+    fn test_extra_syscalls_unshare_remains_blocked() {
+        let extra = vec!["unshare".to_string()];
+        let rules = SeccompManager::minimal_filter(true, &extra).unwrap();
+        assert!(
+            !rules.contains_key(&libc::SYS_unshare),
+            "unshare must stay blocked even when requested via --seccomp-allow"
         );
     }
 

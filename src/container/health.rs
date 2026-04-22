@@ -165,40 +165,125 @@ impl Container {
     /// The socket path is validated to prevent writing to arbitrary Unix sockets:
     /// only abstract sockets (`@...`) and absolute paths under `/run/` are accepted.
     pub(super) fn send_sd_notify(socket_path: &str, message: &str) -> Result<()> {
-        use std::os::unix::net::UnixDatagram;
+        #[cfg(target_os = "linux")]
+        use std::os::linux::net::SocketAddrExt as _;
+        use std::os::unix::net::{SocketAddr, UnixDatagram};
+        use std::path::{Path, PathBuf};
+
+        enum NotifyDestination {
+            Filesystem(PathBuf),
+            #[cfg(target_os = "linux")]
+            Abstract(SocketAddr),
+        }
 
         let is_abstract = socket_path.starts_with('@');
         let has_traversal = socket_path.contains("/../")
             || socket_path.ends_with("/..")
             || socket_path.contains('\0');
-        // M9: Canonicalize filesystem paths to resolve symlinks
-        let is_safe_path = if !is_abstract && !has_traversal {
-            if let Ok(canonical) = std::fs::canonicalize(socket_path) {
-                let canonical_str = canonical.to_string_lossy();
-                canonical_str.starts_with("/run/") || canonical_str.starts_with("/var/run/")
-            } else {
-                socket_path.starts_with("/run/") || socket_path.starts_with("/var/run/")
-            }
-        } else {
-            false
-        };
-
-        if (!is_abstract && !is_safe_path) || has_traversal {
+        if has_traversal {
             return Err(NucleusError::ExecError(format!(
                 "Refusing sd_notify to untrusted socket path: {}",
                 socket_path
             )));
         }
 
+        let destination = if is_abstract {
+            #[cfg(target_os = "linux")]
+            {
+                let name = socket_path
+                    .strip_prefix('@')
+                    .ok_or_else(|| {
+                        NucleusError::ExecError(format!(
+                            "Invalid abstract notify socket path: {}",
+                            socket_path
+                        ))
+                    })?
+                    .as_bytes();
+                let addr = SocketAddr::from_abstract_name(name).map_err(|e| {
+                    NucleusError::ExecError(format!(
+                        "Failed to build abstract notify socket address {}: {}",
+                        socket_path, e
+                    ))
+                })?;
+                NotifyDestination::Abstract(addr)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(NucleusError::ExecError(
+                    "Abstract Unix notify sockets are only supported on Linux".to_string(),
+                ));
+            }
+        } else {
+            let socket = Path::new(socket_path);
+            if !socket.is_absolute() {
+                return Err(NucleusError::ExecError(format!(
+                    "Refusing sd_notify to non-absolute socket path: {}",
+                    socket_path
+                )));
+            }
+
+            let resolved = if socket.exists() {
+                std::fs::canonicalize(socket).map_err(|e| {
+                    NucleusError::ExecError(format!(
+                        "Failed to resolve notify socket path {}: {}",
+                        socket_path, e
+                    ))
+                })?
+            } else {
+                let parent = socket.parent().ok_or_else(|| {
+                    NucleusError::ExecError(format!(
+                        "Notify socket path has no parent directory: {}",
+                        socket_path
+                    ))
+                })?;
+                let canonical_parent = std::fs::canonicalize(parent).map_err(|e| {
+                    NucleusError::ExecError(format!(
+                        "Failed to resolve notify socket parent {}: {}",
+                        parent.display(),
+                        e
+                    ))
+                })?;
+                canonical_parent.join(socket.file_name().ok_or_else(|| {
+                    NucleusError::ExecError(format!(
+                        "Notify socket path has no file name: {}",
+                        socket_path
+                    ))
+                })?)
+            };
+
+            if !(resolved.starts_with("/run/") || resolved.starts_with("/var/run/")) {
+                return Err(NucleusError::ExecError(format!(
+                    "Refusing sd_notify to untrusted socket path: {}",
+                    socket_path
+                )));
+            }
+
+            NotifyDestination::Filesystem(resolved)
+        };
+
         let sock = UnixDatagram::unbound().map_err(|e| {
             NucleusError::ExecError(format!("Failed to create notify socket: {}", e))
         })?;
-        sock.send_to(message.as_bytes(), socket_path).map_err(|e| {
-            NucleusError::ExecError(format!(
-                "Failed to send to notify socket {}: {}",
-                socket_path, e
-            ))
-        })?;
+        match &destination {
+            NotifyDestination::Filesystem(path) => {
+                sock.send_to(message.as_bytes(), path).map_err(|e| {
+                    NucleusError::ExecError(format!(
+                        "Failed to send to notify socket {}: {}",
+                        path.display(),
+                        e
+                    ))
+                })?;
+            }
+            #[cfg(target_os = "linux")]
+            NotifyDestination::Abstract(addr) => {
+                sock.send_to_addr(message.as_bytes(), addr).map_err(|e| {
+                    NucleusError::ExecError(format!(
+                        "Failed to send to abstract notify socket {}: {}",
+                        socket_path, e
+                    ))
+                })?;
+            }
+        }
         Ok(())
     }
 
@@ -325,5 +410,32 @@ impl Container {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(target_os = "linux")]
+    use std::os::linux::net::SocketAddrExt as _;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_send_sd_notify_supports_abstract_sockets() {
+        let name = format!("nucleus-health-{}", std::process::id());
+        let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let receiver = match UnixDatagram::bind_addr(&addr) {
+            Ok(receiver) => receiver,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("failed to bind abstract socket: {}", err),
+        };
+
+        Container::send_sd_notify(&format!("@{}", name), "READY=1").unwrap();
+
+        let mut buf = [0u8; 32];
+        let len = receiver.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..len], b"READY=1");
     }
 }

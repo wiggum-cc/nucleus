@@ -2,6 +2,7 @@ use super::{egress, netlink, netns};
 use crate::error::{NucleusError, Result, StateTransition};
 use crate::network::config::{BridgeConfig, EgressPolicy, PortForward};
 use crate::network::NetworkState;
+use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::net::Ipv4Addr;
 use std::os::fd::FromRawFd;
@@ -17,8 +18,18 @@ pub struct BridgeNetwork {
     container_ip: String,
     veth_host: String,
     container_id: String,
-    prev_ip_forward: Option<String>,
+    ip_forward_ref_acquired: bool,
     state: NetworkState,
+}
+
+const IP_FORWARD_SYSCTL_PATH: &str = "/proc/sys/net/ipv4/ip_forward";
+const IP_FORWARD_LOCK_FILE: &str = ".ip_forward.lock";
+const IP_FORWARD_STATE_FILE: &str = ".ip_forward.state";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IpForwardRefState {
+    refcount: u64,
+    original_value: String,
 }
 
 impl BridgeNetwork {
@@ -157,21 +168,10 @@ impl BridgeNetwork {
         )?;
         rollback.nat_added = true;
 
-        // 8. Enable IP forwarding (save previous value for restore on cleanup)
-        let prev_ip_forward = match std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward") {
-            Ok(v) => Some(v.trim().to_string()),
-            Err(e) => {
-                warn!(
-                    "Could not read ip_forward state (will not restore on cleanup): {}",
-                    e
-                );
-                None
-            }
-        };
-        rollback.prev_ip_forward = prev_ip_forward;
-        std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").map_err(|e| {
-            NucleusError::NetworkError(format!("Failed to enable IP forwarding: {}", e))
-        })?;
+        // 8. Enable IP forwarding using a cross-container refcount so one
+        // container cannot disable forwarding while another bridge is still active.
+        Self::acquire_ip_forward_ref()?;
+        rollback.ip_forward_ref_acquired = true;
 
         // 9. Set up port forwarding rules
         for pf in &config.port_forwards {
@@ -187,7 +187,7 @@ impl BridgeNetwork {
             "Bridge network configured: {} -> {} (IP: {})",
             veth_host, veth_container, container_ip
         );
-        let prev_ip_forward = rollback.prev_ip_forward.clone();
+        let ip_forward_ref_acquired = rollback.ip_forward_ref_acquired;
         rollback.disarm();
 
         Ok(Self {
@@ -195,7 +195,7 @@ impl BridgeNetwork {
             container_ip,
             veth_host,
             container_id: container_id.to_string(),
-            prev_ip_forward,
+            ip_forward_ref_acquired,
             state: net_state,
         })
     }
@@ -242,14 +242,11 @@ impl BridgeNetwork {
         // Delete veth pair (deleting one end removes both)
         let _ = netlink::del_link(&self.veth_host);
 
-        // Restore previous ip_forward state if we changed it
-        if let Some(ref prev) = self.prev_ip_forward {
-            if prev == "0" {
-                if let Err(e) = std::fs::write("/proc/sys/net/ipv4/ip_forward", "0") {
-                    warn!("Failed to restore ip_forward to 0: {}", e);
-                } else {
-                    info!("Restored net.ipv4.ip_forward to 0");
-                }
+        if self.ip_forward_ref_acquired {
+            if let Err(e) = Self::release_ip_forward_ref() {
+                warn!("Failed to release ip_forward refcount: {}", e);
+            } else {
+                self.ip_forward_ref_acquired = false;
             }
         }
 
@@ -287,10 +284,9 @@ impl BridgeNetwork {
 
         let _ = netlink::del_link(&self.veth_host);
 
-        if let Some(ref prev) = self.prev_ip_forward {
-            if prev == "0" {
-                let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", "0");
-            }
+        if self.ip_forward_ref_acquired {
+            let _ = Self::release_ip_forward_ref();
+            self.ip_forward_ref_acquired = false;
         }
 
         self.state = NetworkState::Cleaned;
@@ -595,6 +591,195 @@ impl BridgeNetwork {
         }
     }
 
+    fn ip_forward_lock_path(alloc_dir: &std::path::Path) -> std::path::PathBuf {
+        alloc_dir.join(IP_FORWARD_LOCK_FILE)
+    }
+
+    fn ip_forward_state_path(alloc_dir: &std::path::Path) -> std::path::PathBuf {
+        alloc_dir.join(IP_FORWARD_STATE_FILE)
+    }
+
+    fn read_ip_forward_value(sysctl_path: &std::path::Path) -> Result<String> {
+        std::fs::read_to_string(sysctl_path)
+            .map(|value| value.trim().to_string())
+            .map_err(|e| {
+                NucleusError::NetworkError(format!(
+                    "Failed to read {}: {}",
+                    sysctl_path.display(),
+                    e
+                ))
+            })
+    }
+
+    fn write_ip_forward_value(sysctl_path: &std::path::Path, value: &str) -> Result<()> {
+        std::fs::write(sysctl_path, value).map_err(|e| {
+            NucleusError::NetworkError(format!(
+                "Failed to write {} to {}: {}",
+                value,
+                sysctl_path.display(),
+                e
+            ))
+        })
+    }
+
+    fn load_ip_forward_state(alloc_dir: &std::path::Path) -> Result<Option<IpForwardRefState>> {
+        let state_path = Self::ip_forward_state_path(alloc_dir);
+        match std::fs::read_to_string(&state_path) {
+            Ok(content) => serde_json::from_str(&content).map(Some).map_err(|e| {
+                NucleusError::NetworkError(format!(
+                    "Failed to parse ip_forward refcount state {:?}: {}",
+                    state_path, e
+                ))
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(NucleusError::NetworkError(format!(
+                "Failed to read ip_forward refcount state {:?}: {}",
+                state_path, e
+            ))),
+        }
+    }
+
+    fn store_ip_forward_state(
+        alloc_dir: &std::path::Path,
+        state: &IpForwardRefState,
+    ) -> Result<()> {
+        let state_path = Self::ip_forward_state_path(alloc_dir);
+        let encoded = serde_json::to_vec(state).map_err(|e| {
+            NucleusError::NetworkError(format!(
+                "Failed to serialize ip_forward refcount state {:?}: {}",
+                state_path, e
+            ))
+        })?;
+        std::fs::write(&state_path, encoded).map_err(|e| {
+            NucleusError::NetworkError(format!(
+                "Failed to persist ip_forward refcount state {:?}: {}",
+                state_path, e
+            ))
+        })
+    }
+
+    fn remove_ip_forward_state(alloc_dir: &std::path::Path) -> Result<()> {
+        let state_path = Self::ip_forward_state_path(alloc_dir);
+        match std::fs::remove_file(&state_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(NucleusError::NetworkError(format!(
+                "Failed to remove ip_forward refcount state {:?}: {}",
+                state_path, e
+            ))),
+        }
+    }
+
+    fn acquire_ip_forward_ref() -> Result<()> {
+        let alloc_dir = Self::ip_alloc_dir();
+        Self::acquire_ip_forward_ref_in_dir(
+            &alloc_dir,
+            std::path::Path::new(IP_FORWARD_SYSCTL_PATH),
+        )
+    }
+
+    fn acquire_ip_forward_ref_in_dir(
+        alloc_dir: &std::path::Path,
+        sysctl_path: &std::path::Path,
+    ) -> Result<()> {
+        Self::ensure_alloc_dir(alloc_dir)?;
+        let lock_path = Self::ip_forward_lock_path(alloc_dir);
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| {
+                NucleusError::NetworkError(format!(
+                    "Failed to open ip_forward lock {:?}: {}",
+                    lock_path, e
+                ))
+            })?;
+        let lock_ret = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+        if lock_ret != 0 {
+            return Err(NucleusError::NetworkError(format!(
+                "Failed to acquire ip_forward lock: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        let mut state = match Self::load_ip_forward_state(alloc_dir)? {
+            Some(state) => state,
+            None => {
+                let original_value = Self::read_ip_forward_value(sysctl_path)?;
+                let state = IpForwardRefState {
+                    refcount: 0,
+                    original_value,
+                };
+                Self::store_ip_forward_state(alloc_dir, &state)?;
+                state
+            }
+        };
+
+        if state.refcount == 0 {
+            Self::write_ip_forward_value(sysctl_path, "1")?;
+        }
+        state.refcount = state.refcount.checked_add(1).ok_or_else(|| {
+            NucleusError::NetworkError("ip_forward refcount overflow".to_string())
+        })?;
+        Self::store_ip_forward_state(alloc_dir, &state)
+    }
+
+    fn release_ip_forward_ref() -> Result<()> {
+        let alloc_dir = Self::ip_alloc_dir();
+        Self::release_ip_forward_ref_in_dir(
+            &alloc_dir,
+            std::path::Path::new(IP_FORWARD_SYSCTL_PATH),
+        )
+    }
+
+    fn release_ip_forward_ref_in_dir(
+        alloc_dir: &std::path::Path,
+        sysctl_path: &std::path::Path,
+    ) -> Result<()> {
+        if !alloc_dir.exists() {
+            return Ok(());
+        }
+        let lock_path = Self::ip_forward_lock_path(alloc_dir);
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| {
+                NucleusError::NetworkError(format!(
+                    "Failed to open ip_forward lock {:?}: {}",
+                    lock_path, e
+                ))
+            })?;
+        let lock_ret = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+        if lock_ret != 0 {
+            return Err(NucleusError::NetworkError(format!(
+                "Failed to acquire ip_forward lock: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        let Some(mut state) = Self::load_ip_forward_state(alloc_dir)? else {
+            return Ok(());
+        };
+
+        if state.refcount == 0 {
+            return Self::remove_ip_forward_state(alloc_dir);
+        }
+
+        state.refcount -= 1;
+        if state.refcount == 0 {
+            Self::write_ip_forward_value(sysctl_path, &state.original_value)?;
+            Self::remove_ip_forward_state(alloc_dir)?;
+            info!("Restored net.ipv4.ip_forward to {}", state.original_value);
+        } else {
+            Self::store_ip_forward_state(alloc_dir, &state)?;
+        }
+
+        Ok(())
+    }
+
     /// Read the start time (field 22) from /proc/<pid>/stat to detect PID recycling.
     /// Returns 0 if the process does not exist or the field cannot be parsed.
     fn read_pid_start_ticks(pid: u32) -> u64 {
@@ -693,10 +878,7 @@ impl BridgeNetwork {
         }
         let owner = meta.uid();
         let euid = nix::unistd::Uid::effective().as_raw();
-        if owner != 0
-            && owner != euid
-            && !Self::is_trusted_store_network_binary(&resolved, mode)
-        {
+        if owner != 0 && owner != euid && !Self::is_trusted_store_network_binary(&resolved, mode) {
             return Err(NucleusError::NetworkError(format!(
                 "Binary '{}' at {:?} owned by UID {} (expected root or euid {}), refusing to execute",
                 name, resolved, owner, euid
@@ -866,6 +1048,7 @@ impl BridgeNetwork {
             // memfd dropped here via the returned Err, closing the fd automatically
             NucleusError::NetworkError(format!("Failed to bind mount resolv.conf: {}", e))
         })?;
+        Self::harden_resolv_conf_bind(&target)?;
 
         // memfd dropped here – the mount holds a kernel reference to the file,
         // so it survives the fd close.
@@ -914,6 +1097,7 @@ impl BridgeNetwork {
         .map_err(|e| {
             NucleusError::NetworkError(format!("Failed to bind mount resolv.conf: {}", e))
         })?;
+        Self::harden_resolv_conf_bind(&target)?;
 
         // The bind mount holds a reference to the inode, so we can safely
         // unlink the staging path to avoid leaking DNS server info on disk.
@@ -923,6 +1107,29 @@ impl BridgeNetwork {
 
         info!("Bind-mounted resolv.conf for bridge networking (rootfs mode, staging)");
         Ok(())
+    }
+
+    fn harden_resolv_conf_bind(target: &std::path::Path) -> Result<()> {
+        use nix::mount::{mount, MsFlags};
+
+        mount(
+            None::<&str>,
+            target,
+            None::<&str>,
+            MsFlags::MS_REMOUNT
+                | MsFlags::MS_BIND
+                | MsFlags::MS_RDONLY
+                | MsFlags::MS_NOSUID
+                | MsFlags::MS_NODEV
+                | MsFlags::MS_NOEXEC,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            NucleusError::NetworkError(format!(
+                "Failed to remount resolv.conf with hardened flags at {:?}: {}",
+                target, e
+            ))
+        })
     }
 }
 
@@ -938,7 +1145,7 @@ struct SetupRollback {
     veth_created: bool,
     nat_added: bool,
     port_forwards: Vec<(String, PortForward)>,
-    prev_ip_forward: Option<String>,
+    ip_forward_ref_acquired: bool,
     reserved_ip: Option<(std::path::PathBuf, String)>,
     armed: bool,
 }
@@ -955,7 +1162,7 @@ impl SetupRollback {
             veth_created: false,
             nat_added: false,
             port_forwards: Vec::new(),
-            prev_ip_forward: None,
+            ip_forward_ref_acquired: false,
             reserved_ip,
             armed: true,
         }
@@ -1005,6 +1212,12 @@ impl Drop for SetupRollback {
         if self.veth_created {
             if let Err(e) = netlink::del_link(&self.veth_host) {
                 warn!("Rollback: failed to delete veth {}: {}", self.veth_host, e);
+            }
+        }
+
+        if self.ip_forward_ref_acquired {
+            if let Err(e) = BridgeNetwork::release_ip_forward_ref() {
+                warn!("Rollback: failed to release ip_forward refcount: {}", e);
             }
         }
 
@@ -1061,7 +1274,7 @@ mod tests {
             veth_created: false,
             nat_added: false,
             port_forwards: Vec::new(),
-            prev_ip_forward: None,
+            ip_forward_ref_acquired: false,
             reserved_ip: Some((temp.path().to_path_buf(), "rollback".to_string())),
             armed: true,
         };
@@ -1071,6 +1284,27 @@ mod tests {
         assert!(
             !temp.path().join("rollback.ip").exists(),
             "rollback must release reserved IP files on setup failure"
+        );
+    }
+
+    #[test]
+    fn test_ip_forward_refcount_restores_original_only_after_last_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let sysctl = temp.path().join("ip_forward");
+        std::fs::write(&sysctl, "0").unwrap();
+
+        BridgeNetwork::acquire_ip_forward_ref_in_dir(temp.path(), &sysctl).unwrap();
+        BridgeNetwork::acquire_ip_forward_ref_in_dir(temp.path(), &sysctl).unwrap();
+        assert_eq!(std::fs::read_to_string(&sysctl).unwrap(), "1");
+
+        BridgeNetwork::release_ip_forward_ref_in_dir(temp.path(), &sysctl).unwrap();
+        assert_eq!(std::fs::read_to_string(&sysctl).unwrap(), "1");
+
+        BridgeNetwork::release_ip_forward_ref_in_dir(temp.path(), &sysctl).unwrap();
+        assert_eq!(std::fs::read_to_string(&sysctl).unwrap(), "0");
+        assert!(
+            !temp.path().join(IP_FORWARD_STATE_FILE).exists(),
+            "state file must be removed when the last bridge releases ip_forward"
         );
     }
 

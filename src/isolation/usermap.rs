@@ -153,38 +153,69 @@ impl UserNamespaceMapper {
     /// This must be called after unshare(CLONE_NEWUSER) and before any other
     /// namespace operations
     pub fn setup_mappings(&self) -> Result<()> {
-        info!("Setting up user namespace mappings");
+        if !self.can_self_map_current_process() {
+            return Err(NucleusError::NamespaceError(
+                "This user namespace mapping must be written from a process outside the new \
+                 user namespace; use write_mappings_for_pid() from the parent after fork"
+                    .to_string(),
+            ));
+        }
 
-        // Disable setgroups to allow GID mapping without CAP_SETGID
-        self.write_setgroups_deny()?;
+        self.write_mappings_for_pid(std::process::id())
+    }
 
-        // Write UID mappings
-        self.write_uid_map()?;
+    /// Write UID/GID mappings for the given process from an external writer.
+    ///
+    /// For privileged multi-ID mappings, Linux requires a task outside the new
+    /// user namespace to write `/proc/<pid>/{uid,gid}_map`.
+    pub fn write_mappings_for_pid(&self, pid: u32) -> Result<()> {
+        info!("Setting up user namespace mappings for pid {}", pid);
 
-        // Write GID mappings
-        self.write_gid_map()?;
+        if self.should_deny_setgroups() {
+            self.write_setgroups_deny(pid)?;
+        }
 
-        info!("Successfully configured user namespace mappings");
+        self.write_uid_map(pid)?;
+        self.write_gid_map(pid)?;
+
+        info!(
+            "Successfully configured user namespace mappings for pid {}",
+            pid
+        );
         Ok(())
     }
 
-    /// Write to /proc/self/setgroups to deny setgroups(2)
+    fn can_self_map_current_process(&self) -> bool {
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+
+        self.config.uid_mappings.len() == 1
+            && self.config.gid_mappings.len() == 1
+            && self.config.uid_mappings[0] == IdMapping::new(0, uid, 1)
+            && self.config.gid_mappings[0] == IdMapping::new(0, gid, 1)
+    }
+
+    fn should_deny_setgroups(&self) -> bool {
+        self.config.gid_mappings.len() == 1 && self.config.gid_mappings[0].count == 1
+    }
+
+    /// Write to /proc/<pid>/setgroups to deny setgroups(2)
     ///
-    /// This is required for unprivileged user namespace mapping
-    fn write_setgroups_deny(&self) -> Result<()> {
-        let path = "/proc/self/setgroups";
+    /// This is required for the unprivileged single-ID gid_map case.
+    fn write_setgroups_deny(&self, pid: u32) -> Result<()> {
+        let path = format!("/proc/{}/setgroups", pid);
         debug!("Writing 'deny' to {}", path);
 
-        fs::write(path, "deny\n").map_err(|e| {
+        fs::write(&path, "deny\n").map_err(|e| {
             NucleusError::NamespaceError(format!("Failed to write to {}: {}", path, e))
         })?;
 
         Ok(())
     }
 
-    /// Write UID mappings to /proc/self/uid_map
-    fn write_uid_map(&self) -> Result<()> {
-        let path = "/proc/self/uid_map";
+    /// Write UID mappings to /proc/<pid>/uid_map
+    fn write_uid_map(&self, pid: u32) -> Result<()> {
+        let path = format!("/proc/{}/uid_map", pid);
         let mut content = String::new();
 
         for mapping in &self.config.uid_mappings {
@@ -193,16 +224,16 @@ impl UserNamespaceMapper {
 
         debug!("Writing UID mappings to {}: {}", path, content.trim());
 
-        fs::write(path, &content).map_err(|e| {
+        fs::write(&path, &content).map_err(|e| {
             NucleusError::NamespaceError(format!("Failed to write UID mappings: {}", e))
         })?;
 
         Ok(())
     }
 
-    /// Write GID mappings to /proc/self/gid_map
-    fn write_gid_map(&self) -> Result<()> {
-        let path = "/proc/self/gid_map";
+    /// Write GID mappings to /proc/<pid>/gid_map
+    fn write_gid_map(&self, pid: u32) -> Result<()> {
+        let path = format!("/proc/{}/gid_map", pid);
         let mut content = String::new();
 
         for mapping in &self.config.gid_mappings {
@@ -211,7 +242,7 @@ impl UserNamespaceMapper {
 
         debug!("Writing GID mappings to {}: {}", path, content.trim());
 
-        fs::write(path, &content).map_err(|e| {
+        fs::write(&path, &content).map_err(|e| {
             NucleusError::NamespaceError(format!("Failed to write GID mappings: {}", e))
         })?;
 
@@ -263,6 +294,21 @@ mod tests {
             UserNamespaceConfig::custom(uid_mappings.clone(), gid_mappings.clone()).unwrap();
         assert_eq!(config.uid_mappings, uid_mappings);
         assert_eq!(config.gid_mappings, gid_mappings);
+    }
+
+    #[test]
+    fn test_rootless_mapping_can_self_map_current_process() {
+        let mapper = UserNamespaceMapper::new(UserNamespaceConfig::rootless());
+        assert!(mapper.can_self_map_current_process());
+        assert!(mapper.should_deny_setgroups());
+    }
+
+    #[test]
+    fn test_root_remapped_requires_external_writer() {
+        let mapper = UserNamespaceMapper::new(UserNamespaceConfig::root_remapped());
+        assert!(!mapper.can_self_map_current_process());
+        assert!(!mapper.should_deny_setgroups());
+        assert!(mapper.setup_mappings().is_err());
     }
 
     // Note: Testing actual mapping setup requires user namespace creation

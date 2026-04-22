@@ -10,7 +10,7 @@ use crate::filesystem::{
     switch_root, verify_context_manifest, verify_rootfs_attestation, FilesystemState,
     LazyContextPopulator, TmpfsMount,
 };
-use crate::isolation::NamespaceManager;
+use crate::isolation::{NamespaceManager, UserNamespaceMapper};
 use crate::network::{BridgeDriver, BridgeNetwork, NatBackend, NetworkMode, UserspaceNetwork};
 use crate::resources::Cgroup;
 use crate::security::{
@@ -309,10 +309,28 @@ impl Container {
         } else {
             None
         };
+        let needs_external_userns_mapping = config.user_ns_config.is_some() && !config.use_gvisor;
 
         // Child notifies parent after namespaces are ready.
         let (ready_read, ready_write) = pipe().map_err(|e| {
             NucleusError::ExecError(format!("Failed to create namespace sync pipe: {}", e))
+        })?;
+        let userns_sync = if needs_external_userns_mapping {
+            let (request_read, request_write) = pipe().map_err(|e| {
+                NucleusError::ExecError(format!(
+                    "Failed to create user namespace request pipe: {}",
+                    e
+                ))
+            })?;
+            let (ack_read, ack_write) = pipe().map_err(|e| {
+                NucleusError::ExecError(format!("Failed to create user namespace ack pipe: {}", e))
+            })?;
+            Some((request_read, request_write, ack_read, ack_write))
+        } else {
+            None
+        };
+        let (attach_read, attach_write) = pipe().map_err(|e| {
+            NucleusError::ExecError(format!("Failed to create cgroup attach sync pipe: {}", e))
         })?;
 
         // M11: fork() in multi-threaded context. Flush log buffers and drop
@@ -325,11 +343,53 @@ impl Container {
         match unsafe { fork() }? {
             ForkResult::Parent { child } => {
                 drop(ready_write);
+                drop(attach_read);
+                let (userns_request_read, userns_ack_write) =
+                    if let Some((request_read, request_write, ack_read, ack_write)) = userns_sync {
+                        drop(request_write);
+                        drop(ack_read);
+                        (Some(request_read), Some(ack_write))
+                    } else {
+                        (None, None)
+                    };
                 info!("Forked child process: {}", child);
 
                 // Use a closure so that on any error we kill the child process
                 // instead of leaving it orphaned and blocked on the exec FIFO.
                 let parent_setup = || -> Result<CreatedContainer> {
+                    if needs_external_userns_mapping {
+                        let user_config = config.user_ns_config.as_ref().ok_or_else(|| {
+                            NucleusError::ExecError(
+                                "Missing user namespace configuration in parent".to_string(),
+                            )
+                        })?;
+                        let request_read = userns_request_read.as_ref().ok_or_else(|| {
+                            NucleusError::ExecError(
+                                "Missing user namespace request pipe in parent".to_string(),
+                            )
+                        })?;
+                        let ack_write = userns_ack_write.as_ref().ok_or_else(|| {
+                            NucleusError::ExecError(
+                                "Missing user namespace ack pipe in parent".to_string(),
+                            )
+                        })?;
+
+                        Self::wait_for_sync_byte(
+                            request_read,
+                            &format!(
+                                "Child {} exited before requesting user namespace mappings",
+                                child
+                            ),
+                            "Failed waiting for child user namespace request",
+                        )?;
+                        UserNamespaceMapper::new(user_config.clone())
+                            .write_mappings_for_pid(child.as_raw() as u32)?;
+                        Self::send_sync_byte(
+                            ack_write,
+                            "Failed to notify child that user namespace mappings are ready",
+                        )?;
+                    }
+
                     let target_pid = Self::wait_for_namespace_ready(&ready_read, child)?;
 
                     let cgroup_path = cgroup_opt
@@ -380,6 +440,10 @@ impl Container {
                     if let Some(ref mut cgroup) = cgroup_opt {
                         cgroup.attach_process(target_pid)?;
                     }
+                    Self::send_sync_byte(
+                        &attach_write,
+                        "Failed to notify child that cgroup attachment is complete",
+                    )?;
 
                     if let NetworkMode::Bridge(ref bridge_config) = config.network {
                         match BridgeDriver::setup_with_id(
@@ -445,10 +509,25 @@ impl Container {
             }
             ForkResult::Child => {
                 drop(ready_read);
+                drop(attach_write);
+                let (userns_request_write, userns_ack_read) =
+                    if let Some((request_read, request_write, ack_read, ack_write)) = userns_sync {
+                        drop(request_read);
+                        drop(ack_write);
+                        (Some(request_write), Some(ack_read))
+                    } else {
+                        (None, None)
+                    };
                 // H6: Close inherited FDs > 2 to prevent leaking host sockets/pipes
                 Self::sanitize_fds();
                 let temp_container = Container { config, runsc_path };
-                match temp_container.setup_and_exec(Some(ready_write), exec_fifo) {
+                match temp_container.setup_and_exec(
+                    Some(ready_write),
+                    userns_request_write,
+                    userns_ack_read,
+                    Some(attach_read),
+                    exec_fifo,
+                ) {
                     Ok(_) => unreachable!(),
                     Err(e) => {
                         error!("Container setup failed: {}", e);
@@ -496,6 +575,9 @@ impl Container {
     fn setup_and_exec(
         &self,
         ready_pipe: Option<OwnedFd>,
+        userns_request_pipe: Option<OwnedFd>,
+        userns_ack_pipe: Option<OwnedFd>,
+        cgroup_attach_pipe: Option<OwnedFd>,
         exec_fifo: Option<PathBuf>,
     ) -> Result<()> {
         let is_rootless = self.config.user_ns_config.is_some();
@@ -521,15 +603,41 @@ impl Container {
             if let Some(fd) = ready_pipe {
                 Self::notify_namespace_ready(&fd, std::process::id())?;
             }
+            if let Some(fd) = cgroup_attach_pipe.as_ref() {
+                Self::wait_for_sync_byte(
+                    fd,
+                    "Parent closed cgroup attach pipe before signalling gVisor child",
+                    "Failed waiting for cgroup attach acknowledgement",
+                )?;
+            }
             return self.setup_and_exec_gvisor();
         }
 
         // 1. Create namespaces in child and optionally configure user mapping.
         let mut namespace_mgr = NamespaceManager::new(self.config.namespaces.clone());
-        if let Some(user_config) = &self.config.user_ns_config {
-            namespace_mgr = namespace_mgr.with_user_mapping(user_config.clone());
-        }
         namespace_mgr.unshare_namespaces()?;
+        if self.config.user_ns_config.is_some() {
+            let request_fd = userns_request_pipe.as_ref().ok_or_else(|| {
+                NucleusError::ExecError(
+                    "Missing user namespace request pipe in container child".to_string(),
+                )
+            })?;
+            let ack_fd = userns_ack_pipe.as_ref().ok_or_else(|| {
+                NucleusError::ExecError(
+                    "Missing user namespace acknowledgement pipe in container child".to_string(),
+                )
+            })?;
+
+            Self::send_sync_byte(
+                request_fd,
+                "Failed to request user namespace mappings from parent",
+            )?;
+            Self::wait_for_sync_byte(
+                ack_fd,
+                "Parent closed user namespace ack pipe before mappings were written",
+                "Failed waiting for parent to finish user namespace mappings",
+            )?;
+        }
 
         // CLONE_NEWPID only applies to children created after unshare().
         // Create a child that will become PID 1 in the new namespace and exec the workload.
@@ -543,11 +651,27 @@ impl Container {
                     std::process::exit(Self::wait_for_pid_namespace_child(child));
                 }
                 ForkResult::Child => {
+                    if let Some(fd) = cgroup_attach_pipe.as_ref() {
+                        Self::wait_for_sync_byte(
+                            fd,
+                            "Parent closed cgroup attach pipe before signalling PID 1 child",
+                            "Failed waiting for cgroup attach acknowledgement",
+                        )?;
+                    }
                     // Continue container setup as PID 1 in the new namespace.
                 }
             }
-        } else if let Some(fd) = ready_pipe {
-            Self::notify_namespace_ready(&fd, std::process::id())?;
+        } else {
+            if let Some(fd) = ready_pipe {
+                Self::notify_namespace_ready(&fd, std::process::id())?;
+            }
+            if let Some(fd) = cgroup_attach_pipe.as_ref() {
+                Self::wait_for_sync_byte(
+                    fd,
+                    "Parent closed cgroup attach pipe before signalling container child",
+                    "Failed waiting for cgroup attach acknowledgement",
+                )?;
+            }
         }
 
         // Namespace: Unshared -> Entered (process is now inside all namespaces)
@@ -1133,6 +1257,41 @@ impl Container {
             written += n;
         }
         Ok(())
+    }
+
+    fn send_sync_byte(fd: &OwnedFd, error_context: &str) -> Result<()> {
+        let mut written = 0;
+        let payload = [1u8];
+        while written < payload.len() {
+            let n = write(fd, &payload[written..])
+                .map_err(|e| NucleusError::ExecError(format!("{}: {}", error_context, e)))?;
+            if n == 0 {
+                return Err(NucleusError::ExecError(format!(
+                    "{}: short write",
+                    error_context
+                )));
+            }
+            written += n;
+        }
+        Ok(())
+    }
+
+    fn wait_for_sync_byte(fd: &OwnedFd, eof_context: &str, error_context: &str) -> Result<()> {
+        let mut payload = [0u8; 1];
+        loop {
+            match read(fd, &mut payload) {
+                Err(nix::errno::Errno::EINTR) => continue,
+                Ok(1) => return Ok(()),
+                Ok(0) => return Err(NucleusError::ExecError(eof_context.to_string())),
+                Ok(_) => {
+                    return Err(NucleusError::ExecError(format!(
+                        "{}: invalid sync payload",
+                        error_context
+                    )))
+                }
+                Err(e) => return Err(NucleusError::ExecError(format!("{}: {}", error_context, e))),
+            }
+        }
     }
 
     fn wait_for_pid_namespace_child(child: Pid) -> i32 {

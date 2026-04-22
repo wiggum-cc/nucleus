@@ -20,7 +20,17 @@ pub enum GVisorNetworkMode {
 }
 
 /// Platform backend for gVisor's Sentry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum GVisorPlatform {
     /// systrap backend, the current default and most broadly compatible option.
     #[default]

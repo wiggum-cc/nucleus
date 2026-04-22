@@ -51,7 +51,17 @@ pub fn generate_container_id() -> crate::error::Result<String> {
 /// Trust level for a container workload.
 ///
 /// Determines the minimum isolation guarantees the runtime must enforce.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum TrustLevel {
     /// Native kernel isolation (namespaces + seccomp + Landlock) is acceptable.
     Trusted,
@@ -64,7 +74,17 @@ pub enum TrustLevel {
 ///
 /// Determines whether the container runs as an ephemeral agent sandbox
 /// or a long-running production service with stricter requirements.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum ServiceMode {
     /// Ephemeral agent workload (default). Allows degraded fallbacks.
     #[default]
@@ -81,7 +101,9 @@ pub enum ServiceMode {
 ///
 /// Parsed by clap at argument time – invalid values are caught immediately.
 /// The variant triggers additional logic in `apply_runtime_selection`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
+)]
 pub enum RuntimeSelection {
     /// gVisor sandbox runtime (default). Provides kernel-level isolation.
     #[value(name = "gvisor")]
@@ -95,7 +117,9 @@ pub enum RuntimeSelection {
 ///
 /// Parsed by clap at argument time. The `bridge` variant carries additional
 /// configuration that is attached after parsing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
+)]
 pub enum NetworkModeArg {
     /// No network (default).
     #[value(name = "none")]
@@ -109,7 +133,9 @@ pub enum NetworkModeArg {
 }
 
 /// Required host kernel lockdown mode, when asserted by the runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
+)]
 pub enum KernelLockdownMode {
     /// Integrity mode blocks kernel writes from privileged userspace.
     Integrity,
@@ -383,7 +409,17 @@ pub struct ContainerConfig {
 }
 
 /// Seccomp operating mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum SeccompMode {
     /// Normal enforcement – deny unlisted syscalls.
     #[default]
@@ -860,11 +896,12 @@ impl ContainerConfig {
 
     /// Validate runtime-specific feature support.
     pub fn validate_runtime_support(&self) -> crate::error::Result<()> {
+        self.limits.validate_runtime_sanity()?;
+
         if let Some(user_ns_config) = &self.user_ns_config {
             if !self.process_identity.additional_gids.is_empty() {
                 return Err(crate::error::NucleusError::ConfigError(
-                    "Supplementary groups are unsupported with user namespaces because \
-                     /proc/self/setgroups is denied"
+                    "Supplementary groups are currently unsupported with user namespaces"
                         .to_string(),
                 ));
             }
@@ -937,9 +974,16 @@ impl ContainerConfig {
             ));
         }
 
-        if self.seccomp_profile.is_some() || self.seccomp_log_denied {
+        if self.seccomp_log_denied {
             return Err(crate::error::NucleusError::ConfigError(
-                "gVisor runtime does not support custom seccomp profiles or seccomp deny logging; use --runtime native"
+                "gVisor runtime does not support seccomp deny logging; use --runtime native"
+                    .to_string(),
+            ));
+        }
+
+        if !self.seccomp_allow_syscalls.is_empty() {
+            return Err(crate::error::NucleusError::ConfigError(
+                "gVisor runtime does not support --seccomp-allow; use a custom --seccomp-profile or --runtime native"
                     .to_string(),
             ));
         }
@@ -1327,14 +1371,23 @@ mod tests {
     }
 
     #[test]
-    fn test_gvisor_rejects_native_security_policy_files() {
+    fn test_gvisor_allows_custom_seccomp_profile_but_rejects_native_policy_files() {
         let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
             .with_seccomp_profile(PathBuf::from("/tmp/seccomp.json"))
             .with_caps_policy(PathBuf::from("/tmp/caps.toml"));
 
         let err = cfg.validate_runtime_support().unwrap_err();
-        assert!(err.to_string().contains("gVisor runtime"));
+        assert!(err.to_string().contains("capability policy"));
+    }
+
+    #[test]
+    fn test_gvisor_accepts_custom_seccomp_profile() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_seccomp_profile(PathBuf::from("/tmp/seccomp.json"));
+
+        cfg.validate_runtime_support().unwrap();
     }
 
     #[test]
@@ -1356,6 +1409,16 @@ mod tests {
 
         let err = cfg.validate_runtime_support().unwrap_err();
         assert!(err.to_string().contains("gVisor runtime"));
+    }
+
+    #[test]
+    fn test_gvisor_rejects_seccomp_allow_without_custom_profile_projection() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_seccomp_allow_syscalls(vec!["io_uring_setup".to_string()]);
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("seccomp-allow"));
     }
 
     #[test]

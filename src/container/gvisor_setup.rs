@@ -4,7 +4,9 @@ use crate::filesystem::{
     snapshot_context_dir, verify_context_manifest, verify_rootfs_attestation, ContextPopulator,
 };
 use crate::network::{BridgeNetwork, NetworkMode};
-use crate::security::{GVisorNetworkMode, GVisorRuntime, OciBundle, OciConfig, OciMount};
+use crate::security::{
+    load_json_policy, GVisorNetworkMode, GVisorRuntime, OciBundle, OciConfig, OciMount, OciSeccomp,
+};
 use nix::unistd::Uid;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use tracing::info;
@@ -49,6 +51,16 @@ impl Container {
         oci_config = oci_config.with_namespace_config(&self.config.namespaces);
         oci_config = oci_config.with_process_identity(&self.config.process_identity);
         oci_config = oci_config.with_rlimits(&self.config.limits);
+
+        if let Some(profile_path) = self.config.seccomp_profile.as_ref() {
+            let seccomp: OciSeccomp =
+                load_json_policy(profile_path, self.config.seccomp_profile_sha256.as_deref())?;
+            oci_config = oci_config.with_seccomp(seccomp);
+            info!(
+                "Attached OCI linux.seccomp profile to gVisor bundle from {:?}",
+                profile_path
+            );
+        }
 
         // Inject user-configured environment variables
         if !self.config.environment.is_empty() {

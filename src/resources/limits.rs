@@ -1,7 +1,8 @@
 use crate::error::{NucleusError, Result};
+use serde::{Deserialize, Serialize};
 
 /// Per-device I/O throttling limit
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IoDeviceLimit {
     /// Device identifier in "major:minor" format
     pub device: String,
@@ -187,6 +188,11 @@ impl ResourceLimits {
     pub fn with_cpu_cores(mut self, cores: f64) -> Result<Self> {
         const MAX_CPU_CORES: f64 = 65_536.0;
 
+        if self.cpu_period_us == 0 {
+            return Err(NucleusError::InvalidResourceLimit(
+                "CPU period must be greater than 0".to_string(),
+            ));
+        }
         if cores <= 0.0 || cores.is_nan() || cores.is_infinite() {
             return Err(NucleusError::InvalidResourceLimit(
                 "CPU cores must be a finite positive number".to_string(),
@@ -209,6 +215,11 @@ impl ResourceLimits {
         if max_pids == 0 {
             return Err(NucleusError::InvalidResourceLimit(
                 "Max PIDs must be positive".to_string(),
+            ));
+        }
+        if max_pids == libc::RLIM_INFINITY {
+            return Err(NucleusError::InvalidResourceLimit(
+                "Max PIDs must be less than RLIM_INFINITY; use 0/None for unlimited".to_string(),
             ));
         }
         self.pids_max = Some(max_pids);
@@ -236,6 +247,31 @@ impl ResourceLimits {
     pub fn with_memlock(mut self, limit: &str) -> Result<Self> {
         self.memlock_bytes = Some(Self::parse_memory(limit)?);
         Ok(self)
+    }
+
+    /// Validate invariants required by runtime, cgroup, and OCI limit consumers.
+    pub fn validate_runtime_sanity(&self) -> Result<()> {
+        if self.cpu_period_us == 0 {
+            return Err(NucleusError::InvalidResourceLimit(
+                "CPU period must be greater than 0".to_string(),
+            ));
+        }
+
+        if let Some(pids_max) = self.pids_max {
+            if pids_max == 0 {
+                return Err(NucleusError::InvalidResourceLimit(
+                    "Max PIDs must be positive".to_string(),
+                ));
+            }
+            if pids_max == libc::RLIM_INFINITY {
+                return Err(NucleusError::InvalidResourceLimit(
+                    "Max PIDs must be less than RLIM_INFINITY; use 0/None for unlimited"
+                        .to_string(),
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -303,6 +339,13 @@ mod tests {
     }
 
     #[test]
+    fn test_with_cpu_cores_rejects_zero_period() {
+        let mut limits = ResourceLimits::unlimited();
+        limits.cpu_period_us = 0;
+        assert!(limits.with_cpu_cores(1.0).is_err());
+    }
+
+    #[test]
     fn test_with_memory_auto_sets_memory_high() {
         let limits = ResourceLimits::unlimited().with_memory("1G").unwrap();
         let expected_bytes = 1024 * 1024 * 1024u64;
@@ -345,6 +388,13 @@ mod tests {
     fn test_with_cpu_weight_invalid() {
         assert!(ResourceLimits::unlimited().with_cpu_weight(0).is_err());
         assert!(ResourceLimits::unlimited().with_cpu_weight(10001).is_err());
+    }
+
+    #[test]
+    fn test_with_pids_rejects_rlim_infinity() {
+        assert!(ResourceLimits::unlimited()
+            .with_pids(libc::RLIM_INFINITY)
+            .is_err());
     }
 
     #[test]
@@ -433,5 +483,14 @@ mod tests {
                 .is_err(),
             "CPU cores > 65536 must be rejected to prevent quota overflow"
         );
+    }
+
+    #[test]
+    fn test_validate_runtime_sanity_rejects_invalid_deserialized_values() {
+        let mut limits = ResourceLimits::unlimited();
+        limits.cpu_period_us = 0;
+        limits.pids_max = Some(libc::RLIM_INFINITY);
+
+        assert!(limits.validate_runtime_sanity().is_err());
     }
 }

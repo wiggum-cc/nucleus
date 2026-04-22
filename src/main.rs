@@ -1,5 +1,5 @@
 use clap::Parser;
-use nucleus::checkpoint::CriuRuntime;
+use nucleus::checkpoint::{CheckpointMetadata, CriuRuntime};
 use nucleus::container::{
     parse_signal, validate_container_name, validate_hostname, Container, ContainerConfig,
     ContainerLifecycle, ContainerState, ContainerStateManager, ContainerStateParams, HealthCheck,
@@ -10,12 +10,14 @@ use nucleus::error::{NucleusError, Result};
 use nucleus::filesystem::ContextMode;
 use nucleus::isolation::{ContainerAttach, NamespaceConfig};
 use nucleus::network::{BridgeConfig, EgressPolicy, NatBackend, NetworkMode, PortForward};
-use nucleus::resources::{IoDeviceLimit, ResourceLimits, ResourceStats};
+use nucleus::resources::{Cgroup, IoDeviceLimit, ResourceLimits, ResourceStats};
 use nucleus::security::GVisorPlatform;
 use nucleus::topology::{
     execute_reconcile, plan_reconcile, DependencyGraph, ReconcileAction, TopologyConfig,
 };
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::process::ExitCode;
 use tracing::info;
 
 fn validate_systemd_credential_name(name: &str) -> Result<()> {
@@ -129,6 +131,48 @@ fn resolve_process_identity(
     }))
 }
 
+fn exit_code_from_i32(code: i32) -> ExitCode {
+    u8::try_from(code)
+        .map(ExitCode::from)
+        .unwrap_or(ExitCode::FAILURE)
+}
+
+fn restore_checkpoint_cgroup(
+    container_id: &str,
+    pid: u32,
+    metadata: &CheckpointMetadata,
+) -> Result<(Option<String>, Option<u64>, Option<u64>)> {
+    let Some(resource_limits) = metadata.resource_limits.as_ref() else {
+        return Ok((None, None, None));
+    };
+
+    let cgroup_name = format!("nucleus-{}", container_id);
+    let mut cgroup = Cgroup::create(&cgroup_name).map_err(|e| {
+        NucleusError::CheckpointError(format!("Failed to recreate cgroup on restore: {}", e))
+    })?;
+    let limits = resource_limits.to_resource_limits();
+    if let Err(e) = cgroup.set_limits(&limits) {
+        let _ = cgroup.cleanup();
+        return Err(NucleusError::CheckpointError(format!(
+            "Failed to restore cgroup limits for restored container: {}",
+            e
+        )));
+    }
+    if let Err(e) = cgroup.attach_process(pid) {
+        let _ = cgroup.cleanup();
+        return Err(NucleusError::CheckpointError(format!(
+            "Failed to attach restored process {} to cgroup: {}",
+            pid, e
+        )));
+    }
+
+    Ok((
+        Some(format!("/sys/fs/cgroup/{}", cgroup_name)),
+        resource_limits.memory_bytes,
+        resource_limits.cpu_limit_millicores(),
+    ))
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "nucleus")]
 #[command(about = "Extremely lightweight Docker alternative for agents", long_about = None)]
@@ -210,6 +254,10 @@ enum Commands {
         /// Internal: use a pre-generated container ID (set by --detach re-exec)
         #[arg(long, hide = true)]
         preset_id: Option<String>,
+
+        /// Internal: serialized parsed create request used for detach re-exec
+        #[arg(long, hide = true)]
+        detached_config_json: Option<String>,
 
         /// Run in rootless mode with user namespace
         #[arg(long)]
@@ -427,7 +475,7 @@ enum Commands {
         topology_config_hash: Option<u64>,
 
         /// Command to run in container
-        #[arg(last = true, required = true)]
+        #[arg(last = true, required_unless_present = "detached_config_json")]
         command: Vec<String>,
     },
 
@@ -596,6 +644,78 @@ enum ComposeCommands {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DetachedCreateRequest {
+    name: Option<String>,
+    context: Option<String>,
+    memory: Option<String>,
+    cpus: Option<f64>,
+    hostname: Option<String>,
+    cpu_weight: Option<u64>,
+    io_limits: Vec<String>,
+    pids: Option<u64>,
+    memlock: Option<String>,
+    swap: bool,
+    runtime: RuntimeSelection,
+    detach: bool,
+    quiet_id: bool,
+    preset_id: Option<String>,
+    rootless: bool,
+    user: Option<String>,
+    group: Option<String>,
+    additional_groups: Vec<String>,
+    bundle: Option<PathBuf>,
+    pid_file: Option<PathBuf>,
+    console_socket: Option<PathBuf>,
+    network: NetworkModeArg,
+    allow_host_network: bool,
+    allow_degraded_security: bool,
+    allow_chroot_fallback: bool,
+    trust_level: TrustLevel,
+    proc_rw: bool,
+    publish: Vec<String>,
+    context_mode: ContextMode,
+    service_mode: ServiceMode,
+    rootfs: Option<String>,
+    egress_allow: Vec<String>,
+    egress_tcp_ports: Vec<u16>,
+    egress_udp_ports: Vec<u16>,
+    dns: Vec<String>,
+    nat_backend: NatBackend,
+    health_cmd: Option<String>,
+    health_interval: Option<u64>,
+    health_retries: Option<u32>,
+    health_start_period: Option<u64>,
+    secrets: Vec<String>,
+    systemd_credentials: Vec<String>,
+    volumes: Vec<String>,
+    tmpfs: Vec<String>,
+    env_vars: Vec<String>,
+    sd_notify: bool,
+    readiness_exec: Option<String>,
+    readiness_tcp: Option<u16>,
+    readiness_sd_notify: bool,
+    seccomp_profile: Option<String>,
+    seccomp_profile_sha256: Option<String>,
+    seccomp_mode: SeccompMode,
+    seccomp_log: Option<String>,
+    seccomp_log_denied: bool,
+    seccomp_allow: Vec<String>,
+    caps_policy: Option<String>,
+    caps_policy_sha256: Option<String>,
+    landlock_policy: Option<String>,
+    landlock_policy_sha256: Option<String>,
+    verify_context_integrity: bool,
+    verify_rootfs_attestation: bool,
+    require_kernel_lockdown: Option<KernelLockdownMode>,
+    gvisor_platform: GVisorPlatform,
+    time_namespace: bool,
+    disable_cgroup_namespace: bool,
+    hooks: Option<String>,
+    topology_config_hash: Option<u64>,
+    command: Vec<String>,
+}
+
 /// Truncate a container ID to 12 chars for display.
 fn truncate_id(id: &str) -> &str {
     if id.len() > 12 {
@@ -605,7 +725,17 @@ fn truncate_id(id: &str) -> &str {
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
+    match try_main() {
+        Ok(code) => exit_code_from_i32(code),
+        Err(err) => {
+            eprintln!("Error: {}", err);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn try_main() -> Result<i32> {
     let cli = Cli::parse();
     let state_root = cli.root.clone();
 
@@ -619,7 +749,7 @@ fn main() -> Result<()> {
             if let Some(ref id) = container {
                 let state = state_mgr.resolve_container(id)?;
                 println!("{}", serde_json::to_string_pretty(&state.oci_state())?);
-                return Ok(());
+                return Ok(0);
             }
 
             let states = if all {
@@ -630,7 +760,7 @@ fn main() -> Result<()> {
 
             if states.is_empty() {
                 println!("No containers found");
-                return Ok(());
+                return Ok(0);
             }
 
             println!(
@@ -671,7 +801,7 @@ fn main() -> Result<()> {
                 );
             }
 
-            Ok(())
+            Ok(0)
         }
 
         Commands::Stats { container_id } => {
@@ -685,7 +815,7 @@ fn main() -> Result<()> {
 
             if states.is_empty() {
                 println!("No running containers found");
-                return Ok(());
+                return Ok(0);
             }
 
             println!(
@@ -736,7 +866,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            Ok(())
+            Ok(0)
         }
 
         Commands::Stop { container, timeout } => {
@@ -744,7 +874,7 @@ fn main() -> Result<()> {
             let state = state_mgr.resolve_container(&container)?;
             ContainerLifecycle::stop(&state, timeout)?;
             println!("{}", state.id);
-            Ok(())
+            Ok(0)
         }
 
         Commands::Start { container } => {
@@ -758,7 +888,7 @@ fn main() -> Result<()> {
             }
             Container::trigger_start(&state.id, state_root.clone())?;
             println!("{}", state.id);
-            Ok(())
+            Ok(0)
         }
 
         Commands::Delete { container, force } => {
@@ -766,7 +896,7 @@ fn main() -> Result<()> {
             let state = state_mgr.resolve_container(&container)?;
             ContainerLifecycle::remove(&state_mgr, &state, force)?;
             println!("{}", state.id);
-            Ok(())
+            Ok(0)
         }
 
         Commands::Kill { container, signal } => {
@@ -775,7 +905,7 @@ fn main() -> Result<()> {
             let sig = parse_signal(&signal)?;
             ContainerLifecycle::kill_container(&state, sig)?;
             println!("{}", state.id);
-            Ok(())
+            Ok(0)
         }
 
         Commands::Attach { container, command } => {
@@ -787,7 +917,7 @@ fn main() -> Result<()> {
                 command
             };
             let exit_code = ContainerAttach::attach(&state, cmd)?;
-            std::process::exit(exit_code);
+            Ok(exit_code)
         }
 
         Commands::Logs {
@@ -819,7 +949,7 @@ fn main() -> Result<()> {
                     status
                 )));
             }
-            Ok(())
+            Ok(0)
         }
 
         Commands::Checkpoint {
@@ -841,31 +971,42 @@ fn main() -> Result<()> {
             let mut criu = CriuRuntime::new()?;
             criu.checkpoint(&state, &PathBuf::from(&output), leave_running)?;
             println!("Checkpoint saved to {}", output);
-            Ok(())
+            Ok(0)
         }
 
         Commands::Restore { input } => {
             let mut criu = CriuRuntime::new()?;
             let input_path = PathBuf::from(&input);
+            let metadata = CheckpointMetadata::load(&input_path)?;
             let pid = criu.restore(&input_path)?;
 
             // Register restored container in state manager so state/stop/kill/attach work.
             // Generate a NEW container ID to avoid overwriting the original state file
             // (the original container may still be running with --leave-running).
-            let metadata = nucleus::checkpoint::CheckpointMetadata::load(&input_path)?;
             let new_id = nucleus::container::generate_container_id()?;
             let new_name = format!("{}-restored", metadata.container_name);
             let state_mgr = ContainerStateManager::new_with_root(state_root.clone())?;
+            let (cgroup_path, memory_limit, cpu_limit) =
+                match restore_checkpoint_cgroup(&new_id, pid, &metadata) {
+                    Ok(restored) => restored,
+                    Err(err) => {
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid as i32),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                        return Err(err);
+                    }
+                };
             let state = ContainerState::new(ContainerStateParams {
                 id: new_id.clone(),
                 name: new_name,
                 pid,
                 command: metadata.command,
-                memory_limit: None, // memory limit unknown after restore
-                cpu_limit: None,    // cpu limit unknown after restore
+                memory_limit,
+                cpu_limit,
                 using_gvisor: metadata.using_gvisor,
                 rootless: metadata.rootless,
-                cgroup_path: None, // cgroup path unknown after restore
+                cgroup_path,
                 process_uid: 0,
                 process_gid: 0,
                 additional_gids: Vec::new(),
@@ -877,7 +1018,7 @@ fn main() -> Result<()> {
             );
 
             println!("{}", new_id);
-            Ok(())
+            Ok(0)
         }
 
         Commands::Create {
@@ -895,6 +1036,7 @@ fn main() -> Result<()> {
             detach,
             quiet_id,
             preset_id,
+            detached_config_json,
             rootless,
             user,
             group,
@@ -950,14 +1092,102 @@ fn main() -> Result<()> {
             topology_config_hash,
             command,
         } => {
-            if command.is_empty() {
+            let create_request = if let Some(serialized) = detached_config_json {
+                let request: DetachedCreateRequest =
+                    serde_json::from_str(&serialized).map_err(|e| {
+                        NucleusError::ConfigError(format!(
+                            "Failed to deserialize detached create request: {}",
+                            e
+                        ))
+                    })?;
+                if request.detach {
+                    return Err(NucleusError::ConfigError(
+                        "Detached create request must clear --detach before re-exec".to_string(),
+                    ));
+                }
+                request
+            } else {
+                DetachedCreateRequest {
+                    name,
+                    context,
+                    memory,
+                    cpus,
+                    hostname,
+                    cpu_weight,
+                    io_limits,
+                    pids,
+                    memlock,
+                    swap,
+                    runtime,
+                    detach,
+                    quiet_id,
+                    preset_id,
+                    rootless,
+                    user,
+                    group,
+                    additional_groups,
+                    bundle,
+                    pid_file,
+                    console_socket,
+                    network,
+                    allow_host_network,
+                    allow_degraded_security,
+                    allow_chroot_fallback,
+                    trust_level,
+                    proc_rw,
+                    publish,
+                    context_mode,
+                    service_mode,
+                    rootfs,
+                    egress_allow,
+                    egress_tcp_ports,
+                    egress_udp_ports,
+                    dns,
+                    nat_backend,
+                    health_cmd,
+                    health_interval,
+                    health_retries,
+                    health_start_period,
+                    secrets,
+                    systemd_credentials,
+                    volumes,
+                    tmpfs,
+                    env_vars,
+                    sd_notify,
+                    readiness_exec,
+                    readiness_tcp,
+                    readiness_sd_notify,
+                    seccomp_profile,
+                    seccomp_profile_sha256,
+                    seccomp_mode,
+                    seccomp_log,
+                    seccomp_log_denied,
+                    seccomp_allow,
+                    caps_policy,
+                    caps_policy_sha256,
+                    landlock_policy,
+                    landlock_policy_sha256,
+                    verify_context_integrity,
+                    verify_rootfs_attestation,
+                    require_kernel_lockdown,
+                    gvisor_platform,
+                    time_namespace,
+                    disable_cgroup_namespace,
+                    hooks,
+                    topology_config_hash,
+                    command,
+                }
+            };
+
+            if create_request.command.is_empty() {
                 return Err(NucleusError::ConfigError(
                     "No command specified".to_string(),
                 ));
             }
 
-            // --detach: re-exec under systemd-run as a transient service
-            if detach {
+            // --detach: re-exec under systemd-run as a transient service using
+            // a serialized parsed request instead of argv string surgery.
+            if create_request.detach {
                 let id = nucleus::container::generate_container_id()?;
                 let exe = std::env::current_exe().map_err(|e| {
                     NucleusError::ConfigError(format!(
@@ -965,39 +1195,24 @@ fn main() -> Result<()> {
                         e
                     ))
                 })?;
-
-                // Reconstruct args: remove --detach/-d, inject --quiet-id and --preset-id
-                let raw_args: Vec<String> = std::env::args().collect();
-                let mut inner_args: Vec<String> = Vec::with_capacity(raw_args.len() + 2);
-                // Find the "--" separator position (everything after is the container command)
-                let separator_pos = raw_args.iter().position(|a| a == "--");
-
-                for (i, arg) in raw_args.iter().enumerate().skip(1) {
-                    // Only strip --detach/-d from nucleus args, not from the container command
-                    if separator_pos.map_or(true, |sep| i < sep)
-                        && (arg == "--detach" || arg == "-d")
-                    {
-                        continue;
-                    }
-                    inner_args.push(arg.clone());
-                }
-
-                // Insert --quiet-id and --preset-id right after "create"
-                if let Some(create_pos) = inner_args
-                    .iter()
-                    .position(|a| a.eq_ignore_ascii_case("create"))
-                {
-                    inner_args.insert(create_pos + 1, format!("--preset-id={}", id));
-                    inner_args.insert(create_pos + 1, "--quiet-id".to_string());
-                }
-
-                // Propagate --root if set (it's a global arg before the subcommand)
+                let mut inner_request = create_request.clone();
+                inner_request.detach = false;
+                inner_request.quiet_id = true;
+                inner_request.preset_id = Some(id.clone());
+                let serialized = serde_json::to_string(&inner_request).map_err(|e| {
+                    NucleusError::ConfigError(format!(
+                        "Failed to serialize detached create request: {}",
+                        e
+                    ))
+                })?;
+                let mut inner_args: Vec<String> = Vec::new();
                 if let Some(ref root) = state_root {
-                    if !raw_args.iter().any(|a| a.starts_with("--root")) {
-                        inner_args.insert(0, root.display().to_string());
-                        inner_args.insert(0, "--root".to_string());
-                    }
+                    inner_args.push("--root".to_string());
+                    inner_args.push(root.display().to_string());
                 }
+                inner_args.push("create".to_string());
+                inner_args.push("--detached-config-json".to_string());
+                inner_args.push(serialized);
 
                 let unit_name = format!("nucleus-{}", &id[..12]);
                 let status = std::process::Command::new("systemd-run")
@@ -1031,8 +1246,79 @@ fn main() -> Result<()> {
                 }
 
                 println!("{}", id);
-                return Ok(());
+                return Ok(0);
             }
+
+            let DetachedCreateRequest {
+                name,
+                context,
+                memory,
+                cpus,
+                hostname,
+                cpu_weight,
+                io_limits,
+                pids,
+                memlock,
+                swap,
+                runtime,
+                detach: _,
+                quiet_id,
+                preset_id,
+                rootless,
+                user,
+                group,
+                additional_groups,
+                bundle,
+                pid_file,
+                console_socket,
+                network,
+                allow_host_network,
+                allow_degraded_security,
+                allow_chroot_fallback,
+                trust_level,
+                proc_rw,
+                publish,
+                context_mode,
+                service_mode,
+                rootfs,
+                egress_allow,
+                egress_tcp_ports,
+                egress_udp_ports,
+                dns,
+                nat_backend,
+                health_cmd,
+                health_interval,
+                health_retries,
+                health_start_period,
+                secrets,
+                systemd_credentials,
+                volumes,
+                tmpfs,
+                env_vars,
+                sd_notify,
+                readiness_exec,
+                readiness_tcp,
+                readiness_sd_notify,
+                seccomp_profile,
+                seccomp_profile_sha256,
+                seccomp_mode,
+                seccomp_log,
+                seccomp_log_denied,
+                seccomp_allow,
+                caps_policy,
+                caps_policy_sha256,
+                landlock_policy,
+                landlock_policy_sha256,
+                verify_context_integrity,
+                verify_rootfs_attestation,
+                require_kernel_lockdown,
+                gvisor_platform,
+                time_namespace,
+                disable_cgroup_namespace,
+                hooks,
+                topology_config_hash,
+                command,
+            } = create_request;
 
             if let Some(ref n) = name {
                 validate_container_name(n)?;
@@ -1501,7 +1787,7 @@ fn main() -> Result<()> {
             let container = Container::new(config);
             let exit_code = container.run()?;
 
-            std::process::exit(exit_code);
+            Ok(exit_code)
         }
 
         Commands::Compose(compose_cmd) => match compose_cmd {
@@ -1521,7 +1807,7 @@ fn main() -> Result<()> {
                         .join(", ")
                 );
                 println!("Startup order: {}", graph.startup_order.join(" -> "));
-                Ok(())
+                Ok(0)
             }
 
             ComposeCommands::Plan { file } => {
@@ -1540,7 +1826,7 @@ fn main() -> Result<()> {
                     };
                     println!("  {} -> {}", name, action_str);
                 }
-                Ok(())
+                Ok(0)
             }
 
             ComposeCommands::Up { file, timeout } => {
@@ -1552,7 +1838,7 @@ fn main() -> Result<()> {
                 println!("Bringing up topology '{}'...", config.name);
                 execute_reconcile(&config, &plan, &state_mgr, timeout, state_root.as_deref())?;
                 println!("Topology '{}' is up", config.name);
-                Ok(())
+                Ok(0)
             }
 
             ComposeCommands::Down { file, timeout } => {
@@ -1572,7 +1858,7 @@ fn main() -> Result<()> {
                     }
                 }
                 println!("Topology '{}' is down", config.name);
-                Ok(())
+                Ok(0)
             }
 
             ComposeCommands::State { file } => {
@@ -1612,7 +1898,7 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                Ok(())
+                Ok(0)
             }
         },
 
@@ -1632,7 +1918,7 @@ fn main() -> Result<()> {
                     "Profile contains {} syscalls",
                     profile.syscalls.first().map(|g| g.names.len()).unwrap_or(0)
                 );
-                Ok(())
+                Ok(0)
             }
         },
     }
@@ -1646,6 +1932,182 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn test_detached_create_request_roundtrips_command_tokens() {
+        let request = DetachedCreateRequest {
+            name: Some("svc".to_string()),
+            context: Some("/tmp/context".to_string()),
+            memory: Some("512M".to_string()),
+            cpus: Some(1.5),
+            hostname: Some("svc".to_string()),
+            cpu_weight: Some(100),
+            io_limits: vec!["8:0 riops=1000".to_string()],
+            pids: Some(64),
+            memlock: Some("8M".to_string()),
+            swap: true,
+            runtime: RuntimeSelection::Native,
+            detach: false,
+            quiet_id: true,
+            preset_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+            rootless: true,
+            user: Some("1000".to_string()),
+            group: Some("1000".to_string()),
+            additional_groups: vec!["27".to_string()],
+            bundle: Some(PathBuf::from("/tmp/bundle")),
+            pid_file: Some(PathBuf::from("/tmp/pid")),
+            console_socket: Some(PathBuf::from("/tmp/console.sock")),
+            network: NetworkModeArg::Bridge,
+            allow_host_network: false,
+            allow_degraded_security: true,
+            allow_chroot_fallback: true,
+            trust_level: TrustLevel::Trusted,
+            proc_rw: true,
+            publish: vec!["127.0.0.1:8080:80/tcp".to_string()],
+            context_mode: ContextMode::BindMount,
+            service_mode: ServiceMode::Production,
+            rootfs: Some("/nix/store/rootfs".to_string()),
+            egress_allow: vec!["10.0.0.0/8".to_string()],
+            egress_tcp_ports: vec![443],
+            egress_udp_ports: vec![53],
+            dns: vec!["8.8.8.8".to_string()],
+            nat_backend: NatBackend::Kernel,
+            health_cmd: Some("curl -f http://127.0.0.1/health".to_string()),
+            health_interval: Some(5),
+            health_retries: Some(2),
+            health_start_period: Some(1),
+            secrets: vec!["/tmp/src:/run/secrets/token".to_string()],
+            systemd_credentials: vec!["db-password:/run/secrets/db".to_string()],
+            volumes: vec!["/tmp/data:/data:ro".to_string()],
+            tmpfs: vec!["/cache:64M:rw".to_string()],
+            env_vars: vec!["A=B".to_string()],
+            sd_notify: true,
+            readiness_exec: Some("test -f /tmp/ready".to_string()),
+            readiness_tcp: None,
+            readiness_sd_notify: false,
+            seccomp_profile: Some("/tmp/seccomp.json".to_string()),
+            seccomp_profile_sha256: Some("abcd".to_string()),
+            seccomp_mode: SeccompMode::Enforce,
+            seccomp_log: None,
+            seccomp_log_denied: false,
+            seccomp_allow: vec!["io_uring_setup".to_string(), "--detach".to_string()],
+            caps_policy: Some("/tmp/caps.toml".to_string()),
+            caps_policy_sha256: Some("efgh".to_string()),
+            landlock_policy: Some("/tmp/landlock.toml".to_string()),
+            landlock_policy_sha256: Some("ijkl".to_string()),
+            verify_context_integrity: true,
+            verify_rootfs_attestation: true,
+            require_kernel_lockdown: Some(KernelLockdownMode::Integrity),
+            gvisor_platform: GVisorPlatform::Ptrace,
+            time_namespace: true,
+            disable_cgroup_namespace: true,
+            hooks: Some("/tmp/hooks.json".to_string()),
+            topology_config_hash: Some(42),
+            command: vec![
+                "/bin/sh".to_string(),
+                "-ceu".to_string(),
+                "printf '%s\n' create --detach".to_string(),
+                "--".to_string(),
+                "-d".to_string(),
+            ],
+        };
+
+        let encoded = serde_json::to_string(&request).unwrap();
+        let decoded: DetachedCreateRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.command, request.command);
+        assert_eq!(decoded.publish, request.publish);
+        assert_eq!(decoded.seccomp_allow, request.seccomp_allow);
+    }
+
+    #[test]
+    fn test_create_hidden_detached_config_skips_command_requirement() {
+        let encoded = serde_json::to_string(&DetachedCreateRequest {
+            name: None,
+            context: None,
+            memory: None,
+            cpus: None,
+            hostname: None,
+            cpu_weight: None,
+            io_limits: Vec::new(),
+            pids: None,
+            memlock: None,
+            swap: false,
+            runtime: RuntimeSelection::GVisor,
+            detach: false,
+            quiet_id: false,
+            preset_id: None,
+            rootless: false,
+            user: None,
+            group: None,
+            additional_groups: Vec::new(),
+            bundle: None,
+            pid_file: None,
+            console_socket: None,
+            network: NetworkModeArg::None,
+            allow_host_network: false,
+            allow_degraded_security: false,
+            allow_chroot_fallback: false,
+            trust_level: TrustLevel::Untrusted,
+            proc_rw: false,
+            publish: Vec::new(),
+            context_mode: ContextMode::Copy,
+            service_mode: ServiceMode::Agent,
+            rootfs: None,
+            egress_allow: Vec::new(),
+            egress_tcp_ports: Vec::new(),
+            egress_udp_ports: Vec::new(),
+            dns: Vec::new(),
+            nat_backend: NatBackend::Auto,
+            health_cmd: None,
+            health_interval: None,
+            health_retries: None,
+            health_start_period: None,
+            secrets: Vec::new(),
+            systemd_credentials: Vec::new(),
+            volumes: Vec::new(),
+            tmpfs: Vec::new(),
+            env_vars: Vec::new(),
+            sd_notify: false,
+            readiness_exec: None,
+            readiness_tcp: None,
+            readiness_sd_notify: false,
+            seccomp_profile: None,
+            seccomp_profile_sha256: None,
+            seccomp_mode: SeccompMode::Enforce,
+            seccomp_log: None,
+            seccomp_log_denied: false,
+            seccomp_allow: Vec::new(),
+            caps_policy: None,
+            caps_policy_sha256: None,
+            landlock_policy: None,
+            landlock_policy_sha256: None,
+            verify_context_integrity: false,
+            verify_rootfs_attestation: false,
+            require_kernel_lockdown: None,
+            gvisor_platform: GVisorPlatform::Systrap,
+            time_namespace: false,
+            disable_cgroup_namespace: false,
+            hooks: None,
+            topology_config_hash: None,
+            command: vec!["/bin/true".to_string()],
+        })
+        .unwrap();
+
+        let cli =
+            Cli::try_parse_from(["nucleus", "create", "--detached-config-json", &encoded]).unwrap();
+
+        match cli.command {
+            Commands::Create {
+                detached_config_json,
+                command,
+                ..
+            } => {
+                assert!(command.is_empty());
+                assert_eq!(detached_config_json, Some(encoded));
+            }
+            _ => panic!("expected create command"),
+        }
     }
 
     #[test]
