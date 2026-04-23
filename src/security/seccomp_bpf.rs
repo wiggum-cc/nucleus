@@ -138,10 +138,7 @@ pub fn compile_bitmap_bpf(
     // === Section 1: Architecture validation ===
     prog.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET));
     prog.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, audit_arch, 1, 0));
-    prog.push(bpf_stmt(
-        BPF_RET | BPF_K,
-        libc::SECCOMP_RET_KILL_PROCESS as u32,
-    ));
+    prog.push(bpf_stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_KILL_PROCESS));
 
     // === Section 2: Setup ===
     // Compute bit_position = nr & 31, save in M[0].
@@ -449,10 +446,7 @@ mod tests {
 
         // Wrong architecture should return KILL_PROCESS
         let data = make_seccomp_data(0, 0xDEADBEEF, [0; 6]);
-        assert_eq!(
-            bpf_eval(&prog, &data),
-            libc::SECCOMP_RET_KILL_PROCESS as u32
-        );
+        assert_eq!(bpf_eval(&prog, &data), libc::SECCOMP_RET_KILL_PROCESS);
     }
 
     #[test]

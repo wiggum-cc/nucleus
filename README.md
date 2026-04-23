@@ -103,18 +103,18 @@ Container filesystem is backed by tmpfs and either populated with context files 
 ## Installation
 
 ```bash
-cargo install nucleus-container --version 0.3.0
+cargo install nucleus-container --version 0.3.3
 ```
 
 Or via Nix (recommended for reproducible builds and NixOS integration):
 
 ```bash
-nix run github:0kenx/nucleus/v0.3.0
+nix run github:wiggum-cc/nucleus/v0.3.3
 ```
 
 The Cargo package name is `nucleus-container`; it installs the `nucleus` binary. The repository itself is packaged as a Nix flake, so `nix run`, `nix build`, and the NixOS module all share the same pinned inputs.
 
-## Recent Features in 0.3.0
+## Recent Features in 0.3.3
 
 - **Privilege drop for services** – `--user`, `--group`, and `--additional-group` now apply a real post-setup workload identity in both the native runtime and gVisor.
 - **Ownership-aware secrets and writable paths** – Production secret staging and NixOS `createHostPath = true` defaults now align file ownership with the configured workload user/group.
@@ -434,7 +434,7 @@ Nucleus provides a declarative NixOS module for running containers as systemd se
 
 ```nix
 {
-  inputs.nucleus.url = "github:0kenx/nucleus/v0.3.0";
+  inputs.nucleus.url = "github:wiggum-cc/nucleus/v0.3.3";
 
   outputs = { self, nixpkgs, nucleus, ... }: {
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {

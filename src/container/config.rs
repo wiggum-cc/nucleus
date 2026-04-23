@@ -1239,7 +1239,7 @@ mod tests {
             .with_service_mode(ServiceMode::Production)
             .with_rootfs_path(rootfs);
         let err = cfg.validate_production_mode().unwrap_err();
-        let _ = std::fs::remove_dir_all(&cfg.rootfs_path.as_ref().unwrap());
+        let _ = std::fs::remove_dir_all(cfg.rootfs_path.as_ref().unwrap());
         assert!(err.to_string().contains("--memory"));
     }
 

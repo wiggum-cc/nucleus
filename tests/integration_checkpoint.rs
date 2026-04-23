@@ -24,7 +24,7 @@ mod tests {
             cpu_limit: Some(1000),
             using_gvisor: false,
             rootless: true,
-            cgroup_path: Some("/sys/fs/cgroup/nucleus-abc123def456".to_string()),
+            cgroup_path: None,
             process_uid: 0,
             process_gid: 0,
             additional_gids: Vec::new(),
@@ -34,7 +34,7 @@ mod tests {
     #[test]
     fn test_metadata_from_state() {
         let state = sample_state();
-        let meta = CheckpointMetadata::from_state(&state);
+        let meta = CheckpointMetadata::from_state(&state).unwrap();
 
         assert_eq!(meta.container_id, "abc123def456");
         assert_eq!(meta.container_name, "my-worker");
@@ -50,7 +50,7 @@ mod tests {
     fn test_metadata_save_and_load() {
         let temp = TempDir::new().unwrap();
         let state = sample_state();
-        let meta = CheckpointMetadata::from_state(&state);
+        let meta = CheckpointMetadata::from_state(&state).unwrap();
 
         meta.save(temp.path()).unwrap();
 
@@ -77,7 +77,7 @@ mod tests {
     #[test]
     fn test_metadata_serialization_roundtrip() {
         let state = sample_state();
-        let meta = CheckpointMetadata::from_state(&state);
+        let meta = CheckpointMetadata::from_state(&state).unwrap();
 
         let json = serde_json::to_string_pretty(&meta).unwrap();
         let deserialized: CheckpointMetadata = serde_json::from_str(&json).unwrap();
@@ -99,12 +99,12 @@ mod tests {
         let temp = TempDir::new().unwrap();
 
         let state1 = sample_state();
-        let meta1 = CheckpointMetadata::from_state(&state1);
+        let meta1 = CheckpointMetadata::from_state(&state1).unwrap();
         meta1.save(temp.path()).unwrap();
 
         let mut state2 = sample_state();
         state2.name = "updated-worker".to_string();
-        let meta2 = CheckpointMetadata::from_state(&state2);
+        let meta2 = CheckpointMetadata::from_state(&state2).unwrap();
         meta2.save(temp.path()).unwrap();
 
         let loaded = CheckpointMetadata::load(temp.path()).unwrap();
@@ -117,7 +117,7 @@ mod tests {
         state.using_gvisor = true;
         state.rootless = false;
 
-        let meta = CheckpointMetadata::from_state(&state);
+        let meta = CheckpointMetadata::from_state(&state).unwrap();
         assert!(meta.using_gvisor);
         assert!(!meta.rootless);
 
@@ -136,7 +136,7 @@ mod tests {
         fs::write(&victim, "host-data").unwrap();
         symlink(&victim, temp.path().join("metadata.json.tmp")).unwrap();
 
-        let meta = CheckpointMetadata::from_state(&sample_state());
+        let meta = CheckpointMetadata::from_state(&sample_state()).unwrap();
         let err = meta.save(temp.path()).unwrap_err();
 
         assert!(

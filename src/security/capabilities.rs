@@ -333,15 +333,12 @@ mod tests {
     fn test_two_phase_drop() {
         let mut mgr = CapabilityManager::new();
         // Phase 1 may fail in unprivileged tests; that's fine
-        match mgr.drop_bounding_set() {
-            Ok(()) => {
-                assert!(!mgr.is_dropped()); // not fully dropped yet
-                match mgr.finalize_drop() {
-                    Ok(()) => assert!(mgr.is_dropped()),
-                    Err(_) => {} // clear may fail in test env
-                }
+        if let Ok(()) = mgr.drop_bounding_set() {
+            assert!(!mgr.is_dropped()); // not fully dropped yet
+            if let Ok(()) = mgr.finalize_drop() {
+                assert!(mgr.is_dropped())
             }
-            Err(_) => {}
+            // clear may fail in test env
         }
     }
 }

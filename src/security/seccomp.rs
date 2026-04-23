@@ -313,15 +313,15 @@ impl SeccompManager {
         // - Unknown name: WARN and blocked.
         for name in extra_syscalls {
             if let Some(nr) = syscall_name_to_number(name) {
-                if rules.contains_key(&nr) {
-                    // Already allowed by default or arg-filtered – no-op.
-                } else if Self::OPT_IN_SYSCALLS.contains(&name.as_str()) {
-                    rules.insert(nr, Vec::new());
-                } else {
-                    warn!(
-                        "--seccomp-allow: syscall '{}' is not in the opt-in allowlist – blocked",
-                        name
-                    );
+                if let std::collections::btree_map::Entry::Vacant(entry) = rules.entry(nr) {
+                    if Self::OPT_IN_SYSCALLS.contains(&name.as_str()) {
+                        entry.insert(Vec::new());
+                    } else {
+                        warn!(
+                            "--seccomp-allow: syscall '{}' is not in the opt-in allowlist – blocked",
+                            name
+                        );
+                    }
                 }
             } else {
                 warn!("--seccomp-allow: unknown syscall '{}' – blocked", name);
@@ -767,9 +767,7 @@ impl SeccompManager {
         // invariant against namespace creation via clone3 is enforced by dropping
         // CAP_SYS_ADMIN *before* seccomp is installed (see verify_no_namespace_caps).
         // If the custom profile doesn't include clone3, add it.
-        if !rules.contains_key(&libc::SYS_clone3) {
-            rules.insert(libc::SYS_clone3, Vec::new());
-        }
+        rules.entry(libc::SYS_clone3).or_default();
 
         let target_arch = std::env::consts::ARCH.try_into().map_err(|e| {
             NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))

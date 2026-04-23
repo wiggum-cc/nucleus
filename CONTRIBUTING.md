@@ -15,7 +15,7 @@ Thank you for your interest in contributing to Nucleus!
 
 ```bash
 # Clone the repository
-git clone https://github.com/0kenx/nucleus
+git clone https://github.com/wiggum-cc/nucleus
 cd nucleus
 
 # Option 1: Use Nix (recommended)

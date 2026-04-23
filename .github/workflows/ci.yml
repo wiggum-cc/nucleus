@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup override set stable
+
+      - name: Run cargo test
+        env:
+          RUSTC_WRAPPER: ""
+        run: cargo test --locked --lib --bins --tests --examples
+
+      - name: Run cargo clippy
+        env:
+          RUSTC_WRAPPER: ""
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  supply-chain:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
+
+      - name: Install cargo-audit and cargo-deny
+        env:
+          RUSTC_WRAPPER: ""
+        run: cargo install --locked cargo-audit cargo-deny
+
+      - name: Run cargo audit
+        env:
+          RUSTC_WRAPPER: ""
+        run: cargo audit --deny warnings
+
+      - name: Run cargo deny
+        env:
+          RUSTC_WRAPPER: ""
+        run: cargo deny check advisories bans sources
