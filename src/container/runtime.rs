@@ -421,7 +421,12 @@ impl Container {
         } else {
             None
         };
-        let needs_external_userns_mapping = config.user_ns_config.is_some() && !config.use_gvisor;
+        let gvisor_bridge_needs_userns_mapping = config.use_gvisor
+            && !is_root
+            && config.user_ns_config.is_some()
+            && matches!(config.network, NetworkMode::Bridge(_));
+        let needs_external_userns_mapping = config.user_ns_config.is_some()
+            && (!config.use_gvisor || gvisor_bridge_needs_userns_mapping);
         let runtime_base_override =
             Self::prepare_runtime_base_override(&config, is_root, needs_external_userns_mapping)?;
 
@@ -712,22 +717,19 @@ impl Container {
         let mut fs_state = FilesystemState::Unmounted;
         let mut sec_state = SecurityState::Privileged;
 
-        // gVisor is the runtime that should create the container's namespaces.
-        // Running runsc after pre-unsharing our own namespaces breaks its gofer
-        // re-exec path on some systems and duplicates the OCI namespace config.
+        // gVisor creates the container namespaces. Bridge mode is the exception:
+        // Nucleus must hand slirp/port-forward setup a concrete target netns,
+        // then runsc inherits that netns via --network host.
         if self.config.use_gvisor {
-            if matches!(self.config.network, NetworkMode::Bridge(_)) {
-                // Bridge mode still needs a concrete target netns for Nucleus'
-                // userspace NAT and port-forward setup. Without this, slirp4netns
-                // configures the host namespace and concurrent containers collide
-                // on the fixed tap device name.
-                nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).map_err(|e| {
-                    NucleusError::NamespaceError(format!(
-                        "Failed to unshare gVisor bridge network namespace: {}",
-                        e
-                    ))
-                })?;
-            }
+            let gvisor_bridge_precreated_userns =
+                if matches!(self.config.network, NetworkMode::Bridge(_)) {
+                    self.prepare_gvisor_bridge_namespace(
+                        userns_request_pipe.as_ref(),
+                        userns_ack_pipe.as_ref(),
+                    )?
+                } else {
+                    false
+                };
 
             if let Some(fd) = ready_pipe {
                 Self::notify_namespace_ready(&fd, std::process::id())?;
@@ -739,7 +741,7 @@ impl Container {
                     "Failed waiting for cgroup attach acknowledgement",
                 )?;
             }
-            return self.setup_and_exec_gvisor();
+            return self.setup_and_exec_gvisor(gvisor_bridge_precreated_userns);
         }
 
         // 1. Create namespaces in child and optionally configure user mapping.
@@ -1443,6 +1445,54 @@ impl Container {
         Ok(())
     }
 
+    fn prepare_gvisor_bridge_namespace(
+        &self,
+        userns_request_pipe: Option<&OwnedFd>,
+        userns_ack_pipe: Option<&OwnedFd>,
+    ) -> Result<bool> {
+        let mut precreated_userns = false;
+        if self.config.user_ns_config.is_some() && !Uid::effective().is_root() {
+            nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWUSER).map_err(|e| {
+                NucleusError::NamespaceError(format!(
+                    "Failed to unshare gVisor bridge user namespace: {}",
+                    e
+                ))
+            })?;
+
+            let request_fd = userns_request_pipe.ok_or_else(|| {
+                NucleusError::ExecError(
+                    "Missing user namespace request pipe in gVisor bridge child".to_string(),
+                )
+            })?;
+            let ack_fd = userns_ack_pipe.ok_or_else(|| {
+                NucleusError::ExecError(
+                    "Missing user namespace acknowledgement pipe in gVisor bridge child"
+                        .to_string(),
+                )
+            })?;
+
+            Self::send_sync_byte(
+                request_fd,
+                "Failed to request gVisor bridge user namespace mappings from parent",
+            )?;
+            Self::wait_for_sync_byte(
+                ack_fd,
+                "Parent closed user namespace ack pipe before gVisor bridge mappings were written",
+                "Failed waiting for parent to finish gVisor bridge user namespace mappings",
+            )?;
+            Self::become_userns_root_for_setup()?;
+            precreated_userns = true;
+        }
+
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).map_err(|e| {
+            NucleusError::NamespaceError(format!(
+                "Failed to unshare gVisor bridge network namespace: {}",
+                e
+            ))
+        })?;
+        Ok(precreated_userns)
+    }
+
     fn wait_for_pid_namespace_child(child: Pid) -> i32 {
         loop {
             match waitpid(child, None) {
@@ -1714,6 +1764,21 @@ mod tests {
     use crate::container::KernelLockdownMode;
     use crate::network::NetworkMode;
     use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvLock {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl EnvLock {
+        fn acquire() -> Self {
+            Self {
+                _guard: ENV_LOCK.lock().unwrap(),
+            }
+        }
+    }
 
     struct EnvVarGuard {
         key: &'static str,
@@ -1724,6 +1789,12 @@ mod tests {
         fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
             Self { key, previous }
         }
     }
@@ -1968,6 +2039,46 @@ mod tests {
     }
 
     #[test]
+    fn test_gvisor_bridge_precreated_userns_skips_nested_oci_userns() {
+        let source = include_str!("gvisor_setup.rs");
+        let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
+        let precreated_check = fn_body.find("if precreated_userns").unwrap();
+        let oci_userns = fn_body.find("with_rootless_user_namespace").unwrap();
+        assert!(
+            precreated_check < oci_userns,
+            "pre-created rootless bridge userns must skip nested OCI user namespace setup"
+        );
+    }
+
+    #[test]
+    fn test_gvisor_bridge_rootless_requests_external_userns_mapping() {
+        let source = include_str!("runtime.rs");
+        let create_body = extract_fn_body(source, "fn create_internal");
+        assert!(
+            create_body.contains("let gvisor_bridge_needs_userns_mapping"),
+            "gVisor bridge rootless setup must request parent-written userns mappings"
+        );
+        assert!(
+            create_body.contains("matches!(config.network, NetworkMode::Bridge(_))"),
+            "external mapping request must be scoped to gVisor bridge networking"
+        );
+    }
+
+    #[test]
+    fn test_gvisor_bridge_namespace_creates_userns_before_netns() {
+        let source = include_str!("runtime.rs");
+        let fn_body = extract_fn_body(source, "fn prepare_gvisor_bridge_namespace");
+        let userns = fn_body.find("CLONE_NEWUSER").unwrap();
+        let request = fn_body.find("send_sync_byte").unwrap();
+        let become_root = fn_body.find("become_userns_root_for_setup").unwrap();
+        let netns = fn_body.find("CLONE_NEWNET").unwrap();
+        assert!(
+            userns < request && request < become_root && become_root < netns,
+            "rootless gVisor bridge setup must map userns before creating the netns"
+        );
+    }
+
+    #[test]
     fn test_native_fork_sites_assert_single_threaded() {
         let runtime_source = include_str!("runtime.rs");
         let create_body = extract_fn_body(runtime_source, "fn create_internal");
@@ -2006,6 +2117,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_gvisor_artifacts_removes_artifact_dir() {
+        let _env_lock = EnvLock::acquire();
         let temp = tempfile::TempDir::new().unwrap();
         let _artifact_base = EnvVarGuard::set(
             "NUCLEUS_GVISOR_ARTIFACT_BASE",
@@ -2017,6 +2129,19 @@ mod tests {
 
         Container::cleanup_gvisor_artifacts("cleanup-test").unwrap();
         assert!(!artifact_dir.exists());
+    }
+
+    #[test]
+    fn test_gvisor_artifact_base_prefers_xdg_runtime_dir() {
+        let _env_lock = EnvLock::acquire();
+        let temp = tempfile::TempDir::new().unwrap();
+        let _artifact_override = EnvVarGuard::remove("NUCLEUS_GVISOR_ARTIFACT_BASE");
+        let _runtime = EnvVarGuard::set("XDG_RUNTIME_DIR", temp.path());
+
+        assert_eq!(
+            Container::gvisor_artifact_dir("xdg-test"),
+            temp.path().join("nucleus-gvisor").join("xdg-test")
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use super::runtime::Container;
 
 impl Container {
     /// Set up container with gVisor and exec.
-    pub(super) fn setup_and_exec_gvisor(&self) -> Result<()> {
+    pub(super) fn setup_and_exec_gvisor(&self, precreated_userns: bool) -> Result<()> {
         info!("Using gVisor runtime");
 
         let gvisor = if let Some(ref path) = self.runsc_path {
@@ -26,11 +26,15 @@ impl Container {
             })?
         };
 
-        self.setup_and_exec_gvisor_oci(&gvisor)
+        self.setup_and_exec_gvisor_oci(&gvisor, precreated_userns)
     }
 
     /// Set up container with gVisor using OCI bundle format.
-    fn setup_and_exec_gvisor_oci(&self, gvisor: &GVisorRuntime) -> Result<()> {
+    fn setup_and_exec_gvisor_oci(
+        &self,
+        gvisor: &GVisorRuntime,
+        precreated_userns: bool,
+    ) -> Result<()> {
         info!("Using gVisor with OCI bundle format");
 
         let mut oci_config =
@@ -116,7 +120,15 @@ impl Container {
         }
 
         if let Some(user_ns_config) = &self.config.user_ns_config {
-            oci_config = oci_config.with_rootless_user_namespace(user_ns_config);
+            // Rootless bridge networking already placed runsc in a mapped user
+            // namespace so it can inherit the prepared netns. Do not ask runsc
+            // to create a nested OCI user namespace with host IDs that are not
+            // mapped in the intermediate namespace.
+            if precreated_userns {
+                info!("Using pre-created rootless user namespace for gVisor bridge networking");
+            } else {
+                oci_config = oci_config.with_rootless_user_namespace(user_ns_config);
+            }
         }
 
         // Pass OCI hooks into the gVisor config.json so gVisor executes them
@@ -247,15 +259,19 @@ impl Container {
             return std::path::PathBuf::from(path);
         }
 
+        // Rootless bridge setup temporarily becomes uid 0 inside a user
+        // namespace; XDG_RUNTIME_DIR still points at the service-owned host
+        // runtime dir and must win over the host-root default.
+        if !Uid::effective().is_root() || std::env::var_os("XDG_RUNTIME_DIR").is_some() {
+            if let Some(dir) = dirs::runtime_dir() {
+                return dir.join("nucleus-gvisor");
+            }
+        }
+
         if Uid::effective().is_root() {
             std::path::PathBuf::from("/run/nucleus-gvisor")
         } else {
-            dirs::runtime_dir()
-                .map(|dir| dir.join("nucleus-gvisor"))
-                .unwrap_or_else(|| {
-                    std::env::temp_dir()
-                        .join(format!("nucleus-gvisor-{}", Uid::effective().as_raw()))
-                })
+            std::env::temp_dir().join(format!("nucleus-gvisor-{}", Uid::effective().as_raw()))
         }
     }
 

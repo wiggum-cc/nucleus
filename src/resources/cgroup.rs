@@ -372,7 +372,7 @@ mod tests {
         );
         assert_eq!(
             Cgroup::root_path_from_override(Some(OsString::from("/sys/fs/cgroup/example.service")))
-            .unwrap(),
+                .unwrap(),
             PathBuf::from("/sys/fs/cgroup/example.service")
         );
         assert!(Cgroup::root_path_from_override(Some(OsString::from("relative"))).is_err());
