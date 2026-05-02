@@ -7,6 +7,7 @@
 //!   a container's network namespace using `Command::pre_exec`.
 
 use crate::error::{NucleusError, Result};
+use nix::unistd::{setresgid, setresuid, Gid, Uid};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
@@ -82,6 +83,10 @@ fn exec_in_namespaces(pid: u32, enter_userns: bool, program: &str, args: &[&str]
             .pre_exec(move || {
                 if let Some(ref userns) = userns_file {
                     nix::sched::setns(userns, nix::sched::CloneFlags::CLONE_NEWUSER)
+                        .map_err(std::io::Error::other)?;
+                    setresgid(Gid::from_raw(0), Gid::from_raw(0), Gid::from_raw(0))
+                        .map_err(std::io::Error::other)?;
+                    setresuid(Uid::from_raw(0), Uid::from_raw(0), Uid::from_raw(0))
                         .map_err(std::io::Error::other)?;
                 }
                 nix::sched::setns(&ns_file, nix::sched::CloneFlags::CLONE_NEWNET)

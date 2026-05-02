@@ -43,9 +43,17 @@
           mkdir -p "$out"
           for path in bin sbin lib lib64 usr etc nix; do
             if [ -e "${baseRootfs}/$path" ]; then
-              ln -s "${baseRootfs}/$path" "$out/$path"
+              if [ "$path" = etc ]; then
+                mkdir -p "$out/etc"
+                find "${baseRootfs}/etc" -mindepth 1 -maxdepth 1 -exec ln -s '{}' "$out/etc/" \;
+              else
+                ln -s "${baseRootfs}/$path" "$out/$path"
+              fi
             fi
           done
+          mkdir -p "$out/etc"
+          rm -f "$out/etc/resolv.conf"
+          : > "$out/etc/resolv.conf"
 
           manifest="$out/.nucleus-rootfs-sha256"
           find -L "$out" -type f ! -name ".nucleus-rootfs-sha256" -printf '%P\0' \
