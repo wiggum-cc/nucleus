@@ -1035,17 +1035,19 @@ impl BridgeNetwork {
 
         // Bind mount the memfd over the read-only resolv.conf
         let memfd_path = format!("/proc/self/fd/{}", memfd.as_raw_fd());
-        mount(
+        if let Err(e) = mount(
             Some(memfd_path.as_str()),
             &target,
             None::<&str>,
             MsFlags::MS_BIND,
             None::<&str>,
-        )
-        .map_err(|e| {
-            // memfd dropped here via the returned Err, closing the fd automatically
-            NucleusError::NetworkError(format!("Failed to bind mount resolv.conf: {}", e))
-        })?;
+        ) {
+            warn!(
+                "Failed to bind mount memfd-backed resolv.conf: {}; retrying with staging file",
+                e
+            );
+            return Self::bind_mount_resolv_conf_staging(root, dns);
+        }
         Self::harden_resolv_conf_bind(&target)?;
 
         // memfd dropped here – the mount holds a kernel reference to the file,
