@@ -50,6 +50,12 @@ impl Container {
         oci_config = oci_config.with_resources(&self.config.limits);
         oci_config = oci_config.with_namespace_config(&self.config.namespaces);
         oci_config = oci_config.with_process_identity(&self.config.process_identity);
+        if matches!(self.config.network, NetworkMode::Bridge(_)) {
+            // Nucleus configures bridge/userspace NAT against the child process'
+            // network namespace before exec. Keep runsc in that namespace instead
+            // of asking it to create an unconnected network namespace of its own.
+            oci_config = oci_config.without_network_namespace();
+        }
         oci_config = oci_config.with_rlimits(&self.config.limits);
 
         if let Some(profile_path) = self.config.seccomp_profile.as_ref() {
@@ -156,7 +162,7 @@ impl Container {
         let gvisor_net = match &self.config.network {
             NetworkMode::None => GVisorNetworkMode::None,
             NetworkMode::Host => GVisorNetworkMode::Host,
-            NetworkMode::Bridge(_) => GVisorNetworkMode::Sandbox,
+            NetworkMode::Bridge(_) => GVisorNetworkMode::Host,
         };
 
         let rootless_oci = self.config.user_ns_config.is_some();

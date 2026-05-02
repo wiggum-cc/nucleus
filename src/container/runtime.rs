@@ -600,6 +600,19 @@ impl Container {
         // Running runsc after pre-unsharing our own namespaces breaks its gofer
         // re-exec path on some systems and duplicates the OCI namespace config.
         if self.config.use_gvisor {
+            if matches!(self.config.network, NetworkMode::Bridge(_)) {
+                // Bridge mode still needs a concrete target netns for Nucleus'
+                // userspace NAT and port-forward setup. Without this, slirp4netns
+                // configures the host namespace and concurrent containers collide
+                // on the fixed tap device name.
+                nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).map_err(|e| {
+                    NucleusError::NamespaceError(format!(
+                        "Failed to unshare gVisor bridge network namespace: {}",
+                        e
+                    ))
+                })?;
+            }
+
             if let Some(fd) = ready_pipe {
                 Self::notify_namespace_ready(&fd, std::process::id())?;
             }

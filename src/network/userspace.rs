@@ -134,11 +134,18 @@ impl UserspaceNetwork {
                 // Retry without --enable-sandbox; slirp4netns is still
                 // process-isolated via its network namespace.
                 let _ = std::fs::remove_file(&api_socket_path);
-                Self::spawn_slirp(slirp_path, pid, config, needs_userns, &api_socket_path, false)
-                    .map_err(|retry_err| {
-                        let _ = std::fs::remove_dir_all(&runtime_dir);
-                        retry_err
-                    })?
+                Self::spawn_slirp(
+                    slirp_path,
+                    pid,
+                    config,
+                    needs_userns,
+                    &api_socket_path,
+                    false,
+                )
+                .map_err(|retry_err| {
+                    let _ = std::fs::remove_dir_all(&runtime_dir);
+                    retry_err
+                })?
             }
         };
 
@@ -620,8 +627,15 @@ mod tests {
     #[test]
     fn test_slirp_command_args_disable_builtin_dns_when_explicit_dns_is_set() {
         let cfg = BridgeConfig::default().with_dns(vec!["1.1.1.1".to_string()]);
-        let args =
-            UserspaceNetwork::command_args(4242, &cfg, true, Path::new("/tmp/slirp.sock"), 5, 6, true);
+        let args = UserspaceNetwork::command_args(
+            4242,
+            &cfg,
+            true,
+            Path::new("/tmp/slirp.sock"),
+            5,
+            6,
+            true,
+        );
 
         assert!(args.iter().any(|arg| arg == "--disable-dns"));
         assert!(args.iter().any(|arg| arg == "--userns-path"));

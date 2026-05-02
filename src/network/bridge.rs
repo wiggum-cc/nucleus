@@ -819,9 +819,9 @@ impl BridgeNetwork {
 
     /// Resolve a system binary to a validated absolute path.
     ///
-    /// When running as root, searches known sysadmin paths and validates
-    /// ownership and permissions before use. When unprivileged, uses
-    /// `which`-style PATH resolution but still validates the result.
+    /// Searches known sysadmin paths first, then the process PATH, while
+    /// validating ownership and permissions before use. This avoids depending
+    /// on a separate `which` binary in service managers that set a narrow PATH.
     /// Returns an error if no valid binary is found.
     pub(crate) fn resolve_bin(name: &str) -> Result<String> {
         let search_dirs: &[&str] = match name {
@@ -842,14 +842,12 @@ impl BridgeNetwork {
             }
         }
 
-        // Fallback: resolve via PATH, but validate the result
-        if let Ok(output) = Command::new("which").arg(name).output() {
-            if output.status.success() {
-                let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !resolved.is_empty() {
-                    let p = std::path::Path::new(&resolved);
-                    Self::validate_network_binary(p, name)?;
-                    return Ok(resolved);
+        if let Some(path_var) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                let candidate = dir.join(name);
+                if candidate.exists() {
+                    Self::validate_network_binary(&candidate, name)?;
+                    return Ok(candidate.to_string_lossy().into_owned());
                 }
             }
         }

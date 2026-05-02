@@ -1211,6 +1211,18 @@ impl OciConfig {
         self
     }
 
+    /// Remove the OCI network namespace entry so runsc inherits the process
+    /// network namespace that Nucleus prepared before exec.
+    pub fn without_network_namespace(mut self) -> Self {
+        if let Some(linux) = &mut self.linux {
+            if let Some(namespaces) = &mut linux.namespaces {
+                namespaces.retain(|ns| ns.namespace_type != "network");
+            }
+        }
+
+        self
+    }
+
     /// Configure gVisor's true rootless OCI path.
     ///
     /// gVisor expects UID/GID mappings in the OCI spec for this mode, and its
