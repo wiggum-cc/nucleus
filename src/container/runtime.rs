@@ -21,7 +21,7 @@ use nix::sys::signal::{kill, Signal};
 use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
 use nix::sys::stat::Mode;
 use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::{fork, pipe, read, write, ForkResult, Pid};
+use nix::unistd::{fork, pipe, read, setresgid, setresuid, write, ForkResult, Gid, Pid, Uid};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -650,6 +650,7 @@ impl Container {
                 "Parent closed user namespace ack pipe before mappings were written",
                 "Failed waiting for parent to finish user namespace mappings",
             )?;
+            Self::become_userns_root_for_setup()?;
         }
 
         // CLONE_NEWPID only applies to children created after unshare().
@@ -1305,6 +1306,23 @@ impl Container {
                 Err(e) => return Err(NucleusError::ExecError(format!("{}: {}", error_context, e))),
             }
         }
+    }
+
+    fn become_userns_root_for_setup() -> Result<()> {
+        setresgid(Gid::from_raw(0), Gid::from_raw(0), Gid::from_raw(0)).map_err(|e| {
+            NucleusError::NamespaceError(format!(
+                "Failed to become gid 0 inside mapped user namespace: {}",
+                e
+            ))
+        })?;
+        setresuid(Uid::from_raw(0), Uid::from_raw(0), Uid::from_raw(0)).map_err(|e| {
+            NucleusError::NamespaceError(format!(
+                "Failed to become uid 0 inside mapped user namespace: {}",
+                e
+            ))
+        })?;
+        debug!("Switched setup process to uid/gid 0 inside mapped user namespace");
+        Ok(())
     }
 
     fn wait_for_pid_namespace_child(child: Pid) -> i32 {
