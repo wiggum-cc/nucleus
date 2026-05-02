@@ -773,51 +773,82 @@ pub fn mount_procfs(
     );
 
     let mount_data: Option<&str> = if hide_pids { Some("hidepid=2") } else { None };
+    let mut used_hidepid = hide_pids;
 
-    match mount(
+    let mounted = match mount(
         Some("proc"),
         proc_path,
         Some("proc"),
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
         mount_data,
     ) {
-        Ok(_) => {
-            if read_only {
-                mount(
-                    None::<&str>,
-                    proc_path,
-                    None::<&str>,
-                    MsFlags::MS_REMOUNT
-                        | MsFlags::MS_RDONLY
-                        | MsFlags::MS_NOSUID
-                        | MsFlags::MS_NODEV
-                        | MsFlags::MS_NOEXEC,
-                    None::<&str>,
-                )
-                .map_err(|e| {
-                    NucleusError::FilesystemError(format!(
-                        "Failed to remount procfs read-only: {}",
-                        e
-                    ))
-                })?;
-                info!("Successfully mounted procfs (read-only)");
-            } else {
-                info!("Successfully mounted procfs");
+        Ok(_) => true,
+        Err(e) if hide_pids && best_effort => {
+            // Some kernels reject hidepid in user namespaces even though the
+            // private PID namespace still prevents host PID enumeration.
+            warn!(
+                "Failed to mount procfs with hidepid=2: {} (retrying without hidepid)",
+                e
+            );
+            match mount(
+                Some("proc"),
+                proc_path,
+                Some("proc"),
+                MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+                None::<&str>,
+            ) {
+                Ok(_) => {
+                    used_hidepid = false;
+                    true
+                }
+                Err(e) => {
+                    warn!("Failed to mount procfs: {} (continuing anyway)", e);
+                    false
+                }
             }
-            Ok(())
         }
         Err(e) => {
             if best_effort {
                 warn!("Failed to mount procfs: {} (continuing anyway)", e);
-                Ok(())
+                false
             } else {
-                Err(NucleusError::FilesystemError(format!(
+                return Err(NucleusError::FilesystemError(format!(
                     "Failed to mount procfs: {}",
                     e
-                )))
+                )));
             }
         }
+    };
+
+    if mounted {
+        if read_only {
+            mount(
+                None::<&str>,
+                proc_path,
+                None::<&str>,
+                MsFlags::MS_REMOUNT
+                    | MsFlags::MS_RDONLY
+                    | MsFlags::MS_NOSUID
+                    | MsFlags::MS_NODEV
+                    | MsFlags::MS_NOEXEC,
+                None::<&str>,
+            )
+            .map_err(|e| {
+                NucleusError::FilesystemError(format!("Failed to remount procfs read-only: {}", e))
+            })?;
+            if hide_pids && !used_hidepid {
+                info!("Successfully mounted procfs without hidepid (read-only)");
+            } else {
+                info!("Successfully mounted procfs (read-only)");
+            }
+        } else if hide_pids && !used_hidepid {
+            info!("Successfully mounted procfs without hidepid");
+        } else {
+            info!("Successfully mounted procfs");
+        }
     }
+
+    Ok(())
 }
 
 /// Paths to mask with /dev/null (files) – matches OCI runtime spec masked paths.
