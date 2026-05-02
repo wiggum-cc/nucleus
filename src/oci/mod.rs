@@ -1832,9 +1832,10 @@ mod tests {
             &format!("cat > {}\n", output_file.to_string_lossy()),
         );
 
+        let bash = find_bash();
         let hook = OciHook {
-            path: hook_script.to_string_lossy().to_string(),
-            args: vec![],
+            path: bash.clone(),
+            args: vec![bash, hook_script.to_string_lossy().to_string()],
             env: vec![],
             timeout: Some(5),
         };
@@ -1862,9 +1863,10 @@ mod tests {
         let hook_script = temp_dir.path().join("fail.sh");
         write_script(&hook_script, "exit 1\n");
 
+        let bash = find_bash();
         let hook = OciHook {
-            path: hook_script.to_string_lossy().to_string(),
-            args: vec![],
+            path: bash.clone(),
+            args: vec![bash, hook_script.to_string_lossy().to_string()],
             env: vec![],
             timeout: Some(5),
         };
@@ -1894,16 +1896,17 @@ mod tests {
         let ok_script = temp_dir.path().join("ok.sh");
         write_script(&ok_script, &format!("touch {}\n", marker.to_string_lossy()));
 
+        let bash = find_bash();
         let hooks = vec![
             OciHook {
-                path: fail_script.to_string_lossy().to_string(),
-                args: vec![],
+                path: bash.clone(),
+                args: vec![bash.clone(), fail_script.to_string_lossy().to_string()],
                 env: vec![],
                 timeout: Some(5),
             },
             OciHook {
-                path: ok_script.to_string_lossy().to_string(),
-                args: vec![],
+                path: bash.clone(),
+                args: vec![bash, ok_script.to_string_lossy().to_string()],
                 env: vec![],
                 timeout: Some(5),
             },

@@ -21,8 +21,11 @@ use nix::sys::signal::{kill, Signal};
 use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
 use nix::sys::stat::Mode;
 use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::{fork, pipe, read, setresgid, setresuid, write, ForkResult, Gid, Pid, Uid};
+use nix::unistd::{
+    chown, fork, pipe, read, setresgid, setresuid, write, ForkResult, Gid, Pid, Uid,
+};
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -128,6 +131,115 @@ impl Container {
         Err(NucleusError::ExecError(format!(
             "{} requires a single-threaded process before fork, found {:?} threads",
             context, thread_count
+        )))
+    }
+
+    fn prepare_runtime_base_override(
+        config: &ContainerConfig,
+        host_is_root: bool,
+        needs_external_userns_mapping: bool,
+    ) -> Result<Option<PathBuf>> {
+        if !needs_external_userns_mapping {
+            return Ok(None);
+        }
+
+        if !host_is_root {
+            return Ok(Some(
+                dirs::runtime_dir()
+                    .map(|d| d.join("nucleus"))
+                    .unwrap_or_else(std::env::temp_dir),
+            ));
+        }
+
+        let user_config = config.user_ns_config.as_ref().ok_or_else(|| {
+            NucleusError::ExecError("Missing user namespace configuration".to_string())
+        })?;
+        let host_uid =
+            Self::mapped_host_id_for_container_id(&user_config.uid_mappings, 0, "uid mappings")?;
+        let host_gid =
+            Self::mapped_host_id_for_container_id(&user_config.gid_mappings, 0, "gid mappings")?;
+
+        let root = PathBuf::from("/run/nucleus");
+        Self::ensure_runtime_parent_dir(&root)?;
+
+        let runtime_root = root.join("runtime");
+        Self::ensure_runtime_parent_dir(&runtime_root)?;
+
+        let base = runtime_root.join(&config.id);
+        std::fs::create_dir_all(&base).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to create user namespace runtime base {:?}: {}",
+                base, e
+            ))
+        })?;
+        chown(
+            &base,
+            Some(Uid::from_raw(host_uid)),
+            Some(Gid::from_raw(host_gid)),
+        )
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to chown user namespace runtime base {:?} to {}:{}: {}",
+                base, host_uid, host_gid, e
+            ))
+        })?;
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to secure user namespace runtime base {:?}: {}",
+                base, e
+            ))
+        })?;
+
+        Ok(Some(base))
+    }
+
+    fn ensure_runtime_parent_dir(path: &std::path::Path) -> Result<()> {
+        std::fs::create_dir_all(path).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to create runtime parent dir {:?}: {}",
+                path, e
+            ))
+        })?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o711)).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to secure runtime parent dir {:?}: {}",
+                path, e
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn mapped_host_id_for_container_id(
+        mappings: &[crate::isolation::IdMapping],
+        container_id: u32,
+        label: &str,
+    ) -> Result<u32> {
+        for mapping in mappings {
+            let end = mapping
+                .container_id
+                .checked_add(mapping.count)
+                .ok_or_else(|| {
+                    NucleusError::ConfigError(format!(
+                        "{} overflow for container id {}",
+                        label, container_id
+                    ))
+                })?;
+            if container_id >= mapping.container_id && container_id < end {
+                return mapping
+                    .host_id
+                    .checked_add(container_id - mapping.container_id)
+                    .ok_or_else(|| {
+                        NucleusError::ConfigError(format!(
+                            "{} host id overflow for container id {}",
+                            label, container_id
+                        ))
+                    });
+            }
+        }
+
+        Err(NucleusError::ConfigError(format!(
+            "{} do not map container id {}",
+            label, container_id
         )))
     }
 
@@ -310,6 +422,8 @@ impl Container {
             None
         };
         let needs_external_userns_mapping = config.user_ns_config.is_some() && !config.use_gvisor;
+        let runtime_base_override =
+            Self::prepare_runtime_base_override(&config, is_root, needs_external_userns_mapping)?;
 
         // Child notifies parent after namespaces are ready.
         let (ready_read, ready_write) = pipe().map_err(|e| {
@@ -527,6 +641,7 @@ impl Container {
                     userns_ack_read,
                     Some(attach_read),
                     exec_fifo,
+                    runtime_base_override,
                 ) {
                     Ok(_) => unreachable!(),
                     Err(e) => {
@@ -579,6 +694,7 @@ impl Container {
         userns_ack_pipe: Option<OwnedFd>,
         cgroup_attach_pipe: Option<OwnedFd>,
         exec_fifo: Option<PathBuf>,
+        runtime_base_override: Option<PathBuf>,
     ) -> Result<()> {
         let is_rootless = self.config.user_ns_config.is_some();
         let allow_degraded_security = Self::allow_degraded_security(&self.config);
@@ -711,8 +827,10 @@ impl Container {
         // Filesystem: Unmounted -> Mounted
         // Use a private runtime directory instead of /tmp to avoid symlink
         // attacks and information disclosure on multi-user systems.
-        let runtime_base = if nix::unistd::Uid::effective().is_root() {
-            std::path::PathBuf::from("/run/nucleus")
+        let runtime_base = if let Some(path) = runtime_base_override {
+            path
+        } else if nix::unistd::Uid::effective().is_root() {
+            PathBuf::from("/run/nucleus")
         } else {
             dirs::runtime_dir()
                 .map(|d| d.join("nucleus"))
