@@ -549,12 +549,33 @@ impl OciHooks {
             });
         }
 
-        let mut child = cmd.spawn().map_err(|e| {
-            NucleusError::HookError(format!(
-                "Failed to spawn {} hook {}: {}",
-                phase, hook.path, e
-            ))
-        })?;
+        const TEXT_FILE_BUSY_SPAWN_RETRIES: usize = 100;
+        const TEXT_FILE_BUSY_RETRY_DELAY: std::time::Duration =
+            std::time::Duration::from_millis(10);
+
+        let mut text_file_busy_retries = 0;
+        let mut child = loop {
+            match cmd.spawn() {
+                Ok(child) => break child,
+                Err(e)
+                    if e.raw_os_error() == Some(libc::ETXTBSY)
+                        && text_file_busy_retries < TEXT_FILE_BUSY_SPAWN_RETRIES =>
+                {
+                    text_file_busy_retries += 1;
+                    debug!(
+                        "{} hook {} was busy during spawn; retrying ({}/{})",
+                        phase, hook.path, text_file_busy_retries, TEXT_FILE_BUSY_SPAWN_RETRIES
+                    );
+                    std::thread::sleep(TEXT_FILE_BUSY_RETRY_DELAY);
+                }
+                Err(e) => {
+                    return Err(NucleusError::HookError(format!(
+                        "Failed to spawn {} hook {}: {}",
+                        phase, hook.path, e
+                    )));
+                }
+            }
+        };
 
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write as IoWrite;
@@ -1832,10 +1853,9 @@ mod tests {
             &format!("cat > {}\n", output_file.to_string_lossy()),
         );
 
-        let bash = find_bash();
         let hook = OciHook {
-            path: bash.clone(),
-            args: vec![bash, hook_script.to_string_lossy().to_string()],
+            path: hook_script.to_string_lossy().to_string(),
+            args: vec![],
             env: vec![],
             timeout: Some(5),
         };
@@ -1858,15 +1878,57 @@ mod tests {
     }
 
     #[test]
+    fn test_oci_hook_retries_text_file_busy_spawn() {
+        let temp_dir = TempDir::new().unwrap();
+        let hook_script = temp_dir.path().join("hook.sh");
+        let output_file = temp_dir.path().join("output.json");
+
+        write_script(
+            &hook_script,
+            &format!("cat > {}\n", output_file.to_string_lossy()),
+        );
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let busy_script = hook_script.clone();
+        let busy_handle = std::thread::spawn(move || {
+            let _busy_file = OpenOptions::new().write(true).open(&busy_script).unwrap();
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+        ready_rx.recv().unwrap();
+
+        let hook = OciHook {
+            path: hook_script.to_string_lossy().to_string(),
+            args: vec![],
+            env: vec![],
+            timeout: Some(5),
+        };
+        let state = OciContainerState {
+            oci_version: "1.0.2".to_string(),
+            id: "test-container".to_string(),
+            status: OciStatus::Creating,
+            pid: 12345,
+            bundle: "/tmp/test-bundle".to_string(),
+        };
+
+        let result = OciHooks::run_hooks(&[hook], &state, "createRuntime");
+        busy_handle.join().unwrap();
+        result.unwrap();
+
+        let written = std::fs::read_to_string(&output_file).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(parsed["id"], "test-container");
+    }
+
+    #[test]
     fn test_oci_hook_nonzero_exit_is_error() {
         let temp_dir = TempDir::new().unwrap();
         let hook_script = temp_dir.path().join("fail.sh");
         write_script(&hook_script, "exit 1\n");
 
-        let bash = find_bash();
         let hook = OciHook {
-            path: bash.clone(),
-            args: vec![bash, hook_script.to_string_lossy().to_string()],
+            path: hook_script.to_string_lossy().to_string(),
+            args: vec![],
             env: vec![],
             timeout: Some(5),
         };
@@ -1896,17 +1958,16 @@ mod tests {
         let ok_script = temp_dir.path().join("ok.sh");
         write_script(&ok_script, &format!("touch {}\n", marker.to_string_lossy()));
 
-        let bash = find_bash();
         let hooks = vec![
             OciHook {
-                path: bash.clone(),
-                args: vec![bash.clone(), fail_script.to_string_lossy().to_string()],
+                path: fail_script.to_string_lossy().to_string(),
+                args: vec![],
                 env: vec![],
                 timeout: Some(5),
             },
             OciHook {
-                path: bash.clone(),
-                args: vec![bash, ok_script.to_string_lossy().to_string()],
+                path: ok_script.to_string_lossy().to_string(),
+                args: vec![],
                 env: vec![],
                 timeout: Some(5),
             },
