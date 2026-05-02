@@ -9,6 +9,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 const CGROUP_V2_ROOT: &str = "/sys/fs/cgroup";
+const NUCLEUS_CGROUP_ROOT_ENV: &str = "NUCLEUS_CGROUP_ROOT";
 const CGROUP_CLEANUP_RETRIES: usize = 50;
 const CGROUP_CLEANUP_SLEEP: Duration = Duration::from_millis(20);
 
@@ -27,7 +28,7 @@ impl Cgroup {
     /// State transition: Nonexistent -> Created
     pub fn create(name: &str) -> Result<Self> {
         let state = CgroupState::Nonexistent.transition(CgroupState::Created)?;
-        let path = PathBuf::from(CGROUP_V2_ROOT).join(name);
+        let path = Self::root_path()?.join(name);
 
         info!("Creating cgroup at {:?}", path);
 
@@ -37,6 +38,26 @@ impl Cgroup {
         })?;
 
         Ok(Self { path, state })
+    }
+
+    fn root_path() -> Result<PathBuf> {
+        Self::root_path_from_override(std::env::var_os(NUCLEUS_CGROUP_ROOT_ENV))
+    }
+
+    fn root_path_from_override(raw: Option<std::ffi::OsString>) -> Result<PathBuf> {
+        match raw {
+            Some(raw) if !raw.as_os_str().is_empty() => {
+                let path = PathBuf::from(raw);
+                if !path.is_absolute() {
+                    return Err(NucleusError::CgroupError(format!(
+                        "{} must be an absolute path",
+                        NUCLEUS_CGROUP_ROOT_ENV
+                    )));
+                }
+                Ok(path)
+            }
+            _ => Ok(PathBuf::from(CGROUP_V2_ROOT)),
+        }
     }
 
     /// Set resource limits
@@ -325,6 +346,7 @@ impl Drop for Cgroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
 
     #[test]
     fn test_resource_limits_unlimited() {
@@ -336,6 +358,24 @@ mod tests {
         assert!(limits.cpu_weight.is_none());
         assert!(limits.pids_max.is_none());
         assert!(limits.io_limits.is_empty());
+    }
+
+    #[test]
+    fn test_cgroup_root_override_requires_absolute_path() {
+        assert_eq!(
+            Cgroup::root_path_from_override(None).unwrap(),
+            PathBuf::from(CGROUP_V2_ROOT)
+        );
+        assert_eq!(
+            Cgroup::root_path_from_override(Some(OsString::from(""))).unwrap(),
+            PathBuf::from(CGROUP_V2_ROOT)
+        );
+        assert_eq!(
+            Cgroup::root_path_from_override(Some(OsString::from("/sys/fs/cgroup/example.service")))
+            .unwrap(),
+            PathBuf::from("/sys/fs/cgroup/example.service")
+        );
+        assert!(Cgroup::root_path_from_override(Some(OsString::from("relative"))).is_err());
     }
 
     // Note: Testing actual cgroup operations requires root privileges

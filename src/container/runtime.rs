@@ -508,7 +508,7 @@ impl Container {
 
                     let cgroup_path = cgroup_opt
                         .as_ref()
-                        .map(|_| format!("/sys/fs/cgroup/{}", cgroup_name));
+                        .map(|cgroup| cgroup.path().display().to_string());
                     let cpu_millicores = config
                         .limits
                         .cpu_quota_us

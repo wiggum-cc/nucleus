@@ -167,7 +167,7 @@ fn restore_checkpoint_cgroup(
     }
 
     Ok((
-        Some(format!("/sys/fs/cgroup/{}", cgroup_name)),
+        Some(cgroup.path().display().to_string()),
         resource_limits.memory_bytes,
         resource_limits.cpu_limit_millicores(),
     ))
