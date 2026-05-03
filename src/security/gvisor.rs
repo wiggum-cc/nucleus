@@ -350,36 +350,10 @@ impl GVisorRuntime {
 
         let c_env = self.exec_environment(&runsc_runtime_dir)?;
 
-        // Defense-in-depth: even though gVisor provides its own sandboxing,
-        // apply PR_SET_NO_NEW_PRIVS so the runsc process (and anything it
-        // spawns) cannot gain privileges via setuid/setgid binaries.
-        //
-        // PR_SET_NO_NEW_PRIVS only affects the calling thread. Verify we are
-        // single-threaded so no sibling thread can race to exec a setuid binary.
-        let thread_count = std::fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("Threads:"))
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .and_then(|n| n.parse::<u32>().ok())
-            });
-        if thread_count != Some(1) {
-            return Err(NucleusError::GVisorError(format!(
-                "PR_SET_NO_NEW_PRIVS requires single-threaded process, found {:?} threads",
-                thread_count
-            )));
-        }
-        // SAFETY: PR_SET_NO_NEW_PRIVS with arg 1 is always safe; we verified
-        // single-threaded above so no other thread can race this prctl.
-        let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-        if ret != 0 {
-            return Err(NucleusError::GVisorError(format!(
-                "Failed to set PR_SET_NO_NEW_PRIVS before gVisor exec: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        info!("PR_SET_NO_NEW_PRIVS applied before gVisor exec (defense-in-depth)");
+        // runsc starts its gofer by re-executing /proc/self/exe. Carrying
+        // no_new_privs into runsc makes that helper exec fail with EPERM on
+        // the locked-down NixOS VM profile, so leave gVisor to enforce its own
+        // sandbox process model after exec.
 
         // execve - this replaces the current process with runsc
         nix::unistd::execve::<std::ffi::CString, std::ffi::CString>(&program, &c_args, &c_env)?;
