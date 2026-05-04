@@ -39,6 +39,14 @@ impl Container {
 
         let mut oci_config =
             OciConfig::new(self.config.command.clone(), self.config.hostname.clone());
+        if precreated_userns {
+            // In rootless bridge mode Nucleus creates the mapped user namespace
+            // before execing runsc so the prepared netns can be inherited.
+            // runsc then starts its gofer by re-execing /proc/self/exe; carrying
+            // OCI noNewPrivileges into that handoff makes the gofer exec fail
+            // with EPERM before the gVisor sandbox starts.
+            oci_config = oci_config.with_no_new_privileges(false);
+        }
         let artifact_dir = Self::gvisor_artifact_dir(&self.config.id);
         Self::ensure_secure_gvisor_artifact_dir(&artifact_dir)?;
         let context_manifest = if self.config.verify_context_integrity {

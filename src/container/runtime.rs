@@ -2051,6 +2051,17 @@ mod tests {
     }
 
     #[test]
+    fn test_gvisor_bridge_precreated_userns_disables_oci_no_new_privileges() {
+        let source = include_str!("gvisor_setup.rs");
+        let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
+        assert!(
+            fn_body.contains("if precreated_userns")
+                && fn_body.contains("with_no_new_privileges(false)"),
+            "pre-created rootless bridge userns must not pass OCI noNewPrivileges to runsc"
+        );
+    }
+
+    #[test]
     fn test_gvisor_bridge_rootless_requests_external_userns_mapping() {
         let source = include_str!("runtime.rs");
         let create_body = extract_fn_body(source, "fn create_internal");

@@ -25,6 +25,13 @@ mod tests {
     }
 
     #[test]
+    fn test_oci_config_can_disable_no_new_privileges() {
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], Some("test".to_string()))
+            .with_no_new_privileges(false);
+        assert!(!config.process.no_new_privileges);
+    }
+
+    #[test]
     fn test_oci_config_no_hostname() {
         let config = OciConfig::new(vec!["/bin/echo".to_string(), "hi".to_string()], None);
         assert!(config.hostname.is_none());

@@ -948,6 +948,12 @@ impl OciConfig {
         self
     }
 
+    /// Configure the OCI noNewPrivileges process flag.
+    pub fn with_no_new_privileges(mut self, enabled: bool) -> Self {
+        self.process.no_new_privileges = enabled;
+        self
+    }
+
     /// Add environment variables to the OCI process config.
     pub fn with_env(mut self, vars: &[(String, String)]) -> Self {
         for (key, value) in vars {
