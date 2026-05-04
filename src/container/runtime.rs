@@ -2062,6 +2062,16 @@ mod tests {
     }
 
     #[test]
+    fn test_gvisor_bridge_precreated_userns_selects_runsc_rootless() {
+        let source = include_str!("gvisor_setup.rs");
+        let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
+        assert!(
+            fn_body.contains("let runsc_rootless = precreated_userns"),
+            "pre-created rootless bridge userns must use runsc's rootless execution path"
+        );
+    }
+
+    #[test]
     fn test_gvisor_bridge_rootless_requests_external_userns_mapping() {
         let source = include_str!("runtime.rs");
         let create_body = extract_fn_body(source, "fn create_internal");

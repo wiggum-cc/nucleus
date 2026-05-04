@@ -206,8 +206,12 @@
           OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
 
           shellHook = ''
-            export RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache"
-            export SCCACHE_CACHE_SIZE="5G"
+            if [ "''${NUCLEUS_ENABLE_SCCACHE:-0}" = "1" ]; then
+              export RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache"
+              export SCCACHE_CACHE_SIZE="5G"
+            else
+              unset RUSTC_WRAPPER
+            fi
           '';
 
           packages = with pkgs; [

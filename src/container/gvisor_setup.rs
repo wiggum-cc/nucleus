@@ -185,12 +185,14 @@ impl Container {
             NetworkMode::Bridge(_) => GVisorNetworkMode::Host,
         };
 
-        let rootless_oci = self.config.user_ns_config.is_some();
+        let ignore_cgroups = self.config.user_ns_config.is_some();
+        let runsc_rootless = precreated_userns;
         gvisor.exec_with_oci_bundle_network(
             &self.config.id,
             &bundle,
             gvisor_net,
-            rootless_oci,
+            ignore_cgroups,
+            runsc_rootless,
             self.config.gvisor_platform,
         )?;
 

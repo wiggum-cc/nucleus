@@ -256,24 +256,26 @@ impl GVisorRuntime {
             bundle,
             GVisorNetworkMode::None,
             false,
+            false,
             GVisorPlatform::Systrap,
         )
     }
 
     /// Execute using gVisor with an OCI bundle and explicit network mode.
     ///
-    /// When `rootless` is true, the OCI spec is expected to carry explicit
-    /// user namespace mappings. In that mode we do not pass runsc's CLI
-    /// `--rootless` flag, because gVisor documents that flag as the
-    /// `runsc do`-oriented path rather than the OCI `run` path. We still skip runsc's
-    /// internal cgroup configuration because Nucleus already manages cgroups
-    /// externally and unprivileged callers cannot configure them directly.
+    /// `ignore_cgroups` skips runsc's internal cgroup configuration because
+    /// Nucleus already manages cgroups externally and unprivileged callers
+    /// cannot configure them directly. `runsc_rootless` selects gVisor's
+    /// built-in rootless execution path for cases where Nucleus already
+    /// entered a mapped user namespace and therefore cannot express the
+    /// namespace setup as an OCI `linux.uidMappings` request.
     pub fn exec_with_oci_bundle_network(
         &self,
         container_id: &str,
         bundle: &OciBundle,
         network_mode: GVisorNetworkMode,
-        rootless: bool,
+        ignore_cgroups: bool,
+        runsc_rootless: bool,
         platform: GVisorPlatform,
     ) -> Result<()> {
         info!(
@@ -329,7 +331,8 @@ impl GVisorRuntime {
             bundle,
             &runsc_root,
             network_flag,
-            rootless,
+            ignore_cgroups,
+            runsc_rootless,
             platform,
         );
 
@@ -420,7 +423,8 @@ impl GVisorRuntime {
         bundle: &OciBundle,
         runsc_root: &Path,
         network_flag: &str,
-        rootless: bool,
+        ignore_cgroups: bool,
+        runsc_rootless: bool,
         platform: GVisorPlatform,
     ) -> Vec<String> {
         let mut args = vec![
@@ -429,9 +433,11 @@ impl GVisorRuntime {
             runsc_root.to_string_lossy().to_string(),
         ];
 
-        // Rootless OCI mode relies on user namespace mappings in config.json.
-        // We intentionally do not pass runsc's CLI `--rootless` flag here.
-        if rootless {
+        if runsc_rootless {
+            args.push("--rootless".to_string());
+        }
+
+        if ignore_cgroups {
             args.push("--ignore-cgroups".to_string());
         }
 
@@ -453,6 +459,7 @@ impl GVisorRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oci::OciConfig;
     use std::path::Path;
 
     #[test]
@@ -572,6 +579,52 @@ mod tests {
             path_val, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "exec_environment PATH must be the standard hardcoded value"
         );
+    }
+
+    #[test]
+    fn test_precreated_rootless_args_pass_runsc_rootless() {
+        let rt = GVisorRuntime::with_path("/nix/store/fake-runsc/bin/runsc".to_string());
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = OciBundle::new(
+            tmp.path().join("bundle"),
+            OciConfig::new(vec!["/bin/true".to_string()], None),
+        );
+
+        let args = rt.build_oci_run_args(
+            "container-id",
+            &bundle,
+            tmp.path(),
+            "host",
+            true,
+            true,
+            GVisorPlatform::Systrap,
+        );
+
+        assert!(args.iter().any(|arg| arg == "--rootless"));
+        assert!(args.iter().any(|arg| arg == "--ignore-cgroups"));
+    }
+
+    #[test]
+    fn test_rootless_oci_args_do_not_pass_runsc_rootless() {
+        let rt = GVisorRuntime::with_path("/nix/store/fake-runsc/bin/runsc".to_string());
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = OciBundle::new(
+            tmp.path().join("bundle"),
+            OciConfig::new(vec!["/bin/true".to_string()], None),
+        );
+
+        let args = rt.build_oci_run_args(
+            "container-id",
+            &bundle,
+            tmp.path(),
+            "host",
+            true,
+            false,
+            GVisorPlatform::Systrap,
+        );
+
+        assert!(!args.iter().any(|arg| arg == "--rootless"));
+        assert!(args.iter().any(|arg| arg == "--ignore-cgroups"));
     }
 
     #[test]
