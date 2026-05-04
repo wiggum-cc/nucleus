@@ -3,6 +3,7 @@ use landlock::{
     Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetError,
     RulesetStatus, ABI,
 };
+use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
 /// Target ABI – covers up to Linux 6.12 features (Truncate, IoctlDev, Refer, etc.).
@@ -164,6 +165,71 @@ impl LandlockManager {
         }
     }
 
+    /// Apply an execute-only allowlist for host-side supervisor processes.
+    ///
+    /// This policy handles only `LANDLOCK_ACCESS_FS_EXECUTE`, leaving normal
+    /// read/write access untouched. It is intended for runtimes like gVisor
+    /// that must keep `no_new_privs` clear for their own helper re-exec path,
+    /// while still blocking arbitrary host executable and setuid-wrapper execs
+    /// after the supervisor has entered its setup namespace.
+    pub fn apply_execute_allowlist_policy(
+        &mut self,
+        allowed_roots: &[PathBuf],
+        best_effort: bool,
+    ) -> Result<bool> {
+        if self.applied {
+            debug!("Landlock execute allowlist already applied, skipping");
+            return Ok(true);
+        }
+
+        info!(
+            allowed_roots = ?allowed_roots,
+            "Applying Landlock execute allowlist policy"
+        );
+
+        match self.build_execute_allowlist_and_restrict(allowed_roots) {
+            Ok(status) => match status {
+                RulesetStatus::FullyEnforced => {
+                    self.applied = true;
+                    info!("Landlock execute allowlist fully enforced");
+                    Ok(true)
+                }
+                RulesetStatus::PartiallyEnforced => {
+                    if best_effort {
+                        self.applied = true;
+                        info!("Landlock execute allowlist partially enforced");
+                        Ok(true)
+                    } else {
+                        Err(NucleusError::LandlockError(
+                            "Landlock execute allowlist only partially enforced; strict mode requires full enforcement".to_string(),
+                        ))
+                    }
+                }
+                RulesetStatus::NotEnforced => {
+                    if best_effort {
+                        warn!("Landlock execute allowlist not enforced");
+                        Ok(false)
+                    } else {
+                        Err(NucleusError::LandlockError(
+                            "Landlock execute allowlist not enforced".to_string(),
+                        ))
+                    }
+                }
+            },
+            Err(e) => {
+                if best_effort {
+                    warn!(
+                        "Failed to apply Landlock execute allowlist: {} (continuing without it)",
+                        e
+                    );
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
     /// Build the ruleset and call restrict_self().
     fn build_and_restrict(&self) -> Result<RulesetStatus> {
         let access_all = AccessFs::from_all(TARGET_ABI);
@@ -282,6 +348,46 @@ impl LandlockManager {
         Ok(status.ruleset)
     }
 
+    fn build_execute_allowlist_and_restrict(
+        &self,
+        allowed_roots: &[PathBuf],
+    ) -> Result<RulesetStatus> {
+        let access_execute = AccessFs::Execute;
+        let mut ruleset = Ruleset::default()
+            .handle_access(access_execute)
+            .map_err(ll_err)?
+            .create()
+            .map_err(ll_err)?;
+
+        let mut added_rules = 0usize;
+        for root in allowed_roots {
+            let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            match PathFd::new(canonical.as_path()) {
+                Ok(fd) => {
+                    ruleset = ruleset
+                        .add_rule(PathBeneath::new(fd, access_execute))
+                        .map_err(ll_err)?;
+                    added_rules += 1;
+                }
+                Err(err) => {
+                    warn!(
+                        "Landlock execute allowlist skipped {:?}: {}",
+                        canonical, err
+                    );
+                }
+            }
+        }
+
+        if added_rules == 0 {
+            return Err(NucleusError::LandlockError(
+                "Landlock execute allowlist has no valid executable roots".to_string(),
+            ));
+        }
+
+        let status = ruleset.restrict_self().map_err(ll_err)?;
+        Ok(status.ruleset)
+    }
+
     /// Check if Landlock policy has been applied
     pub fn is_applied(&self) -> bool {
         self.applied
@@ -386,6 +492,24 @@ mod tests {
         // But it should still have write capabilities
         assert!(access_tmp.contains(AccessFs::WriteFile));
         assert!(access_tmp.contains(AccessFs::RemoveFile));
+    }
+
+    #[test]
+    fn test_execute_allowlist_handles_only_execute() {
+        let source = include_str!("landlock.rs");
+        let fn_body = extract_fn_body(source, "fn build_execute_allowlist_and_restrict");
+        assert!(
+            fn_body.contains("let access_execute = AccessFs::Execute"),
+            "execute allowlist must handle only execute access"
+        );
+        assert!(
+            fn_body.contains("handle_access(access_execute)"),
+            "execute allowlist must not handle read/write filesystem rights"
+        );
+        assert!(
+            !fn_body.contains("from_all"),
+            "execute allowlist must not accidentally become a broad filesystem policy"
+        );
     }
 
     #[test]

@@ -1,11 +1,12 @@
+use super::landlock::LandlockManager;
 use crate::error::{NucleusError, Result};
 use crate::oci::OciBundle;
 use nix::unistd::Uid;
 use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Network mode for gVisor runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +258,7 @@ impl GVisorRuntime {
             GVisorNetworkMode::None,
             false,
             false,
+            false,
             GVisorPlatform::Systrap,
         )
     }
@@ -269,6 +271,8 @@ impl GVisorRuntime {
     /// built-in rootless execution path for cases where Nucleus already
     /// entered a mapped user namespace and therefore cannot express the
     /// namespace setup as an OCI `linux.uidMappings` request.
+    /// `require_supervisor_exec_policy` fail-closes if Nucleus cannot install
+    /// the host-side execute allowlist before handing control to runsc.
     pub fn exec_with_oci_bundle_network(
         &self,
         container_id: &str,
@@ -276,6 +280,7 @@ impl GVisorRuntime {
         network_mode: GVisorNetworkMode,
         ignore_cgroups: bool,
         runsc_rootless: bool,
+        require_supervisor_exec_policy: bool,
         platform: GVisorPlatform,
     ) -> Result<()> {
         info!(
@@ -323,10 +328,13 @@ impl GVisorRuntime {
                 ))
             })?;
 
+        let (program_path, exec_allow_roots) =
+            self.prepare_supervisor_runsc_program(&runsc_root)?;
+
         // Build runsc command with OCI bundle.
         // Global flags (--root, --network, --platform) must come BEFORE the subcommand.
         // runsc --root <dir> --network <mode> --platform <plat> run --bundle <path> <id>
-        let args = self.build_oci_run_args(
+        let mut args = self.build_oci_run_args(
             container_id,
             bundle,
             &runsc_root,
@@ -335,11 +343,12 @@ impl GVisorRuntime {
             runsc_rootless,
             platform,
         );
+        args[0] = program_path.to_string_lossy().to_string();
 
         debug!("runsc OCI args: {:?}", args);
 
         // Convert to CStrings for exec
-        let program = CString::new(self.runsc_path.as_str())
+        let program = CString::new(program_path.to_string_lossy().as_ref())
             .map_err(|e| NucleusError::GVisorError(format!("Invalid runsc path: {}", e)))?;
 
         let c_args: Result<Vec<CString>> = args
@@ -357,6 +366,14 @@ impl GVisorRuntime {
         // no_new_privs into runsc makes that helper exec fail with EPERM on
         // the locked-down NixOS VM profile, so leave gVisor to enforce its own
         // sandbox process model after exec.
+        //
+        // For the rootless bridge path, Nucleus has already entered a mapped
+        // user namespace. Install an execute-only Landlock allowlist there:
+        // runsc may still re-exec itself, but escaped host-side code cannot
+        // exec arbitrary host binaries such as NixOS setuid wrappers.
+        if runsc_rootless {
+            self.apply_supervisor_exec_policy(&exec_allow_roots, require_supervisor_exec_policy)?;
+        }
 
         // execve - this replaces the current process with runsc
         nix::unistd::execve::<std::ffi::CString, std::ffi::CString>(&program, &c_args, &c_env)?;
@@ -415,6 +432,79 @@ impl GVisorRuntime {
         push("LOGNAME", "root".to_string())?;
 
         Ok(env)
+    }
+
+    fn prepare_supervisor_runsc_program(
+        &self,
+        runsc_root: &Path,
+    ) -> Result<(PathBuf, Vec<PathBuf>)> {
+        let canonical = std::fs::canonicalize(&self.runsc_path).map_err(|e| {
+            NucleusError::GVisorError(format!(
+                "Failed to canonicalize runsc path {:?}: {}",
+                self.runsc_path, e
+            ))
+        })?;
+
+        if canonical.starts_with("/nix/store") {
+            return Ok((canonical, vec![PathBuf::from("/nix/store")]));
+        }
+
+        let private_dir = runsc_root.join("exec-allow");
+        std::fs::create_dir_all(&private_dir).map_err(|e| {
+            NucleusError::GVisorError(format!(
+                "Failed to create private runsc exec directory {:?}: {}",
+                private_dir, e
+            ))
+        })?;
+        std::fs::set_permissions(&private_dir, std::fs::Permissions::from_mode(0o700)).map_err(
+            |e| {
+                NucleusError::GVisorError(format!(
+                    "Failed to secure private runsc exec directory {:?}: {}",
+                    private_dir, e
+                ))
+            },
+        )?;
+
+        let staged = private_dir.join("runsc");
+        std::fs::copy(&canonical, &staged).map_err(|e| {
+            NucleusError::GVisorError(format!(
+                "Failed to stage runsc binary from {:?} to {:?}: {}",
+                canonical, staged, e
+            ))
+        })?;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o500)).map_err(|e| {
+            NucleusError::GVisorError(format!(
+                "Failed to secure staged runsc binary {:?}: {}",
+                staged, e
+            ))
+        })?;
+
+        Ok((staged, vec![private_dir]))
+    }
+
+    fn apply_supervisor_exec_policy(
+        &self,
+        allowed_roots: &[PathBuf],
+        required: bool,
+    ) -> Result<()> {
+        let mut landlock = LandlockManager::new();
+        let applied = landlock.apply_execute_allowlist_policy(allowed_roots, !required)?;
+        if applied {
+            info!(
+                allowed_roots = ?allowed_roots,
+                "Applied gVisor supervisor execute allowlist"
+            );
+        } else if required {
+            return Err(NucleusError::LandlockError(
+                "Required gVisor supervisor execute allowlist was not applied".to_string(),
+            ));
+        } else {
+            warn!(
+                allowed_roots = ?allowed_roots,
+                "gVisor supervisor execute allowlist unavailable"
+            );
+        }
+        Ok(())
     }
 
     fn build_oci_run_args(
@@ -625,6 +715,24 @@ mod tests {
 
         assert!(!args.iter().any(|arg| arg == "--rootless"));
         assert!(args.iter().any(|arg| arg == "--ignore-cgroups"));
+    }
+
+    #[test]
+    fn test_non_nix_runsc_is_staged_for_supervisor_exec_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_runsc = tmp.path().join("runsc-source");
+        std::fs::write(&fake_runsc, b"fake-runsc").unwrap();
+        std::fs::set_permissions(&fake_runsc, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let rt = GVisorRuntime::with_path(fake_runsc.to_string_lossy().to_string());
+        let runsc_root = tmp.path().join("runsc-root");
+        let (program, allow_roots) = rt.prepare_supervisor_runsc_program(&runsc_root).unwrap();
+
+        assert!(program.starts_with(runsc_root.join("exec-allow")));
+        assert_eq!(allow_roots, vec![runsc_root.join("exec-allow")]);
+        assert_eq!(std::fs::read(&program).unwrap(), b"fake-runsc");
+        let mode = std::fs::metadata(&program).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o500);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use nix::unistd::Uid;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use tracing::info;
 
-use super::runtime::Container;
+use super::{config::ServiceMode, runtime::Container};
 
 impl Container {
     /// Set up container with gVisor and exec.
@@ -187,12 +187,14 @@ impl Container {
 
         let ignore_cgroups = self.config.user_ns_config.is_some();
         let runsc_rootless = precreated_userns;
+        let require_supervisor_exec_policy = self.config.service_mode == ServiceMode::Production;
         gvisor.exec_with_oci_bundle_network(
             &self.config.id,
             &bundle,
             gvisor_net,
             ignore_cgroups,
             runsc_rootless,
+            require_supervisor_exec_policy,
             self.config.gvisor_platform,
         )?;
 
