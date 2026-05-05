@@ -89,7 +89,7 @@
         commonArgs = {
           inherit src;
           pname = "nucleus";
-          version = "0.3.4";
+          version = "0.3.5";
           strictDeps = true;
 
           nativeBuildInputs = [
@@ -166,19 +166,19 @@
           my-crate-fmt = craneLib.cargoFmt {
             inherit src;
             pname = "nucleus";
-            version = "0.3.4";
+            version = "0.3.5";
           };
 
           my-crate-audit = craneLib.cargoAudit {
             inherit src advisory-db;
             pname = "nucleus";
-            version = "0.3.4";
+            version = "0.3.5";
           };
 
           my-crate-deny = craneLib.cargoDeny {
             inherit src;
             pname = "nucleus";
-            version = "0.3.4";
+            version = "0.3.5";
           };
 
           my-crate-nextest = craneLib.cargoNextest (commonArgs // {
