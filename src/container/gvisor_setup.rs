@@ -6,7 +6,8 @@ use crate::filesystem::{
 };
 use crate::network::{BridgeNetwork, NetworkMode};
 use crate::security::{
-    load_json_policy, GVisorNetworkMode, GVisorRuntime, OciBundle, OciConfig, OciMount, OciSeccomp,
+    load_json_policy, GVisorNetworkMode, GVisorOciRunOptions, GVisorRuntime, OciBundle, OciConfig,
+    OciMount, OciSeccomp,
 };
 use nix::unistd::Uid;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -194,14 +195,16 @@ impl Container {
         let ignore_cgroups = self.config.user_ns_config.is_some();
         let runsc_rootless = precreated_userns;
         let require_supervisor_exec_policy = self.config.service_mode == ServiceMode::Production;
-        gvisor.exec_with_oci_bundle_network(
+        gvisor.exec_with_oci_bundle_options(
             &self.config.id,
             &bundle,
-            gvisor_net,
-            ignore_cgroups,
-            runsc_rootless,
-            require_supervisor_exec_policy,
-            self.config.gvisor_platform,
+            GVisorOciRunOptions {
+                network_mode: gvisor_net,
+                ignore_cgroups,
+                runsc_rootless,
+                require_supervisor_exec_policy,
+                platform: self.config.gvisor_platform,
+            },
         )?;
 
         Ok(())

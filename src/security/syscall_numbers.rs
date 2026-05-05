@@ -1,7 +1,7 @@
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-pub(super) const SYS_FADVISE64: i64 = libc::SYS_fadvise64 as i64;
+pub(super) const SYS_FADVISE64: i64 = libc::SYS_fadvise64;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-pub(super) const SYS_SENDFILE: i64 = libc::SYS_sendfile as i64;
+pub(super) const SYS_SENDFILE: i64 = libc::SYS_sendfile;
 
 // Linux/aarch64 has these generic syscalls, but libc 0.2.x does not expose
 // SYS_fadvise64 or SYS_sendfile constants for that target.

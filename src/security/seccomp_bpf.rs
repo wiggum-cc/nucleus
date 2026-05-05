@@ -90,7 +90,8 @@ fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> sock_filter {
 ///
 /// The generated program is semantically equivalent to seccompiler's linear
 /// scan but executes in O(1) for the common case of unconditional allows.
-pub fn compile_bitmap_bpf(
+#[cfg(test)]
+fn compile_bitmap_bpf(
     rules: BTreeMap<i64, Vec<SeccompRule>>,
     mismatch_action: SeccompAction,
     match_action: SeccompAction,

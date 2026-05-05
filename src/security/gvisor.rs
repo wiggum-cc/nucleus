@@ -55,6 +55,43 @@ impl GVisorPlatform {
     }
 }
 
+/// Options for running an OCI bundle with gVisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GVisorOciRunOptions {
+    /// gVisor networking mode passed to runsc.
+    pub network_mode: GVisorNetworkMode,
+    /// Skip runsc's cgroup setup when Nucleus manages cgroups externally.
+    pub ignore_cgroups: bool,
+    /// Use runsc's rootless execution path for pre-created user namespaces.
+    pub runsc_rootless: bool,
+    /// Fail if the host-side supervisor execute allowlist cannot be installed.
+    pub require_supervisor_exec_policy: bool,
+    /// gVisor Sentry platform backend.
+    pub platform: GVisorPlatform,
+}
+
+impl Default for GVisorOciRunOptions {
+    fn default() -> Self {
+        Self {
+            network_mode: GVisorNetworkMode::None,
+            ignore_cgroups: false,
+            runsc_rootless: false,
+            require_supervisor_exec_policy: false,
+            platform: GVisorPlatform::default(),
+        }
+    }
+}
+
+impl GVisorOciRunOptions {
+    fn network_flag(self) -> &'static str {
+        match self.network_mode {
+            GVisorNetworkMode::None => "none",
+            GVisorNetworkMode::Sandbox => "sandbox",
+            GVisorNetworkMode::Host => "host",
+        }
+    }
+}
+
 /// GVisor runtime manager
 ///
 /// Implements the gVisor state machine from
@@ -249,24 +286,14 @@ impl GVisorRuntime {
 
     /// Execute using gVisor with an OCI bundle
     ///
-    /// This is the OCI-compliant way to run containers with gVisor.
-    /// The `network_mode` parameter controls gVisor's --network flag:
-    /// - `GVisorNetworkMode::None` → `--network none` (fully isolated, original behavior)
-    /// - `GVisorNetworkMode::Sandbox` → `--network sandbox` (gVisor user-space network stack)
-    /// - `GVisorNetworkMode::Host` → `--network host` (share host network namespace)
+    /// This is the OCI-compliant way to run containers with gVisor using
+    /// default options: no networking, systrap platform, no rootless flag,
+    /// and no internal cgroup setup override.
     pub fn exec_with_oci_bundle(&self, container_id: &str, bundle: &OciBundle) -> Result<()> {
-        self.exec_with_oci_bundle_network(
-            container_id,
-            bundle,
-            GVisorNetworkMode::None,
-            false,
-            false,
-            false,
-            GVisorPlatform::Systrap,
-        )
+        self.exec_with_oci_bundle_options(container_id, bundle, GVisorOciRunOptions::default())
     }
 
-    /// Execute using gVisor with an OCI bundle and explicit network mode.
+    /// Execute using gVisor with an OCI bundle and explicit run options.
     ///
     /// `ignore_cgroups` skips runsc's internal cgroup configuration because
     /// Nucleus already manages cgroups externally and unprivileged callers
@@ -276,28 +303,18 @@ impl GVisorRuntime {
     /// namespace setup as an OCI `linux.uidMappings` request.
     /// `require_supervisor_exec_policy` fail-closes if Nucleus cannot install
     /// the host-side execute allowlist before handing control to runsc.
-    pub fn exec_with_oci_bundle_network(
+    pub fn exec_with_oci_bundle_options(
         &self,
         container_id: &str,
         bundle: &OciBundle,
-        network_mode: GVisorNetworkMode,
-        ignore_cgroups: bool,
-        runsc_rootless: bool,
-        require_supervisor_exec_policy: bool,
-        platform: GVisorPlatform,
+        options: GVisorOciRunOptions,
     ) -> Result<()> {
         info!(
             "Executing with gVisor using OCI bundle at {:?} (network: {:?}, platform: {:?})",
             bundle.bundle_path(),
-            network_mode,
-            platform,
+            options.network_mode,
+            options.platform,
         );
-
-        let network_flag = match network_mode {
-            GVisorNetworkMode::None => "none",
-            GVisorNetworkMode::Sandbox => "sandbox",
-            GVisorNetworkMode::Host => "host",
-        };
 
         // Create a per-container root directory for runsc state. Do not derive
         // this from the OCI bundle parent: --bundle may be operator-provided,
@@ -314,15 +331,7 @@ impl GVisorRuntime {
         // Build runsc command with OCI bundle.
         // Global flags (--root, --network, --platform) must come BEFORE the subcommand.
         // runsc --root <dir> --network <mode> --platform <plat> run --bundle <path> <id>
-        let mut args = self.build_oci_run_args(
-            container_id,
-            bundle,
-            &runsc_root,
-            network_flag,
-            ignore_cgroups,
-            runsc_rootless,
-            platform,
-        );
+        let mut args = self.build_oci_run_args(container_id, bundle, &runsc_root, options);
         args[0] = program_path.to_string_lossy().to_string();
 
         debug!("runsc OCI args: {:?}", args);
@@ -351,8 +360,11 @@ impl GVisorRuntime {
         // user namespace. Install an execute-only Landlock allowlist there:
         // runsc may still re-exec itself, but escaped host-side code cannot
         // exec arbitrary host binaries such as NixOS setuid wrappers.
-        if runsc_rootless {
-            self.apply_supervisor_exec_policy(&exec_allow_roots, require_supervisor_exec_policy)?;
+        if options.runsc_rootless {
+            self.apply_supervisor_exec_policy(
+                &exec_allow_roots,
+                options.require_supervisor_exec_policy,
+            )?;
         }
 
         // execve - this replaces the current process with runsc
@@ -360,6 +372,33 @@ impl GVisorRuntime {
 
         // Should never reach here
         Ok(())
+    }
+
+    /// Execute using gVisor with an OCI bundle and explicit network mode.
+    ///
+    /// Prefer [`Self::exec_with_oci_bundle_options`] for new call sites.
+    #[allow(clippy::too_many_arguments)]
+    pub fn exec_with_oci_bundle_network(
+        &self,
+        container_id: &str,
+        bundle: &OciBundle,
+        network_mode: GVisorNetworkMode,
+        ignore_cgroups: bool,
+        runsc_rootless: bool,
+        require_supervisor_exec_policy: bool,
+        platform: GVisorPlatform,
+    ) -> Result<()> {
+        self.exec_with_oci_bundle_options(
+            container_id,
+            bundle,
+            GVisorOciRunOptions {
+                network_mode,
+                ignore_cgroups,
+                runsc_rootless,
+                require_supervisor_exec_policy,
+                platform,
+            },
+        )
     }
 
     /// Check if gVisor is available on this system
@@ -881,10 +920,7 @@ impl GVisorRuntime {
         container_id: &str,
         bundle: &OciBundle,
         runsc_root: &Path,
-        network_flag: &str,
-        ignore_cgroups: bool,
-        runsc_rootless: bool,
-        platform: GVisorPlatform,
+        options: GVisorOciRunOptions,
     ) -> Vec<String> {
         let mut args = vec![
             self.runsc_path.clone(),
@@ -892,19 +928,19 @@ impl GVisorRuntime {
             runsc_root.to_string_lossy().to_string(),
         ];
 
-        if runsc_rootless {
+        if options.runsc_rootless {
             args.push("--rootless".to_string());
         }
 
-        if ignore_cgroups {
+        if options.ignore_cgroups {
             args.push("--ignore-cgroups".to_string());
         }
 
         args.extend([
             "--network".to_string(),
-            network_flag.to_string(),
+            options.network_flag().to_string(),
             "--platform".to_string(),
-            platform.as_flag().to_string(),
+            options.platform.as_flag().to_string(),
             "run".to_string(),
             "--bundle".to_string(),
             bundle.bundle_path().to_string_lossy().to_string(),
@@ -1096,10 +1132,13 @@ mod tests {
             "container-id",
             &bundle,
             tmp.path(),
-            "host",
-            true,
-            true,
-            GVisorPlatform::Systrap,
+            GVisorOciRunOptions {
+                network_mode: GVisorNetworkMode::Host,
+                ignore_cgroups: true,
+                runsc_rootless: true,
+                require_supervisor_exec_policy: false,
+                platform: GVisorPlatform::Systrap,
+            },
         );
 
         assert!(args.iter().any(|arg| arg == "--rootless"));
@@ -1119,10 +1158,13 @@ mod tests {
             "container-id",
             &bundle,
             tmp.path(),
-            "host",
-            true,
-            false,
-            GVisorPlatform::Systrap,
+            GVisorOciRunOptions {
+                network_mode: GVisorNetworkMode::Host,
+                ignore_cgroups: true,
+                runsc_rootless: false,
+                require_supervisor_exec_policy: false,
+                platform: GVisorPlatform::Systrap,
+            },
         );
 
         assert!(!args.iter().any(|arg| arg == "--rootless"));
