@@ -637,6 +637,7 @@ This produces a Nix store path containing `/bin`, `/lib`, `/etc`, etc. from the 
 
 ## Egress Policy
 
+When production bridge mode runs without `--egress-allow`, Nucleus installs a strict deny-all OUTPUT policy, including DNS.
 When `--egress-allow` is specified, Nucleus applies iptables OUTPUT chain rules inside the container's network namespace:
 
 1. Allow loopback traffic
@@ -652,9 +653,8 @@ nucleus run --network bridge --dns 10.0.0.1 \
   --egress-allow 10.0.0.0/8 --egress-tcp-port 443 \
   -- ./my-service
 
-# Deny-all egress (only DNS to configured resolvers is allowed)
-nucleus run --network bridge --dns 10.0.0.1 \
-  --egress-allow "" \
+# Production deny-all egress, including DNS
+nucleus run --service-mode production --network bridge --dns 10.0.0.1 \
   -- ./isolated-service
 ```
 
@@ -693,6 +693,8 @@ Nucleus is not a generic external OCI runtime. For gVisor execution it generates
 - `annotations`: runtime metadata passed through to the bundle
 
 That OCI path is the contract used with `runsc`. The native runtime uses Nucleus's direct Linux setup path rather than exposing a separate OCI CLI surface.
+
+Lifecycle hooks execute host-side commands with supervisor privileges. They are not accepted in topology service definitions; use only explicit administrative `nucleus create --hooks` configuration for hooks.
 
 ## Additional Hardening Flags
 

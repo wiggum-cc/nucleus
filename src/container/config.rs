@@ -1,4 +1,6 @@
-use crate::filesystem::normalize_container_destination;
+use crate::filesystem::{
+    normalize_container_destination, normalize_volume_destination, validate_production_rootfs_path,
+};
 use crate::isolation::{NamespaceConfig, UserNamespaceConfig};
 use crate::network::EgressPolicy;
 use crate::resources::ResourceLimits;
@@ -818,26 +820,6 @@ impl ContainerConfig {
             ));
         };
 
-        // Canonicalize to resolve symlinks before validating the prefix,
-        // preventing symlink-based bypasses (e.g. /nix/store/evil -> /etc).
-        let rootfs_path = std::fs::canonicalize(rootfs_path).map_err(|e| {
-            crate::error::NucleusError::ConfigError(format!(
-                "Failed to canonicalize rootfs path '{}': {}",
-                rootfs_path.display(),
-                e
-            ))
-        })?;
-
-        // Allow test rootfs paths under /tmp that simulate /nix/store structure
-        let is_test_rootfs = rootfs_path
-            .to_string_lossy()
-            .contains("nucleus-test-nix-store");
-        if !rootfs_path.starts_with("/nix/store") && !is_test_rootfs {
-            return Err(crate::error::NucleusError::ConfigError(
-                "Production mode requires a /nix/store rootfs path".to_string(),
-            ));
-        }
-
         if self.seccomp_mode == SeccompMode::Trace {
             return Err(crate::error::NucleusError::ConfigError(
                 "Production mode forbids --seccomp-mode trace".to_string(),
@@ -883,13 +865,7 @@ impl ContainerConfig {
             ));
         }
 
-        // Verify rootfs exists (checked last, after config invariants)
-        if !rootfs_path.exists() {
-            return Err(crate::error::NucleusError::ConfigError(format!(
-                "Production mode rootfs path does not exist: {:?}",
-                rootfs_path
-            )));
-        }
+        validate_production_rootfs_path(rootfs_path)?;
 
         Ok(())
     }
@@ -942,7 +918,7 @@ impl ContainerConfig {
         }
 
         for volume in &self.volumes {
-            normalize_container_destination(&volume.dest)?;
+            normalize_volume_destination(&volume.dest)?;
             match &volume.source {
                 VolumeSource::Bind { source } => {
                     if !source.is_absolute() {
@@ -1045,9 +1021,7 @@ impl ContainerConfig {
                         "--bundle requires gVisor runtime; use --runtime gvisor".to_string(),
                     ));
                 }
-                self = self
-                    .with_gvisor(false)
-                    .with_trust_level(TrustLevel::Trusted);
+                self = self.with_gvisor(false);
             }
             RuntimeSelection::GVisor => {
                 self = self.with_gvisor(true);
@@ -1215,20 +1189,7 @@ mod tests {
     }
 
     fn test_rootfs_path() -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-
-        // Create a real directory (not a symlink) whose path contains the
-        // test marker so it survives canonicalization.
-        let rootfs = std::env::temp_dir().join(format!(
-            "nucleus-test-nix-store-{}-{}/rootfs",
-            std::process::id(),
-            id
-        ));
-        std::fs::create_dir_all(&rootfs).unwrap();
-
-        rootfs
+        std::path::PathBuf::from("/nix/store")
     }
 
     #[test]
@@ -1239,13 +1200,15 @@ mod tests {
             .with_service_mode(ServiceMode::Production)
             .with_rootfs_path(rootfs);
         let err = cfg.validate_production_mode().unwrap_err();
-        let _ = std::fs::remove_dir_all(cfg.rootfs_path.as_ref().unwrap());
         assert!(err.to_string().contains("--memory"));
     }
 
     #[test]
     fn test_production_mode_valid_config() {
         let rootfs = test_rootfs_path();
+        if !rootfs.is_dir() {
+            return;
+        }
         let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
             .with_service_mode(ServiceMode::Production)
@@ -1259,8 +1222,56 @@ mod tests {
                     .unwrap(),
             );
         let result = cfg.validate_production_mode();
-        let _ = std::fs::remove_dir_all(&rootfs);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_production_mode_rejects_rootfs_parent_traversal() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_service_mode(ServiceMode::Production)
+            .with_rootfs_path(std::path::PathBuf::from("/nix/store/../../tmp/evil-rootfs"))
+            .with_verify_rootfs_attestation(true)
+            .with_limits(
+                crate::resources::ResourceLimits::default()
+                    .with_memory("512M")
+                    .unwrap()
+                    .with_cpu_cores(2.0)
+                    .unwrap(),
+            );
+
+        let err = cfg.validate_production_mode().unwrap_err();
+
+        assert!(
+            err.to_string().contains("parent traversal"),
+            "Production mode must reject raw rootfs traversal before canonicalization"
+        );
+    }
+
+    #[test]
+    fn test_production_mode_rejects_out_of_store_rootfs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_service_mode(ServiceMode::Production)
+            .with_rootfs_path(rootfs)
+            .with_verify_rootfs_attestation(true)
+            .with_limits(
+                crate::resources::ResourceLimits::default()
+                    .with_memory("512M")
+                    .unwrap()
+                    .with_cpu_cores(2.0)
+                    .unwrap(),
+            );
+
+        let err = cfg.validate_production_mode().unwrap_err();
+
+        assert!(
+            err.to_string().contains("/nix/store"),
+            "Production mode must reject rootfs paths that resolve outside /nix/store"
+        );
     }
 
     #[test]
@@ -1278,7 +1289,6 @@ mod tests {
                     .unwrap(),
             );
         let err = cfg.validate_production_mode().unwrap_err();
-        let _ = std::fs::remove_dir_all(&rootfs);
         assert!(err.to_string().contains("attestation"));
     }
 
@@ -1298,7 +1308,6 @@ mod tests {
                     .unwrap(),
             );
         let err = cfg.validate_production_mode().unwrap_err();
-        let _ = std::fs::remove_dir_all(&rootfs);
         assert!(
             err.to_string().contains("trace"),
             "Production mode must reject seccomp trace mode"
@@ -1318,7 +1327,6 @@ mod tests {
                     .unwrap(),
             );
         let err = cfg.validate_production_mode().unwrap_err();
-        let _ = std::fs::remove_dir_all(&rootfs);
         assert!(err.to_string().contains("--cpus"));
     }
 
@@ -1499,6 +1507,23 @@ mod tests {
     }
 
     #[test]
+    fn test_bind_volume_dest_rejects_reserved_container_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_volume(VolumeMount {
+                source: VolumeSource::Bind {
+                    source: dir.path().to_path_buf(),
+                },
+                dest: PathBuf::from("/etc"),
+                read_only: false,
+            });
+
+        let err = cfg.validate_runtime_support().unwrap_err();
+        assert!(err.to_string().contains("reserved"));
+    }
+
+    #[test]
     fn test_tmpfs_volume_rejects_parent_traversal() {
         let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
@@ -1597,16 +1622,32 @@ mod tests {
 
     #[test]
     fn test_native_runtime_disables_gvisor() {
-        // --runtime native must explicitly disable gVisor and set Trusted trust level
+        // --runtime native selects the native runtime without changing trust policy.
         let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
-            .with_gvisor(false)
-            .with_trust_level(TrustLevel::Trusted);
+            .apply_runtime_selection(RuntimeSelection::Native, false)
+            .unwrap();
+        assert!(!cfg.use_gvisor, "native runtime must disable gVisor");
+        assert_eq!(
+            cfg.trust_level,
+            TrustLevel::Untrusted,
+            "native runtime must preserve the default Untrusted trust level"
+        );
+    }
+
+    #[test]
+    fn test_native_runtime_preserves_explicit_trusted_policy() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_trust_level(TrustLevel::Trusted)
+            .apply_runtime_selection(RuntimeSelection::Native, false)
+            .unwrap();
+
         assert!(!cfg.use_gvisor, "native runtime must disable gVisor");
         assert_eq!(
             cfg.trust_level,
             TrustLevel::Trusted,
-            "native runtime must set Trusted trust level"
+            "native runtime must preserve explicit Trusted trust level"
         );
     }
 

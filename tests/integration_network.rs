@@ -237,12 +237,22 @@ mod tests {
         assert!(policy.allowed_tcp_ports.is_empty());
         assert!(policy.allowed_udp_ports.is_empty());
         assert!(policy.log_denied);
+        assert!(!policy.allow_dns);
+    }
+
+    #[test]
+    fn test_egress_default_allows_dns_for_allowlists() {
+        let policy = EgressPolicy::default();
+        assert!(policy.allowed_cidrs.is_empty());
+        assert!(policy.allowed_tcp_ports.is_empty());
+        assert!(policy.allowed_udp_ports.is_empty());
+        assert!(policy.log_denied);
         assert!(policy.allow_dns);
     }
 
     #[test]
     fn test_egress_policy_builder() {
-        let policy = EgressPolicy::deny_all()
+        let policy = EgressPolicy::default()
             .with_allowed_cidrs(vec!["10.0.0.0/8".to_string()])
             .with_allowed_tcp_ports(vec![443, 80])
             .with_allowed_udp_ports(vec![53]);

@@ -252,11 +252,10 @@ impl CapabilityManager {
     }
 
     /// Verify that namespace-creating capabilities are actually absent from
-    /// the effective set. This is a runtime guard for the clone3 seccomp
-    /// invariant: clone3 cannot be argument-filtered at the BPF level, so
-    /// we rely on CAP_SYS_ADMIN (et al.) being dropped to prevent namespace
-    /// creation. If the check fails in production mode, it returns an error;
-    /// otherwise it emits a warning.
+    /// the effective set. Seccomp blocks unshare, filters clone namespace flags,
+    /// and returns ENOSYS for clone3; dropping these capabilities is the
+    /// independent capability-layer guard. If the check fails in production
+    /// mode, it returns an error; otherwise it emits a warning.
     pub fn verify_no_namespace_caps(production: bool) -> Result<()> {
         use caps::Capability;
         let ns_caps = [
@@ -276,8 +275,8 @@ impl CapabilityManager {
         if !leaked.is_empty() {
             let msg = format!(
                 "SEC-CLONE3: namespace-creating capabilities still present after drop: [{}]. \
-                 clone3 syscall is allowed without argument filtering – these caps \
-                 must be absent to prevent namespace escape.",
+                 seccomp denies unfilterable clone3, but these caps must still be \
+                 absent for defense in depth.",
                 leaked.join(", ")
             );
             if production {

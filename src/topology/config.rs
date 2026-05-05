@@ -62,6 +62,7 @@ fn default_volume_type() -> String {
 
 /// Service (container) definition within a topology.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceDef {
     /// Nix store path to rootfs derivation
     pub rootfs: String,
@@ -146,10 +147,9 @@ pub struct ServiceDef {
     /// Container runtime
     #[serde(default = "default_runtime")]
     pub runtime: String,
-
-    /// OCI lifecycle hooks
-    #[serde(default)]
-    pub hooks: Option<crate::security::OciHooks>,
+    // OCI lifecycle hooks are intentionally not part of topology service
+    // configuration. Hooks execute host commands as the Nucleus supervisor user
+    // and must be supplied only through explicit administrative create config.
 }
 
 fn default_cpus() -> f64 {
@@ -223,7 +223,7 @@ pub(crate) fn parse_service_volume_mount(spec: &str) -> crate::error::Result<Ser
         )));
     }
 
-    let dest = crate::filesystem::normalize_container_destination(Path::new(dest))?;
+    let dest = crate::filesystem::normalize_volume_destination(Path::new(dest))?;
     Ok(ServiceVolumeMount {
         volume: volume.to_string(),
         dest,
@@ -281,8 +281,8 @@ impl TopologyConfig {
         }
 
         // Validate topology name and all service keys use safe characters,
-        // preventing path traversal when they are used in temp-file paths
-        // (e.g. /tmp/nucleus-hooks-{topology}-{service}.json).
+        // preventing path traversal when they are used in generated container
+        // names and state paths.
         crate::container::validate_container_name(&self.name).map_err(|_| {
             crate::error::NucleusError::ConfigError(format!(
                 "Topology name '{}' contains invalid characters (allowed: a-zA-Z0-9, '-', '_', '.')",
@@ -319,6 +319,7 @@ impl TopologyConfig {
                             name, path
                         )));
                     }
+                    crate::filesystem::validate_bind_mount_source_policy(Path::new(path))?;
                 }
                 "ephemeral" => {
                     if volume.path.is_some() {
@@ -606,6 +607,46 @@ volumes = ["/host/path:/container/path"]
     }
 
     #[test]
+    fn test_validate_rejects_sensitive_persistent_volume_paths() {
+        let toml = r#"
+name = "test"
+
+[volumes.host-etc]
+volume_type = "persistent"
+path = "/etc/nucleus"
+
+[services.web]
+rootfs = "/nix/store/web"
+command = ["/bin/web"]
+memory = "256M"
+volumes = ["host-etc:/var/lib/web"]
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("sensitive host path"));
+    }
+
+    #[test]
+    fn test_validate_rejects_reserved_volume_destinations() {
+        let toml = r#"
+name = "test"
+
+[volumes.data]
+volume_type = "ephemeral"
+size = "64M"
+
+[services.web]
+rootfs = "/nix/store/web"
+command = ["/bin/web"]
+memory = "256M"
+volumes = ["data:/etc"]
+"#;
+        let config = TopologyConfig::from_toml(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("reserved"));
+    }
+
+    #[test]
     fn test_validate_rejects_invalid_volume_owner() {
         let toml = r#"
 name = "test"
@@ -624,5 +665,29 @@ volumes = ["data:/var/lib/web"]
         let config = TopologyConfig::from_toml(toml).unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("volume owner"));
+    }
+
+    #[test]
+    fn test_topology_rejects_service_oci_hooks() {
+        let toml = r#"
+name = "test"
+
+[services.web]
+rootfs = "/nix/store/web"
+command = ["/bin/web"]
+memory = "256M"
+
+[services.web.hooks]
+poststart = [
+  { path = "/bin/sh", args = ["sh", "-c", "id > /tmp/nucleus-owned"] }
+]
+"#;
+        let err = TopologyConfig::from_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field `hooks`") || msg.contains("unknown field 'hooks'"),
+            "topology service hooks must be rejected at parse time, got: {}",
+            msg
+        );
     }
 }

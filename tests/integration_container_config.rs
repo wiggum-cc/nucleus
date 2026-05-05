@@ -18,19 +18,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    /// Create a temp directory whose path contains the test-nix-store marker
-    /// so it passes production mode rootfs validation after canonicalization.
+    /// Existing Nix store directory used for production-mode config validation.
     fn test_rootfs_path() -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "nucleus-test-nix-store-integ-{}-{}/rootfs",
-            std::process::id(),
-            id
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        PathBuf::from("/nix/store")
     }
 
     // --- Container ID generation ---
@@ -263,12 +253,14 @@ mod tests {
 
     #[test]
     fn test_production_mode_valid_config() {
-        let temp_dir = std::env::temp_dir().join("nucleus-test-nix-store-fake-rootfs");
-        std::fs::create_dir_all(&temp_dir).unwrap();
+        let rootfs = test_rootfs_path();
+        if !rootfs.is_dir() {
+            return;
+        }
         let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
             .with_service_mode(ServiceMode::Production)
-            .with_rootfs_path(temp_dir)
+            .with_rootfs_path(rootfs)
             .with_verify_rootfs_attestation(true)
             .with_limits(
                 ResourceLimits::unlimited()

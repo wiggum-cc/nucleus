@@ -1,13 +1,15 @@
 use crate::container::OciStatus;
 use crate::error::{NucleusError, Result};
-use crate::filesystem::normalize_container_destination;
+use crate::filesystem::{normalize_container_destination, normalize_volume_destination};
 use crate::isolation::{IdMapping, NamespaceConfig, UserNamespaceConfig};
 use crate::resources::ResourceLimits;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
+use std::ffi::CString;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
@@ -1054,7 +1056,7 @@ impl OciConfig {
         use crate::container::VolumeSource;
 
         for volume in volumes {
-            let dest = normalize_container_destination(&volume.dest)?;
+            let dest = normalize_volume_destination(&volume.dest)?;
             match &volume.source {
                 VolumeSource::Bind { source } => {
                     crate::filesystem::validate_bind_mount_source(source)?;
@@ -1363,6 +1365,84 @@ pub struct OciBundle {
     config: OciConfig,
 }
 
+fn safe_child_name(name: &str) -> std::io::Result<CString> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid path child name",
+        ));
+    }
+
+    CString::new(name).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path child name contains NUL",
+        )
+    })
+}
+
+fn open_dir_nofollow(path: &Path) -> std::io::Result<fs::File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+fn mkdirat_dir(parent: &fs::File, name: &str, mode: libc::mode_t) -> std::io::Result<()> {
+    let name = safe_child_name(name)?;
+    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) };
+
+    if result == 0 {
+        return Ok(());
+    }
+
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EEXIST) {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
+fn openat_dir_nofollow(parent: &fs::File, name: &str) -> std::io::Result<fs::File> {
+    let name = safe_child_name(name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+}
+
+fn openat_file_nofollow(
+    parent: &fs::File,
+    name: &str,
+    mode: libc::mode_t,
+) -> std::io::Result<fs::File> {
+    let name = safe_child_name(name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            mode,
+        )
+    };
+
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+}
+
 impl OciBundle {
     /// Create a new OCI bundle
     pub fn new(bundle_path: PathBuf, config: OciConfig) -> Self {
@@ -1376,35 +1456,54 @@ impl OciBundle {
     pub fn create(&self) -> Result<()> {
         info!("Creating OCI bundle at {:?}", self.bundle_path);
 
-        // Create bundle directory
+        // Create the bundle directory, then reopen it without following a final
+        // symlink before applying permissions or creating children beneath it.
         fs::create_dir_all(&self.bundle_path).map_err(|e| {
             NucleusError::GVisorError(format!(
                 "Failed to create bundle directory {:?}: {}",
                 self.bundle_path, e
             ))
         })?;
-        fs::set_permissions(&self.bundle_path, fs::Permissions::from_mode(0o700)).map_err(|e| {
+        let bundle_dir = open_dir_nofollow(&self.bundle_path).map_err(|e| {
             NucleusError::GVisorError(format!(
-                "Failed to secure bundle directory permissions {:?}: {}",
+                "Failed to open bundle directory safely {:?}: {}",
                 self.bundle_path, e
             ))
         })?;
+        bundle_dir
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(|e| {
+                NucleusError::GVisorError(format!(
+                    "Failed to secure bundle directory permissions {:?}: {}",
+                    self.bundle_path, e
+                ))
+            })?;
 
-        // Create rootfs directory
+        // Create rootfs relative to the trusted bundle directory. mkdirat plus
+        // openat(O_NOFOLLOW) prevents a pre-existing rootfs symlink from being
+        // chmodded when rootfs needs to be traversable for non-root UIDs.
         let rootfs = self.bundle_path.join("rootfs");
-        fs::create_dir_all(&rootfs).map_err(|e| {
+        mkdirat_dir(&bundle_dir, "rootfs", 0o755).map_err(|e| {
             NucleusError::GVisorError(format!("Failed to create rootfs directory: {}", e))
+        })?;
+        let rootfs_dir = openat_dir_nofollow(&bundle_dir, "rootfs").map_err(|e| {
+            NucleusError::GVisorError(format!(
+                "Failed to open rootfs directory safely {:?}: {}",
+                rootfs, e
+            ))
         })?;
         // The rootfs is the container's "/" – it must be traversable by the
         // container UID which may be non-root (via --user).  Mode 0755 matches
         // the standard Linux root directory permission and lets gVisor's VFS
         // permit path traversal for any UID.
-        fs::set_permissions(&rootfs, fs::Permissions::from_mode(0o755)).map_err(|e| {
-            NucleusError::GVisorError(format!(
-                "Failed to set rootfs directory permissions {:?}: {}",
-                rootfs, e
-            ))
-        })?;
+        rootfs_dir
+            .set_permissions(fs::Permissions::from_mode(0o755))
+            .map_err(|e| {
+                NucleusError::GVisorError(format!(
+                    "Failed to set rootfs directory permissions {:?}: {}",
+                    rootfs, e
+                ))
+            })?;
 
         // Write config.json
         let config_path = self.bundle_path.join("config.json");
@@ -1412,15 +1511,19 @@ impl OciBundle {
             NucleusError::GVisorError(format!("Failed to serialize OCI config: {}", e))
         })?;
 
-        // L5: Use O_NOFOLLOW via custom_flags to prevent writing through symlinks
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&config_path)
-            .map_err(|e| NucleusError::GVisorError(format!("Failed to open config.json: {}", e)))?;
+        let mut file = openat_file_nofollow(&bundle_dir, "config.json", 0o600).map_err(|e| {
+            NucleusError::GVisorError(format!(
+                "Failed to open config.json safely {:?}: {}",
+                config_path, e
+            ))
+        })?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| {
+                NucleusError::GVisorError(format!(
+                    "Failed to set config.json permissions {:?}: {}",
+                    config_path, e
+                ))
+            })?;
         file.write_all(config_json.as_bytes()).map_err(|e| {
             NucleusError::GVisorError(format!("Failed to write config.json: {}", e))
         })?;
@@ -1457,6 +1560,7 @@ impl OciBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
     #[test]
@@ -1504,6 +1608,67 @@ mod tests {
 
         bundle.cleanup().unwrap();
         assert!(!bundle_path.exists());
+    }
+
+    #[test]
+    fn test_oci_bundle_rejects_bundle_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let bundle_path = temp_dir.path().join("test-bundle");
+        let protected_host_dir = temp_dir.path().join("protected-host-dir");
+
+        fs::create_dir_all(&protected_host_dir).unwrap();
+        fs::set_permissions(&protected_host_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&protected_host_dir, &bundle_path).unwrap();
+
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None);
+        let bundle = OciBundle::new(bundle_path.clone(), config);
+
+        let err = bundle.create().unwrap_err();
+
+        assert!(format!("{err}").contains("Failed to open bundle directory safely"));
+        assert_eq!(
+            fs::metadata(&protected_host_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(fs::symlink_metadata(&bundle_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn test_oci_bundle_rejects_rootfs_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let bundle_path = temp_dir.path().join("test-bundle");
+        let protected_host_dir = temp_dir.path().join("protected-host-dir");
+
+        fs::create_dir_all(&bundle_path).unwrap();
+        fs::create_dir_all(&protected_host_dir).unwrap();
+        fs::set_permissions(&protected_host_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&protected_host_dir, bundle_path.join("rootfs")).unwrap();
+
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None);
+        let bundle = OciBundle::new(bundle_path.clone(), config);
+
+        let err = bundle.create().unwrap_err();
+
+        assert!(format!("{err}").contains("Failed to open rootfs directory safely"));
+        assert_eq!(
+            fs::metadata(&protected_host_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(fs::symlink_metadata(bundle_path.join("rootfs"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]
@@ -1610,6 +1775,22 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("sensitive host path"));
+    }
+
+    #[test]
+    fn test_volume_mounts_reject_reserved_destinations() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = OciConfig::new(vec!["/bin/sh".to_string()], None)
+            .with_volume_mounts(&[crate::container::VolumeMount {
+                source: crate::container::VolumeSource::Bind {
+                    source: tmp.path().to_path_buf(),
+                },
+                dest: std::path::PathBuf::from("/usr/bin"),
+                read_only: true,
+            }])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("reserved"));
     }
 
     #[test]

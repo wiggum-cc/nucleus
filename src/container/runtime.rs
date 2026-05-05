@@ -7,8 +7,8 @@ use crate::error::{NucleusError, Result, StateTransition};
 use crate::filesystem::{
     audit_mounts, bind_mount_host_paths, bind_mount_rootfs, create_dev_nodes, create_minimal_fs,
     mask_proc_paths, mount_procfs, mount_secrets_inmemory, mount_volumes, snapshot_context_dir,
-    switch_root, verify_context_manifest, verify_rootfs_attestation, FilesystemState,
-    LazyContextPopulator, TmpfsMount,
+    switch_root, validate_production_rootfs_path, verify_context_manifest,
+    verify_rootfs_attestation, FilesystemState, LazyContextPopulator, TmpfsMount,
 };
 use crate::isolation::{NamespaceManager, UserNamespaceMapper};
 use crate::network::{BridgeDriver, BridgeNetwork, NatBackend, NetworkMode, UserspaceNetwork};
@@ -310,6 +310,15 @@ impl Container {
 
         // Validate production mode invariants before anything else.
         config.validate_production_mode()?;
+        if config.service_mode == ServiceMode::Production {
+            let rootfs_path = config.rootfs_path.as_ref().ok_or_else(|| {
+                NucleusError::ConfigError(
+                    "Production mode requires explicit --rootfs path (no host bind mounts)"
+                        .to_string(),
+                )
+            })?;
+            config.rootfs_path = Some(validate_production_rootfs_path(rootfs_path)?);
+        }
         Self::assert_kernel_lockdown(&config)?;
 
         Self::apply_network_mode_guards(&mut config, is_root)?;
@@ -342,7 +351,8 @@ impl Container {
         }
 
         // Create exec FIFO only for the two-phase create/start lifecycle.
-        // `run()` starts immediately and avoids this cross-root-path sync.
+        // The immediate `run()` lifecycle is still gated by parent_setup_pipe
+        // below; it just does not need an externally-triggered start FIFO.
         let exec_fifo = if defer_exec_until_start {
             let exec_fifo = state_mgr.exec_fifo_path(&config.id)?;
             nix::unistd::mkfifo(&exec_fifo, Mode::S_IRUSR | Mode::S_IWUSR).map_err(|e| {
@@ -448,8 +458,8 @@ impl Container {
         } else {
             None
         };
-        let (attach_read, attach_write) = pipe().map_err(|e| {
-            NucleusError::ExecError(format!("Failed to create cgroup attach sync pipe: {}", e))
+        let (parent_setup_read, parent_setup_write) = pipe().map_err(|e| {
+            NucleusError::ExecError(format!("Failed to create parent setup sync pipe: {}", e))
         })?;
 
         // M11: fork() in multi-threaded context. Flush log buffers and drop
@@ -462,7 +472,7 @@ impl Container {
         match unsafe { fork() }? {
             ForkResult::Parent { child } => {
                 drop(ready_write);
-                drop(attach_read);
+                drop(parent_setup_read);
                 let (userns_request_read, userns_ack_write) =
                     if let Some((request_read, request_write, ack_read, ack_write)) = userns_sync {
                         drop(request_write);
@@ -473,8 +483,11 @@ impl Container {
                     };
                 info!("Forked child process: {}", child);
 
-                // Use a closure so that on any error we kill the child process
-                // instead of leaving it orphaned and blocked on the exec FIFO.
+                // Use a closure so that on any error we kill the forked child.
+                // If the PID-namespace child has already reported readiness,
+                // also kill that target PID; it may otherwise be reparented
+                // away from the intermediate process.
+                let mut target_pid_for_cleanup: Option<u32> = None;
                 let parent_setup = || -> Result<CreatedContainer> {
                     if needs_external_userns_mapping {
                         let user_config = config.user_ns_config.as_ref().ok_or_else(|| {
@@ -510,6 +523,7 @@ impl Container {
                     }
 
                     let target_pid = Self::wait_for_namespace_ready(&ready_read, child)?;
+                    target_pid_for_cleanup = Some(target_pid);
 
                     let cgroup_path = cgroup_opt
                         .as_ref()
@@ -559,10 +573,6 @@ impl Container {
                     if let Some(ref mut cgroup) = cgroup_opt {
                         cgroup.attach_process(target_pid)?;
                     }
-                    Self::send_sync_byte(
-                        &attach_write,
-                        "Failed to notify child that cgroup attachment is complete",
-                    )?;
 
                     if let NetworkMode::Bridge(ref bridge_config) = config.network {
                         match BridgeDriver::setup_with_id(
@@ -599,6 +609,11 @@ impl Container {
                         }
                     }
 
+                    Self::send_sync_byte(
+                        &parent_setup_write,
+                        "Failed to notify child that parent setup is complete",
+                    )?;
+
                     info!(
                         "Container {} created (child pid {}), waiting for start",
                         config.id, target_pid
@@ -619,8 +634,9 @@ impl Container {
                 };
 
                 parent_setup().map_err(|e| {
-                    // Kill the child so it doesn't remain orphaned and blocked
-                    // on the exec FIFO.
+                    if let Some(target_pid) = target_pid_for_cleanup {
+                        let _ = kill(Pid::from_raw(target_pid as i32), Signal::SIGKILL);
+                    }
                     let _ = kill(child, Signal::SIGKILL);
                     let _ = waitpid(child, None);
                     e
@@ -628,7 +644,7 @@ impl Container {
             }
             ForkResult::Child => {
                 drop(ready_read);
-                drop(attach_write);
+                drop(parent_setup_write);
                 let (userns_request_write, userns_ack_read) =
                     if let Some((request_read, request_write, ack_read, ack_write)) = userns_sync {
                         drop(request_read);
@@ -644,7 +660,7 @@ impl Container {
                     Some(ready_write),
                     userns_request_write,
                     userns_ack_read,
-                    Some(attach_read),
+                    Some(parent_setup_read),
                     exec_fifo,
                     runtime_base_override,
                 ) {
@@ -697,7 +713,7 @@ impl Container {
         ready_pipe: Option<OwnedFd>,
         userns_request_pipe: Option<OwnedFd>,
         userns_ack_pipe: Option<OwnedFd>,
-        cgroup_attach_pipe: Option<OwnedFd>,
+        parent_setup_pipe: Option<OwnedFd>,
         exec_fifo: Option<PathBuf>,
         runtime_base_override: Option<PathBuf>,
     ) -> Result<()> {
@@ -734,11 +750,11 @@ impl Container {
             if let Some(fd) = ready_pipe {
                 Self::notify_namespace_ready(&fd, std::process::id())?;
             }
-            if let Some(fd) = cgroup_attach_pipe.as_ref() {
+            if let Some(fd) = parent_setup_pipe.as_ref() {
                 Self::wait_for_sync_byte(
                     fd,
-                    "Parent closed cgroup attach pipe before signalling gVisor child",
-                    "Failed waiting for cgroup attach acknowledgement",
+                    "Parent closed setup pipe before signalling gVisor child",
+                    "Failed waiting for parent setup acknowledgement",
                 )?;
             }
             return self.setup_and_exec_gvisor(gvisor_bridge_precreated_userns);
@@ -783,11 +799,11 @@ impl Container {
                     std::process::exit(Self::wait_for_pid_namespace_child(child));
                 }
                 ForkResult::Child => {
-                    if let Some(fd) = cgroup_attach_pipe.as_ref() {
+                    if let Some(fd) = parent_setup_pipe.as_ref() {
                         Self::wait_for_sync_byte(
                             fd,
-                            "Parent closed cgroup attach pipe before signalling PID 1 child",
-                            "Failed waiting for cgroup attach acknowledgement",
+                            "Parent closed setup pipe before signalling PID 1 child",
+                            "Failed waiting for parent setup acknowledgement",
                         )?;
                     }
                     // Continue container setup as PID 1 in the new namespace.
@@ -797,11 +813,11 @@ impl Container {
             if let Some(fd) = ready_pipe {
                 Self::notify_namespace_ready(&fd, std::process::id())?;
             }
-            if let Some(fd) = cgroup_attach_pipe.as_ref() {
+            if let Some(fd) = parent_setup_pipe.as_ref() {
                 Self::wait_for_sync_byte(
                     fd,
-                    "Parent closed cgroup attach pipe before signalling container child",
-                    "Failed waiting for cgroup attach acknowledgement",
+                    "Parent closed setup pipe before signalling container child",
+                    "Failed waiting for parent setup acknowledgement",
                 )?;
             }
         }
@@ -890,10 +906,15 @@ impl Container {
 
         // 7. Mount runtime paths: either a pre-built rootfs or host bind mounts
         if let Some(ref rootfs_path) = self.config.rootfs_path {
+            let rootfs_path = if self.config.service_mode == ServiceMode::Production {
+                validate_production_rootfs_path(rootfs_path)?
+            } else {
+                rootfs_path.clone()
+            };
             if self.config.verify_rootfs_attestation {
-                verify_rootfs_attestation(rootfs_path)?;
+                verify_rootfs_attestation(&rootfs_path)?;
             }
-            bind_mount_rootfs(&container_root, rootfs_path)?;
+            bind_mount_rootfs(&container_root, &rootfs_path)?;
         } else {
             bind_mount_host_paths(&container_root, is_rootless)?;
         }
@@ -1107,8 +1128,8 @@ impl Container {
         }
 
         // 12c. Verify that namespace-creating capabilities are truly gone before
-        // installing seccomp. clone3 is allowed without argument filtering, so this
-        // is the sole guard against namespace escape via clone3.
+        // installing seccomp. Seccomp denies unfilterable clone3 and filters
+        // clone namespace flags; capability dropping remains an independent guard.
         CapabilityManager::verify_no_namespace_caps(
             self.config.service_mode == ServiceMode::Production,
         )?;
@@ -1843,7 +1864,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_uses_immediate_start_path() {
+    fn test_run_uses_immediate_start_path_with_parent_setup_gate() {
         let source = include_str!("runtime.rs");
         let fn_start = source.find("pub fn run(&self) -> Result<i32>").unwrap();
         let after = &source[fn_start..];
@@ -1871,6 +1892,12 @@ mod tests {
         assert!(
             !run_body.contains("self.create()?.start()"),
             "run() must not route through create()+start()"
+        );
+
+        let create_body = extract_fn_body(source, "fn create_internal");
+        assert!(
+            create_body.contains("parent_setup_write"),
+            "immediate run() must still use a parent setup gate before child setup proceeds"
         );
     }
 
@@ -2119,6 +2146,92 @@ mod tests {
         assert!(
             init_body.contains("assert_single_threaded_for_fork(\"init supervisor fork\")"),
             "run_as_init must assert single-threaded before fork"
+        );
+    }
+
+    #[test]
+    fn test_parent_setup_gate_released_after_network_policy() {
+        let source = include_str!("runtime.rs");
+        let create_body = extract_fn_body(source, "fn create_internal");
+
+        let cgroup_attach = create_body.find("cgroup.attach_process").unwrap();
+        let bridge_setup = create_body.find("BridgeDriver::setup_with_id").unwrap();
+        let egress_policy = create_body.find("net.apply_egress_policy").unwrap();
+        let release = create_body
+            .find("Failed to notify child that parent setup is complete")
+            .unwrap();
+        let created = create_body.find("Ok(CreatedContainer").unwrap();
+
+        assert!(
+            cgroup_attach < bridge_setup,
+            "parent setup gate must not release before cgroup attachment"
+        );
+        assert!(
+            bridge_setup < egress_policy && egress_policy < release,
+            "parent setup gate must not release before bridge and egress policy setup"
+        );
+        assert!(
+            release < created,
+            "create_internal must release the child only after all fallible parent setup succeeds"
+        );
+        assert!(
+            !create_body.contains("cgroup attachment is complete"),
+            "child setup gate must not be released immediately after cgroup attachment"
+        );
+    }
+
+    #[test]
+    fn test_child_waits_for_parent_setup_before_exec_paths() {
+        let source = include_str!("runtime.rs");
+        let setup_body = extract_fn_body(source, "fn setup_and_exec");
+
+        let gvisor_wait = setup_body
+            .find("Parent closed setup pipe before signalling gVisor child")
+            .unwrap();
+        let gvisor_exec = setup_body.find("setup_and_exec_gvisor").unwrap();
+        assert!(
+            gvisor_wait < gvisor_exec,
+            "gVisor path must wait for parent setup before execing runsc"
+        );
+
+        let pid1_wait = setup_body
+            .find("Parent closed setup pipe before signalling PID 1 child")
+            .unwrap();
+        let namespace_enter = setup_body.find("namespace_mgr.enter()?").unwrap();
+        assert!(
+            pid1_wait < namespace_enter,
+            "PID namespace child must wait for parent setup before container setup continues"
+        );
+
+        let direct_wait = setup_body
+            .find("Parent closed setup pipe before signalling container child")
+            .unwrap();
+        assert!(
+            direct_wait < namespace_enter,
+            "non-PID namespace child must wait for parent setup before container setup continues"
+        );
+    }
+
+    #[test]
+    fn test_parent_setup_failure_kills_reported_target_pid() {
+        let source = include_str!("runtime.rs");
+        let create_body = extract_fn_body(source, "fn create_internal");
+
+        let record_target = create_body
+            .find("target_pid_for_cleanup = Some(target_pid)")
+            .unwrap();
+        let kill_target = create_body
+            .find("kill(Pid::from_raw(target_pid as i32), Signal::SIGKILL)")
+            .unwrap();
+        let kill_intermediate = create_body.find("kill(child, Signal::SIGKILL)").unwrap();
+
+        assert!(
+            record_target < kill_target,
+            "parent setup cleanup must remember the reported target PID"
+        );
+        assert!(
+            kill_target < kill_intermediate,
+            "cleanup must kill the target PID before reaping the intermediate fork"
         );
     }
 

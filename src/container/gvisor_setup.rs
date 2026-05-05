@@ -1,7 +1,8 @@
 use crate::error::{NucleusError, Result};
 use crate::filesystem::{
     create_dev_nodes, create_minimal_fs, read_regular_file_nofollow, resolve_container_destination,
-    snapshot_context_dir, verify_context_manifest, verify_rootfs_attestation, ContextPopulator,
+    snapshot_context_dir, validate_production_rootfs_path, verify_context_manifest,
+    verify_rootfs_attestation, ContextPopulator,
 };
 use crate::network::{BridgeNetwork, NetworkMode};
 use crate::security::{
@@ -92,10 +93,15 @@ impl Container {
 
         // Mount pre-built rootfs if provided
         if let Some(ref rootfs_path) = self.config.rootfs_path {
+            let rootfs_path = if self.config.service_mode == ServiceMode::Production {
+                validate_production_rootfs_path(rootfs_path)?
+            } else {
+                rootfs_path.clone()
+            };
             if self.config.verify_rootfs_attestation {
-                verify_rootfs_attestation(rootfs_path)?;
+                verify_rootfs_attestation(&rootfs_path)?;
             }
-            oci_config = oci_config.with_rootfs_binds(rootfs_path);
+            oci_config = oci_config.with_rootfs_binds(&rootfs_path);
         } else {
             oci_config = oci_config.with_host_runtime_binds();
         }

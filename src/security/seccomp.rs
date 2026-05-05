@@ -461,29 +461,10 @@ impl SeccompManager {
         }
         rules.insert(libc::SYS_mprotect, mprotect_rules);
 
-        // clone3: ALLOWED unconditionally. clone3 passes flags inside a struct
-        // pointer that seccomp BPF cannot dereference, so namespace-flag filtering
-        // is impossible at the BPF level. However, glibc 2.34+ and newer musl use
-        // clone3 internally for posix_spawn/fork – blocking it breaks
-        // std::process::Command and any child-process spawning on modern systems.
-        //
-        // SECURITY INVARIANT: Namespace creation via clone3 is prevented solely by
-        // dropping CAP_SYS_ADMIN (and other namespace caps) *before* this seccomp
-        // filter is installed. If capability dropping is bypassed, clone3 becomes
-        // an unfiltered path to namespace creation. This is a known single point
-        // of failure – see CapabilityManager::drop_all() which must run first.
-        //
-        // Verify the invariant: CAP_SYS_ADMIN must not be in the effective set.
-        // CAP_SYS_ADMIN = capability bit 21
-        if Self::has_effective_cap(21) {
-            return Err(NucleusError::SeccompError(
-                "SECURITY: CAP_SYS_ADMIN is still in the effective capability set. \
-                 Capabilities must be dropped before installing seccomp filters \
-                 (clone3 is allowed unconditionally)."
-                    .to_string(),
-            ));
-        }
-        rules.insert(libc::SYS_clone3, Vec::new());
+        // clone3 is intentionally absent from the allow map. Its flags live in a
+        // user pointer (struct clone_args), which seccomp BPF cannot dereference,
+        // so it cannot be safely namespace-filtered. The BPF compiler adds an
+        // exact-match ENOSYS deny for clone3 so libc falls back to filtered clone.
 
         // clone: allow but deny namespace-creating flags to prevent nested namespace creation
         let clone_condition = SeccompCondition::new(
@@ -534,8 +515,9 @@ impl SeccompManager {
         let target_arch = std::env::consts::ARCH.try_into().map_err(|e| {
             NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
         })?;
-        super::seccomp_bpf::compile_bitmap_bpf(
+        super::seccomp_bpf::compile_bitmap_bpf_with_errno_syscalls(
             rules,
+            Self::errno_denied_syscalls(),
             SeccompAction::KillProcess,
             SeccompAction::Allow,
             target_arch,
@@ -549,6 +531,11 @@ impl SeccompManager {
         extra_syscalls: &[String],
     ) -> BTreeMap<i64, Vec<SeccompRule>> {
         Self::minimal_filter(allow_network, extra_syscalls).unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn errno_denied_syscalls_for_test() -> &'static [(i64, u32)] {
+        Self::errno_denied_syscalls()
     }
 
     /// Apply seccomp filter
@@ -622,8 +609,9 @@ impl SeccompManager {
             }
         };
 
-        let bpf_prog: BpfProgram = match super::seccomp_bpf::compile_bitmap_bpf(
+        let bpf_prog: BpfProgram = match super::seccomp_bpf::compile_bitmap_bpf_with_errno_syscalls(
             rules,
+            Self::errno_denied_syscalls(),
             SeccompAction::KillProcess,
             SeccompAction::Allow,
             target_arch,
@@ -733,6 +721,13 @@ impl SeccompManager {
         for syscall_group in &profile.syscalls {
             if syscall_group.action == "SCMP_ACT_ALLOW" {
                 for name in &syscall_group.names {
+                    if name == "clone3" {
+                        warn!(
+                            "Custom seccomp profile requested clone3; ignoring it and returning \
+                             ENOSYS because clone3 namespace flags cannot be argument-filtered"
+                        );
+                        continue;
+                    }
                     if let Some(nr) = syscall_name_to_number(name) {
                         rules.insert(nr, Vec::new());
                     } else {
@@ -762,19 +757,13 @@ impl SeccompManager {
                 }
             }
         }
-        // H2: clone3 is allowed in the built-in filter (needed for glibc 2.34+).
-        // Apply the same policy to custom profiles for consistency. The security
-        // invariant against namespace creation via clone3 is enforced by dropping
-        // CAP_SYS_ADMIN *before* seccomp is installed (see verify_no_namespace_caps).
-        // If the custom profile doesn't include clone3, add it.
-        rules.entry(libc::SYS_clone3).or_default();
-
         let target_arch = std::env::consts::ARCH.try_into().map_err(|e| {
             NucleusError::SeccompError(format!("Unsupported architecture: {:?}", e))
         })?;
 
-        let bpf_prog: BpfProgram = super::seccomp_bpf::compile_bitmap_bpf(
+        let bpf_prog: BpfProgram = super::seccomp_bpf::compile_bitmap_bpf_with_errno_syscalls(
             rules,
+            Self::errno_denied_syscalls(),
             SeccompAction::KillProcess,
             SeccompAction::Allow,
             target_arch,
@@ -831,9 +820,12 @@ impl SeccompManager {
 
     /// Syscalls that the built-in filter restricts at the argument level.
     /// Custom profiles allowing these without argument filters weaken security.
-    const ARG_FILTERED_SYSCALLS: &'static [&'static str] = &[
-        "clone", "clone3", "execveat", "ioctl", "mprotect", "prctl", "socket",
-    ];
+    const ARG_FILTERED_SYSCALLS: &'static [&'static str] =
+        &["clone", "execveat", "ioctl", "mprotect", "prctl", "socket"];
+
+    fn errno_denied_syscalls() -> &'static [(i64, u32)] {
+        &[(libc::SYS_clone3, libc::ENOSYS as u32)]
+    }
 
     /// Non-default syscalls that may be opted into via `--seccomp-allow`.
     ///
@@ -1002,23 +994,6 @@ impl SeccompManager {
                 }
             }
         }
-    }
-
-    /// Check whether a capability is in the current thread's effective set
-    /// by reading /proc/self/status (CapEff line).
-    fn has_effective_cap(cap: i32) -> bool {
-        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-            // If we can't read, assume worst case for safety.
-            return true;
-        };
-        for line in status.lines() {
-            if let Some(hex) = line.strip_prefix("CapEff:\t") {
-                if let Ok(eff) = u64::from_str_radix(hex.trim(), 16) {
-                    return eff & (1u64 << cap) != 0;
-                }
-            }
-        }
-        true // assume worst case
     }
 
     /// Check if seccomp filter has been applied
@@ -1649,23 +1624,23 @@ mod tests {
         let net = SeccompManager::network_mode_syscalls(true);
 
         // Snapshot counts to catch unintended policy drift.
-        // +8 accounts for conditional rules inserted in minimal_filter():
-        // socket/ioctl/prctl/prlimit64/mprotect/clone/clone3/execveat.
+        // +7 accounts for conditional rules inserted in minimal_filter():
+        // socket/ioctl/prctl/prlimit64/mprotect/clone/execveat.
         // fork removed (forces through filtered clone path).
         // execveat removed from base (arg-filtered separately).
         // sysinfo removed (L8: leaks host info).
         // prlimit64 moved to arg-filtered (M3).
         assert_eq!(base.len(), 173);
         assert_eq!(net.len(), 11);
-        assert_eq!(base.len() + 8, 181);
-        assert_eq!(base.len() + net.len() + 8, 192);
+        assert_eq!(base.len() + 7, 180);
+        assert_eq!(base.len() + net.len() + 7, 191);
     }
 
     #[test]
     fn test_arg_filtered_syscalls_list_includes_critical_syscalls() {
         // These syscalls must be in the arg-filtered list so custom profiles
         // get warnings when they allow them without filters.
-        for name in &["clone", "clone3", "execveat", "ioctl", "prctl", "socket"] {
+        for name in &["clone", "execveat", "ioctl", "prctl", "socket"] {
             assert!(
                 SeccompManager::ARG_FILTERED_SYSCALLS.contains(name),
                 "'{}' must be in ARG_FILTERED_SYSCALLS",
@@ -1675,15 +1650,20 @@ mod tests {
     }
 
     #[test]
-    fn test_clone3_allowed_in_minimal_filter() {
-        // clone3 MUST be in the BPF rules map – glibc 2.34+ and newer musl
-        // use clone3 internally for posix_spawn/fork. Blocking it breaks
-        // std::process::Command on modern systems. Namespace creation is
-        // prevented by dropped capabilities (CAP_SYS_ADMIN etc.), not seccomp.
+    fn test_clone3_not_allowlisted_in_minimal_filter() {
+        // clone3 carries flags through struct clone_args, which seccomp BPF
+        // cannot inspect. It must not be unconditionally allowed; the compiler
+        // adds an exact ENOSYS deny so libc falls back to filtered clone.
         let rules = SeccompManager::minimal_filter(true, &[]).unwrap();
         assert!(
-            rules.contains_key(&libc::SYS_clone3),
-            "clone3 must be in the seccomp allowlist (glibc 2.34+ requires it)"
+            !rules.contains_key(&libc::SYS_clone3),
+            "clone3 must not be in the seccomp allowlist"
+        );
+        assert!(
+            SeccompManager::errno_denied_syscalls()
+                .iter()
+                .any(|(nr, errno)| *nr == libc::SYS_clone3 && *errno == libc::ENOSYS as u32),
+            "clone3 must be denied with ENOSYS to trigger libc fallback"
         );
     }
 
@@ -1731,17 +1711,9 @@ mod tests {
         // merge source for apply_profile_from_file.
         let rules = SeccompManager::minimal_filter(true, &[]).unwrap();
 
-        // Every ARG_FILTERED_SYSCALLS entry (except clone3, which is allowed
-        // unconditionally since BPF can't inspect its struct-based flags) must
-        // have non-empty argument-level rules in the built-in filter so that
-        // apply_profile_from_file can merge them.
+        // Every ARG_FILTERED_SYSCALLS entry must have non-empty argument-level
+        // rules in the built-in filter so apply_profile_from_file can merge them.
         for name in SeccompManager::ARG_FILTERED_SYSCALLS {
-            if *name == "clone3" {
-                // clone3 is allowed unconditionally – BPF cannot dereference
-                // the clone_args struct, so arg filtering is impossible.
-                // Namespace defense relies on dropped capabilities.
-                continue;
-            }
             if let Some(nr) = syscall_name_to_number(name) {
                 let entry = rules.get(&nr);
                 assert!(
@@ -1968,6 +1940,22 @@ mod tests {
         assert!(
             !rules.contains_key(&libc::SYS_unshare),
             "unshare must stay blocked even when requested via --seccomp-allow"
+        );
+    }
+
+    #[test]
+    fn test_extra_syscalls_clone3_remains_blocked() {
+        let extra = vec!["clone3".to_string()];
+        let rules = SeccompManager::minimal_filter(true, &extra).unwrap();
+        assert!(
+            !rules.contains_key(&libc::SYS_clone3),
+            "clone3 must stay out of the allowlist even when requested via --seccomp-allow"
+        );
+        assert!(
+            SeccompManager::errno_denied_syscalls()
+                .iter()
+                .any(|(nr, _)| *nr == libc::SYS_clone3),
+            "clone3 must remain covered by the exact ENOSYS deny"
         );
     }
 

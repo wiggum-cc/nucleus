@@ -105,13 +105,12 @@ impl UserspaceNetwork {
         let api_socket_path = runtime_dir.join("slirp4netns.sock");
 
         let slirp = BridgeNetwork::resolve_bin("slirp4netns")?;
-        // Only join the container's user namespace when the host process is
-        // genuinely unprivileged.  A root-owned process can already access any
-        // network namespace via /proc/{pid}/ns/net.  Entering the container's
-        // user namespace would cause the host root mount to become a *locked
-        // mount* in the new mount namespace slirp4netns creates for its sandbox,
-        // and pivot_root(2) cannot pivot away from a locked mount.
-        let needs_userns = rootless && !host_is_root;
+        // Keep slirp4netns inside the container user namespace whenever the
+        // container is rootless/root-remapped, even when Nucleus itself runs as
+        // host root. slirp4netns processes untrusted guest network traffic, so
+        // omitting --userns-path would run that helper as host root in the
+        // initial user namespace.
+        let needs_userns = Self::should_join_userns(host_is_root, rootless);
 
         let slirp_path = Path::new(&slirp);
         let (child, exit_write) = match Self::spawn_slirp(
@@ -131,8 +130,8 @@ impl UserspaceNetwork {
                 // The sandbox uses pivot_root(2) which can fail in constrained
                 // environments (e.g. QEMU test VMs, nested containers) where
                 // mount propagation or /tmp restrictions prevent the pivot.
-                // Retry without --enable-sandbox; slirp4netns is still
-                // process-isolated via its network namespace.
+                // Retry without --enable-sandbox while preserving user namespace
+                // confinement for rootless/root-remapped containers.
                 let _ = std::fs::remove_file(&api_socket_path);
                 Self::spawn_slirp(
                     slirp_path,
@@ -411,6 +410,10 @@ impl UserspaceNetwork {
         Ok(())
     }
 
+    fn should_join_userns(_host_is_root: bool, rootless: bool) -> bool {
+        rootless
+    }
+
     fn spawn_slirp(
         slirp_bin: &Path,
         pid: u32,
@@ -639,6 +642,32 @@ mod tests {
 
         assert!(args.iter().any(|arg| arg == "--disable-dns"));
         assert!(args.iter().any(|arg| arg == "--userns-path"));
+    }
+
+    #[test]
+    fn test_slirp_userns_join_is_kept_for_root_remapped_hosts() {
+        assert!(UserspaceNetwork::should_join_userns(true, true));
+        assert!(UserspaceNetwork::should_join_userns(false, true));
+        assert!(!UserspaceNetwork::should_join_userns(true, false));
+        assert!(!UserspaceNetwork::should_join_userns(false, false));
+    }
+
+    #[test]
+    fn test_slirp_command_args_keep_userns_without_sandbox() {
+        let cfg = BridgeConfig::default();
+        let args = UserspaceNetwork::command_args(
+            4242,
+            &cfg,
+            true,
+            Path::new("/tmp/slirp.sock"),
+            5,
+            6,
+            false,
+        );
+
+        assert!(!args.iter().any(|arg| arg == "--enable-sandbox"));
+        assert!(args.iter().any(|arg| arg == "--userns-path"));
+        assert!(args.iter().any(|arg| arg == "/proc/4242/ns/user"));
     }
 
     #[test]

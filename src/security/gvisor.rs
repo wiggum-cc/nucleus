@@ -2,9 +2,12 @@ use super::landlock::LandlockManager;
 use crate::error::{NucleusError, Result};
 use crate::oci::OciBundle;
 use nix::unistd::Uid;
+use sha2::{Digest, Sha256};
 use std::ffi::CString;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::fs::{self, DirBuilder, OpenOptions};
+use std::io;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, warn};
 
@@ -296,37 +299,14 @@ impl GVisorRuntime {
             GVisorNetworkMode::Host => "host",
         };
 
-        // Create a per-container root directory for runsc state.
-        // By default runsc uses /var/run/runsc which requires root privileges.
-        // We place it next to the OCI bundle so it is cleaned up together.
-        let runsc_root = bundle
-            .bundle_path()
-            .parent()
-            .unwrap_or(bundle.bundle_path())
-            .join("runsc-root");
-        std::fs::create_dir_all(&runsc_root).map_err(|e| {
-            NucleusError::GVisorError(format!("Failed to create runsc root directory: {}", e))
-        })?;
-        std::fs::set_permissions(&runsc_root, std::fs::Permissions::from_mode(0o700)).map_err(
-            |e| {
-                NucleusError::GVisorError(format!(
-                    "Failed to secure runsc root directory permissions: {}",
-                    e
-                ))
-            },
-        )?;
+        // Create a per-container root directory for runsc state. Do not derive
+        // this from the OCI bundle parent: --bundle may be operator-provided,
+        // shared, or attacker-writable, while runsc state includes a staged
+        // executable used by the supervisor process.
+        let runsc_root = Self::secure_runsc_root(container_id)?;
 
         let runsc_runtime_dir = runsc_root.join("runtime");
-        std::fs::create_dir_all(&runsc_runtime_dir).map_err(|e| {
-            NucleusError::GVisorError(format!("Failed to create runsc runtime directory: {}", e))
-        })?;
-        std::fs::set_permissions(&runsc_runtime_dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| {
-                NucleusError::GVisorError(format!(
-                    "Failed to secure runsc runtime directory permissions: {}",
-                    e
-                ))
-            })?;
+        Self::ensure_secure_runsc_dir(&runsc_runtime_dir, "runsc runtime directory")?;
 
         let (program_path, exec_allow_roots) =
             self.prepare_supervisor_runsc_program(&runsc_root)?;
@@ -438,7 +418,7 @@ impl GVisorRuntime {
         &self,
         runsc_root: &Path,
     ) -> Result<(PathBuf, Vec<PathBuf>)> {
-        let canonical = std::fs::canonicalize(&self.runsc_path).map_err(|e| {
+        let canonical = fs::canonicalize(&self.runsc_path).map_err(|e| {
             NucleusError::GVisorError(format!(
                 "Failed to canonicalize runsc path {:?}: {}",
                 self.runsc_path, e
@@ -449,37 +429,426 @@ impl GVisorRuntime {
             return Ok((canonical, vec![PathBuf::from("/nix/store")]));
         }
 
+        Self::ensure_secure_runsc_dir(runsc_root, "runsc root directory")?;
         let private_dir = runsc_root.join("exec-allow");
-        std::fs::create_dir_all(&private_dir).map_err(|e| {
+        Self::ensure_secure_runsc_dir(&private_dir, "private runsc exec directory")?;
+
+        let stage_dir = Self::create_unique_runsc_stage_dir(&private_dir)?;
+        let staged = stage_dir.join("runsc");
+        Self::copy_runsc_nofollow(&canonical, &staged)?;
+
+        Ok((staged, vec![private_dir]))
+    }
+
+    fn secure_runsc_root(container_id: &str) -> Result<PathBuf> {
+        let artifact_base = Self::gvisor_artifact_base()?;
+        let artifact_dir = artifact_base.join(Self::runsc_state_component(container_id));
+
+        if Self::host_root_requires_trusted_runsc_ancestry() {
+            Self::ensure_trusted_host_root_runsc_ancestry(
+                &artifact_base,
+                "gVisor runsc artifact base",
+            )?;
+        }
+
+        Self::ensure_secure_runsc_dir(&artifact_base, "gVisor runsc artifact base")?;
+        Self::ensure_secure_runsc_dir(&artifact_dir, "gVisor runsc artifact directory")?;
+
+        let runsc_root = artifact_dir.join("runsc-root");
+        Self::ensure_secure_runsc_dir(&runsc_root, "runsc root directory")?;
+        Ok(runsc_root)
+    }
+
+    fn gvisor_artifact_base() -> Result<PathBuf> {
+        if let Some(path) =
+            std::env::var_os("NUCLEUS_GVISOR_ARTIFACT_BASE").filter(|path| !path.is_empty())
+        {
+            return Self::absolute_path(Path::new(&path), "gVisor artifact base");
+        }
+
+        if !Uid::effective().is_root() || Self::root_uid_maps_to_unprivileged_host_uid_from_proc() {
+            if let Some(dir) = dirs::runtime_dir() {
+                return Ok(dir.join("nucleus-gvisor"));
+            }
+        }
+
+        if Uid::effective().is_root() {
+            Ok(PathBuf::from("/run/nucleus-gvisor"))
+        } else {
+            Ok(std::env::temp_dir().join(format!("nucleus-gvisor-{}", Uid::effective().as_raw())))
+        }
+    }
+
+    fn absolute_path(path: &Path, label: &str) -> Result<PathBuf> {
+        if path.is_absolute() {
+            return Ok(path.to_path_buf());
+        }
+
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .map_err(|e| {
+                NucleusError::GVisorError(format!(
+                    "Failed to resolve current directory for {} {:?}: {}",
+                    label, path, e
+                ))
+            })
+    }
+
+    fn runsc_state_component(container_id: &str) -> String {
+        if container_id.len() == 32 && container_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return container_id.to_string();
+        }
+
+        let digest = Sha256::digest(container_id.as_bytes());
+        format!("id-{}", hex::encode(&digest[..16]))
+    }
+
+    fn root_uid_maps_to_unprivileged_host_uid_from_proc() -> bool {
+        fs::read_to_string("/proc/self/uid_map")
+            .map(|uid_map| Self::root_uid_maps_to_unprivileged_host_uid(&uid_map))
+            .unwrap_or(false)
+    }
+
+    fn root_uid_maps_to_unprivileged_host_uid(uid_map: &str) -> bool {
+        for line in uid_map.lines() {
+            let mut fields = line.split_whitespace();
+            let Some(namespace_start) = fields.next() else {
+                continue;
+            };
+            let Some(host_start) = fields.next() else {
+                continue;
+            };
+            let Some(length) = fields.next() else {
+                continue;
+            };
+            if fields.next().is_some() {
+                continue;
+            }
+
+            let Ok(namespace_start) = namespace_start.parse::<u64>() else {
+                continue;
+            };
+            let Ok(host_start) = host_start.parse::<u64>() else {
+                continue;
+            };
+            let Ok(length) = length.parse::<u64>() else {
+                continue;
+            };
+
+            if namespace_start == 0 && length > 0 {
+                return host_start != 0;
+            }
+        }
+
+        false
+    }
+
+    fn host_root_requires_trusted_runsc_ancestry() -> bool {
+        Uid::effective().is_root() && !Self::root_uid_maps_to_unprivileged_host_uid_from_proc()
+    }
+
+    fn ensure_trusted_host_root_runsc_ancestry(path: &Path, label: &str) -> Result<()> {
+        let path = Self::absolute_path(path, label)?;
+
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+                Component::RootDir => current.push(component.as_os_str()),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    return Err(NucleusError::GVisorError(format!(
+                        "{} {:?} contains a parent-directory component",
+                        label, path
+                    )));
+                }
+                Component::Normal(name) => {
+                    current.push(name);
+                    match fs::symlink_metadata(&current) {
+                        Ok(metadata) => Self::ensure_trusted_host_root_runsc_ancestor_component(
+                            &current, metadata, label,
+                        )?,
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+                        Err(e) => {
+                            return Err(NucleusError::GVisorError(format!(
+                                "Failed to stat {} ancestor {:?}: {}",
+                                label, current, e
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn ensure_trusted_host_root_runsc_ancestor_component(
+        path: &Path,
+        metadata: fs::Metadata,
+        label: &str,
+    ) -> Result<()> {
+        if metadata.file_type().is_symlink() {
+            return Err(NucleusError::GVisorError(format!(
+                "Refusing symlink {} ancestor {:?}",
+                label, path
+            )));
+        }
+        if !metadata.file_type().is_dir() {
+            return Err(NucleusError::GVisorError(format!(
+                "{} ancestor {:?} is not a directory",
+                label, path
+            )));
+        }
+
+        let owner = metadata.uid();
+        if owner != 0 {
+            return Err(NucleusError::GVisorError(format!(
+                "{} ancestor {:?} is owned by uid {} (expected root)",
+                label, path, owner
+            )));
+        }
+
+        let mode = metadata.permissions().mode();
+        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+            return Err(NucleusError::GVisorError(format!(
+                "{} ancestor {:?} has unsafe permissions {:o}",
+                label,
+                path,
+                mode & 0o7777
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn ensure_secure_runsc_dir(path: &Path, label: &str) -> Result<()> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            Self::ensure_trusted_runsc_parent(parent, label)?;
+        }
+
+        let mut created = false;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(NucleusError::GVisorError(format!(
+                    "Refusing symlink {} {:?}",
+                    label, path
+                )));
+            }
+            Ok(metadata) if !metadata.file_type().is_dir() => {
+                return Err(NucleusError::GVisorError(format!(
+                    "{} {:?} is not a directory",
+                    label, path
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                match DirBuilder::new().mode(0o700).create(path) {
+                    Ok(()) => {
+                        created = true;
+                    }
+                    Err(create_err) if create_err.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(create_err) => {
+                        return Err(NucleusError::GVisorError(format!(
+                            "Failed to create {} {:?}: {}",
+                            label, path, create_err
+                        )));
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(NucleusError::GVisorError(format!(
+                    "Failed to stat {} {:?}: {}",
+                    label, path, e
+                )));
+            }
+        }
+
+        if created {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| {
+                NucleusError::GVisorError(format!(
+                    "Failed to secure newly-created {} permissions {:?}: {}",
+                    label, path, e
+                ))
+            })?;
+        }
+
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY)
+            .open(path)
+            .map_err(|e| {
+                NucleusError::GVisorError(format!(
+                    "Failed to open {} {:?} without following symlinks: {}",
+                    label, path, e
+                ))
+            })?;
+
+        let metadata = dir.metadata().map_err(|e| {
+            NucleusError::GVisorError(format!("Failed to stat {} {:?}: {}", label, path, e))
+        })?;
+        if !metadata.file_type().is_dir() {
+            return Err(NucleusError::GVisorError(format!(
+                "{} {:?} is not a directory",
+                label, path
+            )));
+        }
+
+        let owner = metadata.uid();
+        let expected = Uid::effective().as_raw();
+        if owner != expected {
+            return Err(NucleusError::GVisorError(format!(
+                "{} {:?} is owned by uid {} (expected {})",
+                label, path, owner, expected
+            )));
+        }
+
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            dir.set_permissions(fs::Permissions::from_mode(0o700))
+                .map_err(|e| {
+                    NucleusError::GVisorError(format!(
+                        "Failed to secure {} permissions {:?}: {}",
+                        label, path, e
+                    ))
+                })?;
+        }
+
+        Ok(())
+    }
+
+    fn ensure_trusted_runsc_parent(parent: &Path, label: &str) -> Result<()> {
+        let metadata = fs::symlink_metadata(parent).map_err(|e| {
             NucleusError::GVisorError(format!(
-                "Failed to create private runsc exec directory {:?}: {}",
-                private_dir, e
+                "Failed to stat parent for {} {:?}: {}",
+                label, parent, e
             ))
         })?;
-        std::fs::set_permissions(&private_dir, std::fs::Permissions::from_mode(0o700)).map_err(
-            |e| {
-                NucleusError::GVisorError(format!(
-                    "Failed to secure private runsc exec directory {:?}: {}",
-                    private_dir, e
-                ))
-            },
-        )?;
+        if metadata.file_type().is_symlink() {
+            return Err(NucleusError::GVisorError(format!(
+                "Refusing symlink parent for {} {:?}",
+                label, parent
+            )));
+        }
+        if !metadata.file_type().is_dir() {
+            return Err(NucleusError::GVisorError(format!(
+                "Parent for {} {:?} is not a directory",
+                label, parent
+            )));
+        }
 
-        let staged = private_dir.join("runsc");
-        std::fs::copy(&canonical, &staged).map_err(|e| {
+        let owner = metadata.uid();
+        let current = Uid::effective().as_raw();
+        let owner_trusted = owner == current || owner == 0;
+        let mode = metadata.permissions().mode();
+        let unsafe_writable = mode & 0o022 != 0 && mode & 0o1000 == 0;
+        if !owner_trusted || unsafe_writable {
+            return Err(NucleusError::GVisorError(format!(
+                "Parent for {} {:?} is not trusted (owner uid {}, mode {:o})",
+                label,
+                parent,
+                owner,
+                mode & 0o7777
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn create_unique_runsc_stage_dir(private_dir: &Path) -> Result<PathBuf> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+
+        for attempt in 0..100u32 {
+            let stage_dir = private_dir.join(format!(
+                "stage-{}-{}-{}",
+                std::process::id(),
+                nonce,
+                attempt
+            ));
+            match DirBuilder::new().mode(0o700).create(&stage_dir) {
+                Ok(()) => {
+                    Self::ensure_secure_runsc_dir(&stage_dir, "runsc stage directory")?;
+                    return Ok(stage_dir);
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(NucleusError::GVisorError(format!(
+                        "Failed to create runsc stage directory {:?}: {}",
+                        stage_dir, e
+                    )));
+                }
+            }
+        }
+
+        Err(NucleusError::GVisorError(format!(
+            "Failed to create unique runsc stage directory under {:?}",
+            private_dir
+        )))
+    }
+
+    fn copy_runsc_nofollow(source: &Path, staged: &Path) -> Result<()> {
+        let mut source_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(source)
+            .map_err(|e| {
+                NucleusError::GVisorError(format!(
+                    "Failed to open runsc source {:?}: {}",
+                    source, e
+                ))
+            })?;
+
+        let source_meta = source_file.metadata().map_err(|e| {
+            NucleusError::GVisorError(format!("Failed to stat runsc source {:?}: {}", source, e))
+        })?;
+        if !source_meta.file_type().is_file() {
+            return Err(NucleusError::GVisorError(format!(
+                "runsc source {:?} is not a regular file",
+                source
+            )));
+        }
+
+        let mut staged_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o500)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(staged)
+            .map_err(|e| {
+                NucleusError::GVisorError(format!(
+                    "Failed to create staged runsc binary {:?}: {}",
+                    staged, e
+                ))
+            })?;
+
+        io::copy(&mut source_file, &mut staged_file).map_err(|e| {
             NucleusError::GVisorError(format!(
                 "Failed to stage runsc binary from {:?} to {:?}: {}",
-                canonical, staged, e
+                source, staged, e
             ))
         })?;
-        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o500)).map_err(|e| {
+        staged_file
+            .set_permissions(fs::Permissions::from_mode(0o500))
+            .map_err(|e| {
+                NucleusError::GVisorError(format!(
+                    "Failed to secure staged runsc binary {:?}: {}",
+                    staged, e
+                ))
+            })?;
+        staged_file.sync_all().map_err(|e| {
             NucleusError::GVisorError(format!(
-                "Failed to secure staged runsc binary {:?}: {}",
+                "Failed to sync staged runsc binary {:?}: {}",
                 staged, e
             ))
         })?;
 
-        Ok((staged, vec![private_dir]))
+        Ok(())
     }
 
     fn apply_supervisor_exec_policy(
@@ -551,6 +920,49 @@ mod tests {
     use super::*;
     use crate::oci::OciConfig;
     use std::path::Path;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvLock {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl EnvLock {
+        fn acquire() -> Self {
+            Self {
+                _guard: ENV_LOCK.lock().unwrap(),
+            }
+        }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     fn test_gvisor_availability() {
@@ -733,6 +1145,63 @@ mod tests {
         assert_eq!(std::fs::read(&program).unwrap(), b"fake-runsc");
         let mode = std::fs::metadata(&program).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o500);
+    }
+
+    #[test]
+    fn test_runsc_root_uses_hardened_artifact_dir_not_bundle_parent() {
+        let _env_lock = EnvLock::acquire();
+        let tmp = tempfile::tempdir().unwrap();
+        let artifact_base = tmp.path().join("gvisor-artifacts");
+        let _artifact_base = EnvVarGuard::set("NUCLEUS_GVISOR_ARTIFACT_BASE", &artifact_base);
+        let _runtime = EnvVarGuard::remove("XDG_RUNTIME_DIR");
+
+        let bundle_parent = tmp.path().join("shared");
+        std::fs::create_dir_all(&bundle_parent).unwrap();
+        std::fs::set_permissions(&bundle_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let bundle = OciBundle::new(
+            bundle_parent.join("bundle"),
+            OciConfig::new(vec!["/bin/true".to_string()], None),
+        );
+
+        let runsc_root = GVisorRuntime::secure_runsc_root("container-id").unwrap();
+
+        assert!(runsc_root
+            .starts_with(artifact_base.join(GVisorRuntime::runsc_state_component("container-id"))));
+        assert!(
+            !runsc_root.starts_with(bundle.bundle_path().parent().unwrap()),
+            "runsc root must not be derived from a custom bundle parent"
+        );
+    }
+
+    #[test]
+    fn test_runsc_staging_rejects_symlink_exec_allow_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_runsc = tmp.path().join("runsc-source");
+        std::fs::write(&fake_runsc, b"fake-runsc").unwrap();
+        std::fs::set_permissions(&fake_runsc, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let runsc_root = tmp.path().join("runsc-root");
+        std::fs::create_dir(&runsc_root).unwrap();
+        std::fs::set_permissions(&runsc_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let victim_dir = tmp.path().join("victim");
+        std::fs::create_dir(&victim_dir).unwrap();
+        std::os::unix::fs::symlink(&victim_dir, runsc_root.join("exec-allow")).unwrap();
+
+        let rt = GVisorRuntime::with_path(fake_runsc.to_string_lossy().to_string());
+        let err = rt
+            .prepare_supervisor_runsc_program(&runsc_root)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("Refusing symlink private runsc exec directory"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            !victim_dir.join("runsc").exists(),
+            "staging must not follow the exec-allow symlink"
+        );
     }
 
     #[test]

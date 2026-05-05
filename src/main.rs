@@ -7,7 +7,7 @@ use nucleus::container::{
     RuntimeSelection, SeccompMode, SecretMount, ServiceMode, TrustLevel, VolumeMount, VolumeSource,
 };
 use nucleus::error::{NucleusError, Result};
-use nucleus::filesystem::ContextMode;
+use nucleus::filesystem::{normalize_volume_destination, validate_bind_mount_source, ContextMode};
 use nucleus::isolation::{ContainerAttach, NamespaceConfig};
 use nucleus::network::{BridgeConfig, EgressPolicy, NatBackend, NetworkMode, PortForward};
 use nucleus::resources::{Cgroup, IoDeviceLimit, ResourceLimits, ResourceStats};
@@ -16,7 +16,7 @@ use nucleus::topology::{
     execute_reconcile, plan_reconcile, DependencyGraph, ReconcileAction, TopologyConfig,
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tracing::info;
 
@@ -1654,6 +1654,8 @@ fn try_main() -> Result<i32> {
                         source_raw, e
                     ))
                 })?;
+                validate_bind_mount_source(&source)?;
+                normalize_volume_destination(Path::new(dest_raw))?;
                 config = config.with_volume(VolumeMount {
                     source: VolumeSource::Bind { source },
                     dest: PathBuf::from(dest_raw),
@@ -2122,8 +2124,28 @@ mod tests {
         );
         assert_eq!(
             config.trust_level,
+            TrustLevel::Untrusted,
+            "native runtime selection must preserve the default Untrusted trust level"
+        );
+    }
+
+    #[test]
+    fn test_native_runtime_preserves_explicit_trust_level() {
+        let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_trust_level(TrustLevel::Trusted);
+        let config = config
+            .apply_runtime_selection(RuntimeSelection::Native, false)
+            .unwrap();
+
+        assert!(
+            !config.use_gvisor,
+            "native runtime selection must disable gVisor"
+        );
+        assert_eq!(
+            config.trust_level,
             TrustLevel::Trusted,
-            "native runtime must set TrustLevel::Trusted"
+            "native runtime selection must preserve explicit Trusted trust level"
         );
     }
 

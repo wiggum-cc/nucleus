@@ -183,8 +183,8 @@ pub fn validate_egress_cidr(s: &str) -> Result<(), String> {
 /// Egress policy for audited outbound network access.
 ///
 /// When set, iptables OUTPUT chain rules restrict which destinations the
-/// container process can connect to. An empty allowed list means no
-/// outbound connections are permitted (deny-all egress).
+/// container process can connect to. Use [`EgressPolicy::deny_all`] when no
+/// outbound connections, including DNS, should be permitted.
 #[derive(Debug, Clone)]
 pub struct EgressPolicy {
     /// Allowed destination CIDRs (e.g., "10.0.0.0/8", "192.168.1.0/24").
@@ -195,9 +195,8 @@ pub struct EgressPolicy {
     pub allowed_udp_ports: Vec<u16>,
     /// Whether to log denied egress attempts (rate-limited).
     pub log_denied: bool,
-    /// Whether to allow DNS (port 53 UDP/TCP) to configured resolvers even in
-    /// deny-all mode. Defaults to `true` for usability; set to `false` for
-    /// strict deny-all egress (containers must use pre-resolved addresses).
+    /// Whether to add implicit DNS (port 53 UDP/TCP) allow rules for configured
+    /// resolvers. Defaults to `true` for explicit allowlist usability.
     pub allow_dns: bool,
 }
 
@@ -214,11 +213,12 @@ impl Default for EgressPolicy {
 }
 
 impl EgressPolicy {
-    /// Create a deny-all egress policy. DNS is still permitted by default
-    /// so containers can resolve names; use `allow_dns = false` for strict
-    /// deny-all egress.
+    /// Create a strict deny-all egress policy, including DNS.
     pub fn deny_all() -> Self {
-        Self::default()
+        Self {
+            allow_dns: false,
+            ..Self::default()
+        }
     }
 
     /// Allow egress to the given CIDRs on any port.

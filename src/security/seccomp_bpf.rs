@@ -96,9 +96,35 @@ pub fn compile_bitmap_bpf(
     match_action: SeccompAction,
     target_arch: TargetArch,
 ) -> Result<BpfProgram> {
+    compile_bitmap_bpf_with_errno_syscalls(rules, &[], mismatch_action, match_action, target_arch)
+}
+
+/// Compile a seccomp BPF program with exact-match syscall errno overrides.
+///
+/// `errno_syscalls` are checked before both the unconditional allow bitmap and
+/// the argument-filtered chains. This lets the policy return ENOSYS for syscalls
+/// such as clone3, where libc can safely fall back to an older syscall that the
+/// filter can inspect.
+pub fn compile_bitmap_bpf_with_errno_syscalls(
+    rules: BTreeMap<i64, Vec<SeccompRule>>,
+    errno_syscalls: &[(i64, u32)],
+    mismatch_action: SeccompAction,
+    match_action: SeccompAction,
+    target_arch: TargetArch,
+) -> Result<BpfProgram> {
     let mismatch_val: u32 = mismatch_action.into();
     let match_val: u32 = match_action.into();
     let audit_arch = arch_audit_value(target_arch);
+    let errno_actions: Vec<(u32, u32)> = errno_syscalls
+        .iter()
+        .filter_map(|(nr, errno)| {
+            if *nr < 0 || *nr > u32::MAX as i64 {
+                None
+            } else {
+                Some((*nr as u32, SeccompAction::Errno(*errno).into()))
+            }
+        })
+        .collect();
 
     // Separate unconditional allows (bitmap) from arg-filtered (linear scan).
     let mut bitmap: [u32; NUM_BITMAP_WORDS] = [0; NUM_BITMAP_WORDS];
@@ -139,6 +165,15 @@ pub fn compile_bitmap_bpf(
     prog.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET));
     prog.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, audit_arch, 1, 0));
     prog.push(bpf_stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_KILL_PROCESS));
+
+    // === Section 1b: Exact-match errno denies ===
+    if !errno_actions.is_empty() {
+        prog.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
+        for (nr, action) in errno_actions {
+            prog.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 1));
+            prog.push(bpf_stmt(BPF_RET | BPF_K, action));
+        }
+    }
 
     // === Section 2: Setup ===
     // Compute bit_position = nr & 31, save in M[0].
@@ -203,11 +238,16 @@ pub fn compile_bitmap_bpf(
 /// Build the arg-filtered section: a linear scan of syscalls that need
 /// argument-level checks (e.g. clone namespace flags, ioctl request codes).
 ///
-/// Each chain is structured identically to seccompiler's `append_syscall_chain`:
-///   JEQ nr → rule chain → RET mismatch
+/// Each chain is structured as:
+///   JEQ nr, match: skip next JA
+///   JA next syscall chain
+///   rule chain
+///   RET mismatch
 ///
-/// On JEQ mismatch, the fail-path chains through rule entries to the next
-/// syscall's chain (preserving A = nr for the next JEQ).
+/// On syscall mismatch, jump over the whole argument-filtered chain directly
+/// (preserving A = nr for the next JEQ). Do not route the mismatch path through
+/// `SeccompRule`'s internal rule-failure entries; those entries are an
+/// implementation detail of seccompiler's rule translation.
 fn build_arg_section(
     arg_filtered: Vec<(i64, Vec<SeccompRule>)>,
     mismatch_val: u32,
@@ -228,8 +268,7 @@ fn build_arg_section(
     section
 }
 
-/// Build a single syscall's rule chain, identical to seccompiler's
-/// `append_syscall_chain`.
+/// Build a single syscall's rule chain.
 ///
 /// Uses `SeccompRule::into::<BpfProgram>()` to generate argument-check BPF
 /// for each rule, preserving the existing jump-chain semantics.
@@ -250,15 +289,21 @@ fn build_syscall_chain(
         })
         .collect();
 
+    let chain_len: usize = if chain_bpf.is_empty() {
+        1 // RET match_action for the unconditional case below.
+    } else {
+        chain_bpf.iter().map(Vec::len).sum()
+    };
+
     // Chain header: check syscall number.
-    // jt=0: fall through (matched). jf=1: jump to first rule's fail entry.
-    out.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, syscall_nr as u32, 0, 1));
+    // matched: skip the mismatch JA and enter this syscall's rule body.
+    // mismatched: jump over this syscall's rule body and mismatch RET.
+    out.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, syscall_nr as u32, 1, 0));
+    out.push(bpf_stmt(BPF_JMP | BPF_JA, (chain_len + 1) as u32));
 
     if chain_bpf.is_empty() {
         // Unconditional allow (shouldn't normally reach here from bitmap path,
         // but handle for correctness with custom profiles).
-        out.push(bpf_stmt(BPF_JMP | BPF_JA, 1));
-        out.push(bpf_stmt(BPF_JMP | BPF_JA, 2));
         out.push(bpf_stmt(BPF_RET | BPF_K, match_val));
     } else {
         for mut rule_bpf in chain_bpf {
@@ -390,6 +435,7 @@ mod tests {
 
     const RET_ALLOW: u32 = 0x7fff_0000; // SECCOMP_RET_ALLOW
     const RET_KILL: u32 = 0x8000_0000; // SECCOMP_RET_KILL_PROCESS
+    const RET_ERRNO_ENOSYS: u32 = libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
 
     #[test]
     fn test_unconditional_allows() {
@@ -429,6 +475,31 @@ mod tests {
                 nr
             );
         }
+    }
+
+    #[test]
+    fn test_errno_syscall_overrides_unconditional_allow() {
+        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+        rules.insert(0, Vec::new()); // read
+        rules.insert(123, Vec::new()); // deliberately present in allow bitmap
+
+        let prog = compile_bitmap_bpf_with_errno_syscalls(
+            rules,
+            &[(123, libc::ENOSYS as u32)],
+            SeccompAction::KillProcess,
+            SeccompAction::Allow,
+            TargetArch::x86_64,
+        )
+        .unwrap();
+
+        let data = make_seccomp_data(0, AUDIT_ARCH_X86_64, [0; 6]);
+        assert_eq!(bpf_eval(&prog, &data), RET_ALLOW);
+
+        let data = make_seccomp_data(123, AUDIT_ARCH_X86_64, [0; 6]);
+        assert_eq!(bpf_eval(&prog, &data), RET_ERRNO_ENOSYS);
+
+        let data = make_seccomp_data(124, AUDIT_ARCH_X86_64, [0; 6]);
+        assert_eq!(bpf_eval(&prog, &data), RET_KILL);
     }
 
     #[test]
@@ -482,6 +553,85 @@ mod tests {
         // unknown syscall: killed
         let data = make_seccomp_data(999, AUDIT_ARCH_X86_64, [0; 6]);
         assert_eq!(bpf_eval(&prog, &data), RET_KILL);
+    }
+
+    #[test]
+    fn test_syscall_mismatch_skips_entire_arg_chain() {
+        let cond = SeccompCondition::new(2, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0).unwrap();
+        let rule = SeccompRule::new(vec![cond]).unwrap();
+        let mut section = Vec::new();
+
+        build_syscall_chain(10, vec![rule], RET_KILL, RET_ALLOW, &mut section);
+
+        assert_eq!(section[0].code, BPF_JMP | BPF_JEQ | BPF_K);
+        assert_eq!(section[0].jt, 1, "match path must skip the mismatch JA");
+        assert_eq!(section[0].jf, 0, "mismatch path must take the next JA");
+        assert_eq!(section[1].code, BPF_JMP | BPF_JA);
+
+        let mismatch_target = 1 + 1 + section[1].k as usize;
+        assert_eq!(
+            mismatch_target,
+            section.len(),
+            "syscall mismatch must jump past the entire current chain"
+        );
+    }
+
+    #[test]
+    fn test_denied_syscall_cannot_match_mprotect_arg_predicate() {
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(false, &[]);
+        assert!(
+            !rules.contains_key(&libc::SYS_connect),
+            "connect must be denied when networking is disabled"
+        );
+        assert!(
+            rules
+                .get(&libc::SYS_mprotect)
+                .is_some_and(|chain| !chain.is_empty()),
+            "mprotect must be argument-filtered in the built-in profile"
+        );
+
+        let prog = compile_bitmap_bpf(
+            rules,
+            SeccompAction::KillProcess,
+            SeccompAction::Allow,
+            TargetArch::x86_64,
+        )
+        .unwrap();
+
+        for mprotect_allowed_prot in [0, libc::PROT_WRITE as u64, libc::PROT_EXEC as u64] {
+            let data = make_seccomp_data(
+                libc::SYS_connect as u32,
+                AUDIT_ARCH_X86_64,
+                [0, 0, mprotect_allowed_prot, 0, 0, 0],
+            );
+            assert_eq!(
+                bpf_eval(&prog, &data),
+                RET_KILL,
+                "denied connect syscall must not reuse mprotect arg2 predicate ({})",
+                mprotect_allowed_prot
+            );
+        }
+    }
+
+    #[test]
+    fn test_builtin_clone3_returns_enosys() {
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        assert!(
+            !rules.contains_key(&libc::SYS_clone3),
+            "clone3 must not be in the unconditional allow bitmap"
+        );
+
+        let prog = compile_bitmap_bpf_with_errno_syscalls(
+            rules,
+            crate::security::SeccompManager::errno_denied_syscalls_for_test(),
+            SeccompAction::KillProcess,
+            SeccompAction::Allow,
+            TargetArch::x86_64,
+        )
+        .unwrap();
+
+        let data = make_seccomp_data(libc::SYS_clone3 as u32, AUDIT_ARCH_X86_64, [0; 6]);
+        assert_eq!(bpf_eval(&prog, &data), RET_ERRNO_ENOSYS);
     }
 
     #[test]

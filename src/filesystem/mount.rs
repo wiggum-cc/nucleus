@@ -128,6 +128,67 @@ pub fn resolve_container_destination(root: &Path, dest: &Path) -> Result<PathBuf
     Ok(root.join(relative))
 }
 
+fn validate_rootfs_path_under_store(rootfs_path: &Path, store_root: &Path) -> Result<PathBuf> {
+    if !rootfs_path.is_absolute() {
+        return Err(NucleusError::ConfigError(format!(
+            "Production rootfs path must be absolute: {}",
+            rootfs_path.display()
+        )));
+    }
+
+    for component in rootfs_path.components() {
+        match component {
+            Component::ParentDir => {
+                return Err(NucleusError::ConfigError(format!(
+                    "Production rootfs path must not contain parent traversal: {}",
+                    rootfs_path.display()
+                )));
+            }
+            Component::Prefix(_) => {
+                return Err(NucleusError::ConfigError(format!(
+                    "Unsupported production rootfs path prefix: {}",
+                    rootfs_path.display()
+                )));
+            }
+            Component::RootDir | Component::CurDir | Component::Normal(_) => {}
+        }
+    }
+
+    let canonical = std::fs::canonicalize(rootfs_path).map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Failed to canonicalize production rootfs path '{}': {}",
+            rootfs_path.display(),
+            e
+        ))
+    })?;
+
+    if !canonical.starts_with(store_root) {
+        return Err(NucleusError::ConfigError(format!(
+            "Production mode requires rootfs path to resolve under {}: {} -> {}",
+            store_root.display(),
+            rootfs_path.display(),
+            canonical.display()
+        )));
+    }
+
+    if !canonical.is_dir() {
+        return Err(NucleusError::ConfigError(format!(
+            "Production rootfs path must resolve to a directory: {}",
+            canonical.display()
+        )));
+    }
+
+    Ok(canonical)
+}
+
+/// Validate a production rootfs path and return the canonical path to use.
+///
+/// Production rootfs paths must not contain parent traversal, and the resolved
+/// target must be a directory under the immutable Nix store.
+pub fn validate_production_rootfs_path(rootfs_path: &Path) -> Result<PathBuf> {
+    validate_rootfs_path_under_store(rootfs_path, Path::new("/nix/store"))
+}
+
 pub(crate) fn read_regular_file_nofollow(path: &Path) -> Result<Vec<u8>> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -509,16 +570,32 @@ pub fn bind_mount_host_paths(root: &Path, best_effort: bool) -> Result<()> {
 }
 
 /// H7: Sensitive host paths that must not be bind-mounted into containers.
-const DENIED_BIND_MOUNT_SOURCES_EXACT: &[&str] = &[
-    "/",
-    "/etc/shadow",
-    "/etc/sudoers",
-    "/etc/passwd",
-    "/etc/gshadow",
-];
+const DENIED_BIND_MOUNT_SOURCES_EXACT: &[&str] = &["/"];
 
 /// Sensitive host subtrees that must not be exposed to a container at all.
-const DENIED_BIND_MOUNT_SOURCE_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/boot"];
+const DENIED_BIND_MOUNT_SOURCE_PREFIXES: &[&str] = &[
+    "/boot", "/dev", "/etc", "/home", "/proc", "/root", "/run", "/sys", "/var/log", "/var/run",
+];
+
+/// Container destinations where user-supplied volumes must not be mounted.
+///
+/// These paths carry trusted runtime/rootfs state. Allowing a volume over them
+/// would let a caller replace attested container contents or pseudo-filesystems
+/// after validation has completed.
+const RESERVED_VOLUME_DESTINATION_PREFIXES: &[&str] = &[
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/lib",
+    "/lib64",
+    "/nix",
+    "/proc",
+    "/run/secrets",
+    "/sbin",
+    "/sys",
+    "/usr",
+];
 
 fn normalize_bind_mount_source_for_policy(source: &Path) -> Result<PathBuf> {
     if !source.is_absolute() {
@@ -577,10 +654,19 @@ fn reject_denied_bind_mount_source(source: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Validate that a bind mount source is not a sensitive host path or subtree.
-pub fn validate_bind_mount_source(source: &Path) -> Result<()> {
+/// Validate bind-mount source policy without requiring the source to exist.
+///
+/// Topology persistent volumes use this before creating missing host paths, so
+/// sensitive host locations are rejected before any mkdir/chown side effects.
+pub fn validate_bind_mount_source_policy(source: &Path) -> Result<PathBuf> {
     let normalized = normalize_bind_mount_source_for_policy(source)?;
     reject_denied_bind_mount_source(&normalized)?;
+    Ok(normalized)
+}
+
+/// Validate that a bind mount source exists and is not a sensitive host path or subtree.
+pub fn validate_bind_mount_source(source: &Path) -> Result<()> {
+    validate_bind_mount_source_policy(source)?;
 
     let canonical = std::fs::canonicalize(source).map_err(|e| {
         NucleusError::ConfigError(format!(
@@ -589,6 +675,39 @@ pub fn validate_bind_mount_source(source: &Path) -> Result<()> {
         ))
     })?;
     reject_denied_bind_mount_source(&canonical)
+}
+
+fn reject_reserved_volume_destination(dest: &Path) -> Result<()> {
+    for reserved in RESERVED_VOLUME_DESTINATION_PREFIXES {
+        let reserved_path = Path::new(reserved);
+        if dest == reserved_path || dest.starts_with(reserved_path) {
+            return Err(NucleusError::ConfigError(format!(
+                "Volume destination '{}' is reserved for trusted container/runtime paths and cannot be overlaid",
+                dest.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Normalize and validate a user-supplied volume destination inside the container.
+pub fn normalize_volume_destination(dest: &Path) -> Result<PathBuf> {
+    let normalized = normalize_container_destination(dest)?;
+    reject_reserved_volume_destination(&normalized)?;
+    Ok(normalized)
+}
+
+/// Resolve a validated user-supplied volume destination under a host-side root directory.
+pub fn resolve_volume_destination(root: &Path, dest: &Path) -> Result<PathBuf> {
+    let normalized = normalize_volume_destination(dest)?;
+    let relative = normalized.strip_prefix("/").map_err(|_| {
+        NucleusError::ConfigError(format!(
+            "Volume destination is not absolute after normalization: {:?}",
+            normalized
+        ))
+    })?;
+    Ok(root.join(relative))
 }
 
 /// Mount persistent bind volumes and ephemeral tmpfs volumes into the container root.
@@ -602,7 +721,7 @@ pub fn mount_volumes(root: &Path, volumes: &[crate::container::VolumeMount]) -> 
     info!("Mounting {} volume(s) into container", volumes.len());
 
     for volume in volumes {
-        let dest = resolve_container_destination(root, &volume.dest)?;
+        let dest = resolve_volume_destination(root, &volume.dest)?;
 
         match &volume.source {
             VolumeSource::Bind { source } => {
@@ -1485,7 +1604,19 @@ mod tests {
 
     #[test]
     fn test_validate_bind_mount_source_rejects_sensitive_subtrees() {
-        for path in ["/proc/sys", "/sys/fs/cgroup", "/dev/kmsg", "/boot"] {
+        for path in [
+            "/",
+            "/boot",
+            "/dev/kmsg",
+            "/etc",
+            "/etc/passwd",
+            "/home/alice/.ssh",
+            "/proc/sys",
+            "/root/.ssh",
+            "/run/secrets",
+            "/sys/fs/cgroup",
+            "/var/log",
+        ] {
             let err = validate_bind_mount_source(Path::new(path)).unwrap_err();
             assert!(
                 err.to_string().contains("sensitive host path"),
@@ -1510,6 +1641,95 @@ mod tests {
         std::fs::create_dir(&safe_path).unwrap();
 
         validate_bind_mount_source(&safe_path.join("../data")).unwrap();
+    }
+
+    #[test]
+    fn test_bind_mount_source_policy_rejects_sensitive_paths_before_creation() {
+        let err = validate_bind_mount_source_policy(Path::new("/tmp/../../etc/nucleus-volume"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("sensitive host path"),
+            "expected sensitive-path rejection before path creation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_volume_destinations_reject_reserved_container_paths() {
+        for path in [
+            "/bin/tool",
+            "/dev/null",
+            "/etc/app",
+            "/lib64/ld-linux-x86-64.so.2",
+            "/nix/store/data",
+            "/proc/sys",
+            "/run/secrets/token",
+            "/usr/local/bin",
+        ] {
+            let err = normalize_volume_destination(Path::new(path)).unwrap_err();
+            assert!(
+                err.to_string().contains("reserved"),
+                "expected reserved destination rejection for {path}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_volume_destinations_allow_data_paths() {
+        assert_eq!(
+            normalize_volume_destination(Path::new("/var/lib/app")).unwrap(),
+            PathBuf::from("/var/lib/app")
+        );
+        assert_eq!(
+            normalize_volume_destination(Path::new("/opt/app/data")).unwrap(),
+            PathBuf::from("/opt/app/data")
+        );
+    }
+
+    #[test]
+    fn test_production_rootfs_path_rejects_parent_traversal() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = temp.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+
+        let err =
+            validate_rootfs_path_under_store(&store.join("../outside-rootfs"), &store).unwrap_err();
+
+        assert!(
+            err.to_string().contains("parent traversal"),
+            "expected parent traversal rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_production_rootfs_path_rejects_symlink_escape() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = temp.path().join("store");
+        let outside = temp.path().join("outside-rootfs");
+        std::fs::create_dir(&store).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, store.join("rootfs-link")).unwrap();
+
+        let err = validate_rootfs_path_under_store(&store.join("rootfs-link"), &store).unwrap_err();
+
+        assert!(
+            err.to_string().contains("resolve under"),
+            "expected symlink escape rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_production_rootfs_path_returns_canonical_store_target() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = temp.path().join("store");
+        let rootfs = store.join("abcd-rootfs");
+        std::fs::create_dir(&store).unwrap();
+        std::fs::create_dir(&rootfs).unwrap();
+        symlink(&rootfs, store.join("rootfs-link")).unwrap();
+
+        let canonical =
+            validate_rootfs_path_under_store(&store.join("rootfs-link"), &store).unwrap();
+
+        assert_eq!(canonical, std::fs::canonicalize(rootfs).unwrap());
     }
 
     #[test]

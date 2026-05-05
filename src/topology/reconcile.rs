@@ -14,8 +14,12 @@ use crate::topology::config::{
 };
 use crate::topology::dag::DependencyGraph;
 use std::collections::BTreeMap;
+use std::ffi::CString;
+use std::fs::{self, File, OpenOptions};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -46,6 +50,119 @@ pub struct ReconcilePlan {
 enum PostStartWait {
     Started,
     Healthy,
+}
+
+fn path_component_cstring(component: &std::ffi::OsStr, path: &Path) -> Result<CString> {
+    CString::new(component.as_bytes()).map_err(|_| {
+        NucleusError::ConfigError(format!(
+            "Persistent volume path contains NUL byte: {:?}",
+            path
+        ))
+    })
+}
+
+fn open_root_dir_nofollow() -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")
+        .map_err(|e| {
+            NucleusError::ConfigError(format!(
+                "Failed to open filesystem root for persistent volume setup: {}",
+                e
+            ))
+        })
+}
+
+fn mkdirat_child(parent: &File, name: &CString, mode: libc::mode_t, path: &Path) -> Result<()> {
+    let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) };
+    if rc == 0 {
+        return Ok(());
+    }
+
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EEXIST) {
+        Ok(())
+    } else {
+        Err(NucleusError::ConfigError(format!(
+            "Failed to create persistent volume directory component under {:?}: {}",
+            path, err
+        )))
+    }
+}
+
+fn openat_dir_nofollow(parent: &File, name: &CString, path: &Path) -> Result<File> {
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+
+    if fd < 0 {
+        Err(NucleusError::ConfigError(format!(
+            "Failed to open persistent volume directory component under {:?} without following symlinks: {}",
+            path,
+            std::io::Error::last_os_error()
+        )))
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+fn create_persistent_volume_dir_all_nofollow(path: &Path) -> Result<File> {
+    if !path.is_absolute() {
+        return Err(NucleusError::ConfigError(format!(
+            "Persistent volume path must be absolute: {:?}",
+            path
+        )));
+    }
+
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::RootDir => None,
+            Component::Normal(name) => Some(Ok(name.to_os_string())),
+            Component::CurDir => None,
+            Component::ParentDir | Component::Prefix(_) => Some(Err(NucleusError::ConfigError(
+                format!("Persistent volume path is not normalized: {:?}", path),
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if components.is_empty() {
+        return Err(NucleusError::ConfigError(
+            "Persistent volume path must not be the filesystem root".to_string(),
+        ));
+    }
+
+    let mut dir = open_root_dir_nofollow()?;
+    let final_index = components.len() - 1;
+    for (index, component) in components.iter().enumerate() {
+        let name = path_component_cstring(component, path)?;
+        let mode = if index == final_index { 0o700 } else { 0o755 };
+        mkdirat_child(&dir, &name, mode, path)?;
+        dir = openat_dir_nofollow(&dir, &name, path)?;
+    }
+
+    Ok(dir)
+}
+
+fn fchown_persistent_volume(dir: &File, owner: &str, volume_name: &str, path: &Path) -> Result<()> {
+    let (uid, gid) = parse_volume_owner(owner)?;
+    let rc = unsafe { libc::fchown(dir.as_raw_fd(), uid as libc::uid_t, gid as libc::gid_t) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(NucleusError::ConfigError(format!(
+            "Failed to set owner {} on persistent volume '{}' at {:?}: {}",
+            owner,
+            volume_name,
+            path,
+            std::io::Error::last_os_error()
+        )))
+    }
 }
 
 /// Diff the desired topology against running containers.
@@ -252,34 +369,22 @@ fn prepare_persistent_volume(volume_name: &str, volume_def: &VolumeDef) -> Resul
         )));
     }
 
-    std::fs::create_dir_all(&path).map_err(|e| {
-        NucleusError::ConfigError(format!(
-            "Failed to create persistent volume '{}' at {:?}: {}",
-            volume_name, path, e
-        ))
-    })?;
+    let normalized = crate::filesystem::validate_bind_mount_source_policy(&path)?;
+    let volume_dir = create_persistent_volume_dir_all_nofollow(&normalized)?;
 
-    if let Some(owner) = &volume_def.owner {
-        let (uid, gid) = parse_volume_owner(owner)?;
-        nix::unistd::chown(
-            &path,
-            Some(nix::unistd::Uid::from_raw(uid)),
-            Some(nix::unistd::Gid::from_raw(gid)),
-        )
-        .map_err(|e| {
-            NucleusError::ConfigError(format!(
-                "Failed to set owner {} on persistent volume '{}' at {:?}: {}",
-                owner, volume_name, path, e
-            ))
-        })?;
-    }
-
-    std::fs::canonicalize(&path).map_err(|e| {
+    let canonical = fs::canonicalize(&normalized).map_err(|e| {
         NucleusError::ConfigError(format!(
             "Failed to canonicalize persistent volume '{}' at {:?}: {}",
-            volume_name, path, e
+            volume_name, normalized, e
         ))
-    })
+    })?;
+    crate::filesystem::validate_bind_mount_source(&canonical)?;
+
+    if let Some(owner) = &volume_def.owner {
+        fchown_persistent_volume(&volume_dir, owner, volume_name, &canonical)?;
+    }
+
+    Ok(canonical)
 }
 
 fn build_service_run_args(
@@ -426,46 +531,6 @@ fn build_service_run_args(
     if svc.runtime == "gvisor" {
         args.push("--runtime".to_string());
         args.push("gvisor".to_string());
-    }
-
-    // Write hooks to a secure temp file and pass via --hooks flag.
-    // Fail-closed: if the hooks file cannot be written, refuse to start
-    // the service without its configured hooks.
-    if let Some(ref hooks) = svc.hooks {
-        if !hooks.is_empty() {
-            let hooks_json = serde_json::to_string(hooks).map_err(|e| {
-                NucleusError::ConfigError(format!(
-                    "Failed to serialize hooks for {}: {}",
-                    container_name, e
-                ))
-            })?;
-            let hooks_path =
-                std::env::temp_dir().join(format!("nucleus-hooks-{}.json", container_name));
-            // Remove any pre-existing file/symlink to avoid following attacker-planted links,
-            // then create exclusively with restrictive permissions.
-            let _ = std::fs::remove_file(&hooks_path);
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&hooks_path)
-                .map_err(|e| {
-                    NucleusError::ConfigError(format!(
-                        "Failed to create hooks file for {}: {}",
-                        container_name, e
-                    ))
-                })?;
-            use std::io::Write;
-            let mut writer = std::io::BufWriter::new(file);
-            writer.write_all(hooks_json.as_bytes()).map_err(|e| {
-                NucleusError::ConfigError(format!(
-                    "Failed to write hooks file for {}: {}",
-                    container_name, e
-                ))
-            })?;
-            args.push("--hooks".to_string());
-            args.push(hooks_path.to_string_lossy().to_string());
-        }
     }
 
     args.push("--sd-notify".to_string());
@@ -628,6 +693,7 @@ fn health_check_passes(
 mod tests {
     use super::*;
     use crate::container::{ContainerState, ContainerStateParams};
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn test_plan_new_topology() {
@@ -794,6 +860,54 @@ volumes = [
     }
 
     #[test]
+    fn test_prepare_persistent_volume_rejects_symlink_parent() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let victim = temp.path().join("victim");
+        let link = temp.path().join("link");
+        std::fs::create_dir(&victim).unwrap();
+        symlink(&victim, &link).unwrap();
+
+        let volume = VolumeDef {
+            volume_type: "persistent".to_string(),
+            path: Some(link.join("data").to_string_lossy().to_string()),
+            owner: None,
+            size: None,
+        };
+
+        let err = prepare_persistent_volume("data", &volume).unwrap_err();
+        assert!(
+            err.to_string().contains("without following symlinks"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !victim.join("data").exists(),
+            "persistent volume setup must not create directories through symlink parents"
+        );
+    }
+
+    #[test]
+    fn test_prepare_persistent_volume_rejects_final_symlink() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let victim = temp.path().join("victim");
+        let link = temp.path().join("volume");
+        std::fs::create_dir(&victim).unwrap();
+        symlink(&victim, &link).unwrap();
+
+        let volume = VolumeDef {
+            volume_type: "persistent".to_string(),
+            path: Some(link.to_string_lossy().to_string()),
+            owner: None,
+            size: None,
+        };
+
+        let err = prepare_persistent_volume("data", &volume).unwrap_err();
+        assert!(
+            err.to_string().contains("without following symlinks"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_build_service_run_args_include_nat_backend_for_bridge_services() {
         let toml = r#"
 name = "test"
@@ -832,6 +946,16 @@ memory = "256M"
         let args = build_service_run_args(&config, "web", svc, "test-web", 42, None).unwrap();
 
         assert!(!args.iter().any(|arg| arg == "--nat-backend"));
+    }
+
+    #[test]
+    fn test_topology_reconcile_does_not_forward_oci_hooks() {
+        let source = include_str!("reconcile.rs");
+        let fn_body = extract_fn_body(source, "fn build_service_run_args");
+        assert!(
+            !fn_body.contains("\"--hooks\"") && !fn_body.contains("nucleus-hooks-"),
+            "topology reconciliation must not forward OCI hooks from service config"
+        );
     }
 
     #[test]
