@@ -83,7 +83,26 @@
         # Check if Cargo.lock exists
         cargoLockExists = builtins.pathExists ./Cargo.lock;
 
-        src = if cargoLockExists then craneLib.cleanCargoSource (craneLib.path ./.) else ./.;
+        srcRoot = ./.;
+        src =
+          if cargoLockExists then
+            lib.cleanSourceWith {
+              src = srcRoot;
+              filter =
+                path: type:
+                let
+                  pathString = toString path;
+                  rootString = toString srcRoot;
+                  relativePath = lib.removePrefix "${rootString}/" pathString;
+                in
+                craneLib.filterCargoSources path type
+                || relativePath == "formal"
+                || lib.hasPrefix "formal/" relativePath
+                || relativePath == "intent"
+                || lib.hasPrefix "intent/" relativePath;
+            }
+          else
+            srcRoot;
 
         # Common arguments
         commonArgs = {
