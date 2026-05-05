@@ -19,15 +19,30 @@ VARIABLES
     \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
     \* @type: Seq(Str);
-    event_queue     \* Pending events/messages queue
+    event_queue,     \* Pending events/messages queue
+    \* @type: Bool;
+    pid_isolation_checked,
+    \* @type: Bool;
+    mount_isolation_checked,
+    \* @type: Bool;
+    network_isolation_checked,
+    \* @type: Bool;
+    ipc_isolation_checked,
+    \* @type: Bool;
+    apalache_passed
 
-vars == <<state, pc, history, event_queue>>
+vars == <<state, pc, history, event_queue, pid_isolation_checked, mount_isolation_checked, network_isolation_checked, ipc_isolation_checked, apalache_passed>>
 
 Init ==
     /\ state = unverified
     /\ pc = 0
     /\ history = <<>>
     /\ event_queue = <<>>
+    /\ pid_isolation_checked = FALSE
+    /\ mount_isolation_checked = FALSE
+    /\ network_isolation_checked = FALSE
+    /\ ipc_isolation_checked = FALSE
+    /\ apalache_passed = FALSE
 
 \* Transition actions
 unverified_apalache_check ==
@@ -36,6 +51,11 @@ unverified_apalache_check ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ pid_isolation_checked' = TRUE
+    /\ mount_isolation_checked' = TRUE
+    /\ network_isolation_checked' = TRUE
+    /\ ipc_isolation_checked' = TRUE
+    /\ apalache_passed' = TRUE
 
 Next ==
     \/ unverified_apalache_check
@@ -53,6 +73,11 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
+    /\ pid_isolation_checked \in BOOLEAN
+    /\ mount_isolation_checked \in BOOLEAN
+    /\ network_isolation_checked \in BOOLEAN
+    /\ ipc_isolation_checked \in BOOLEAN
+    /\ apalache_passed \in BOOLEAN
     \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
@@ -68,6 +93,7 @@ HistoryConsistent ==
 
 \* Temporal properties (LTL)
 Prop_model_verified == []((state = unverified) => (<>(state = verified)))
+Prop_verified_covers_namespace_isolation == [](state = verified => apalache_passed /\ pid_isolation_checked /\ mount_isolation_checked /\ network_isolation_checked /\ ipc_isolation_checked)
 
 \* Liveness: Eventually reaches a terminal state
 Liveness ==

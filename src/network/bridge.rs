@@ -1042,11 +1042,10 @@ impl BridgeNetwork {
             MsFlags::MS_BIND,
             None::<&str>,
         ) {
-            warn!(
-                "Failed to bind mount memfd-backed resolv.conf: {}; retrying with staging file",
+            return Err(NucleusError::NetworkError(format!(
+                "Failed to bind mount memfd-backed resolv.conf: {}",
                 e
-            );
-            return Self::bind_mount_resolv_conf_staging(root, dns);
+            )));
         }
         Self::harden_resolv_conf_bind(&target)?;
 
@@ -1066,19 +1065,7 @@ impl BridgeNetwork {
             .map(|server| format!("nameserver {}\n", server))
             .collect();
 
-        // Write to a staging file outside /etc
-        let staging = root.join("tmp/.resolv.conf.nucleus");
-        if let Some(parent) = staging.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                NucleusError::NetworkError(format!(
-                    "Failed to create resolv.conf staging parent: {}",
-                    e
-                ))
-            })?;
-        }
-        std::fs::write(&staging, content).map_err(|e| {
-            NucleusError::NetworkError(format!("Failed to write staging resolv.conf: {}", e))
-        })?;
+        let staging = Self::create_resolv_conf_staging_file(root, content.as_bytes())?;
 
         // Ensure the mount target exists
         let target = root.join("etc/resolv.conf");
@@ -1088,7 +1075,7 @@ impl BridgeNetwork {
 
         // Bind mount the staging file over the read-only resolv.conf
         mount(
-            Some(staging.as_path()),
+            Some(staging.path()),
             &target,
             None::<&str>,
             MsFlags::MS_BIND,
@@ -1099,14 +1086,45 @@ impl BridgeNetwork {
         })?;
         Self::harden_resolv_conf_bind(&target)?;
 
-        // The bind mount holds a reference to the inode, so we can safely
-        // unlink the staging path to avoid leaking DNS server info on disk.
-        if let Err(e) = std::fs::remove_file(&staging) {
-            warn!("Failed to remove staging resolv.conf {:?}: {}", staging, e);
-        }
+        // The bind mount holds a reference to the inode. Dropping the temporary
+        // file unlinks the staging path so DNS server info is not left on disk.
 
         info!("Bind-mounted resolv.conf for bridge networking (rootfs mode, staging)");
         Ok(())
+    }
+
+    fn create_resolv_conf_staging_file(
+        root: &std::path::Path,
+        content: &[u8],
+    ) -> Result<tempfile::NamedTempFile> {
+        use std::io::Write as _;
+
+        let staging_dir = root.parent().ok_or_else(|| {
+            NucleusError::NetworkError(format!(
+                "Container root {:?} has no parent for resolv.conf staging",
+                root
+            ))
+        })?;
+
+        let mut staging = tempfile::Builder::new()
+            .prefix(".resolv.conf.nucleus.")
+            .tempfile_in(staging_dir)
+            .map_err(|e| {
+                NucleusError::NetworkError(format!(
+                    "Failed to create temporary resolv.conf staging file under {:?}: {}",
+                    staging_dir, e
+                ))
+            })?;
+
+        staging.as_file_mut().write_all(content).map_err(|e| {
+            NucleusError::NetworkError(format!(
+                "Failed to write temporary resolv.conf staging file {:?}: {}",
+                staging.path(),
+                e
+            ))
+        })?;
+
+        Ok(staging)
     }
 
     fn harden_resolv_conf_bind(target: &std::path::Path) -> Result<()> {
@@ -1284,6 +1302,52 @@ mod tests {
         assert!(
             !temp.path().join("rollback.ip").exists(),
             "rollback must release reserved IP files on setup failure"
+        );
+    }
+
+    #[test]
+    fn test_resolv_conf_staging_file_is_outside_container_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("tmp")).unwrap();
+
+        let staging =
+            BridgeNetwork::create_resolv_conf_staging_file(&root, b"nameserver 203.0.113.53\n")
+                .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(staging.path()).unwrap(),
+            "nameserver 203.0.113.53\n"
+        );
+        assert!(
+            !staging.path().starts_with(&root),
+            "staging file must not be created under the container root"
+        );
+    }
+
+    #[test]
+    fn test_bind_mount_resolv_conf_does_not_overwrite_root_tmp_symlink_on_failure() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("tmp")).unwrap();
+
+        let victim = temp.path().join("host_victim_file");
+        std::fs::write(&victim, "ORIGINAL_HOST_CONTENT\n").unwrap();
+        symlink(&victim, root.join("tmp/.resolv.conf.nucleus")).unwrap();
+
+        let dns = vec!["203.0.113.53".to_string()];
+        let result = BridgeNetwork::bind_mount_resolv_conf(&root, &dns);
+
+        assert!(
+            result.is_err(),
+            "test root intentionally lacks /etc so bind mount setup must fail"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "ORIGINAL_HOST_CONTENT\n",
+            "resolv.conf setup must not write through attacker-controlled /tmp symlinks"
         );
     }
 

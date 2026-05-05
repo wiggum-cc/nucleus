@@ -18,15 +18,27 @@ VARIABLES
     \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
     \* @type: Seq(Str);
-    event_queue     \* Pending events/messages queue
+    event_queue,     \* Pending events/messages queue
+    \* @type: Bool;
+    namespaces_active,
+    \* @type: Bool;
+    capabilities_dropped,
+    \* @type: Bool;
+    seccomp_active,
+    \* @type: Bool;
+    cgroups_active
 
-vars == <<state, pc, history, event_queue>>
+vars == <<state, pc, history, event_queue, namespaces_active, capabilities_dropped, seccomp_active, cgroups_active>>
 
 Init ==
     /\ state = contained
     /\ pc = 0
     /\ history = <<>>
     /\ event_queue = <<>>
+    /\ namespaces_active = TRUE
+    /\ capabilities_dropped = TRUE
+    /\ seccomp_active = TRUE
+    /\ cgroups_active = TRUE
 
 \* Transition actions
 Next ==
@@ -44,6 +56,10 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
+    /\ namespaces_active \in BOOLEAN
+    /\ capabilities_dropped \in BOOLEAN
+    /\ seccomp_active \in BOOLEAN
+    /\ cgroups_active \in BOOLEAN
     \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* History length matches step count
@@ -52,6 +68,11 @@ HistoryConsistent ==
 
 \* Temporal properties (LTL)
 Prop_no_escape == [][(state = contained) => (state' = contained)]_vars
+Prop_isolation_layers == [](state = contained => namespaces_active /\ capabilities_dropped /\ seccomp_active /\ cgroups_active)
+
+EscapePreventionSafety ==
+    /\ Prop_no_escape
+    /\ Prop_isolation_layers
 
 \* Reachability helpers for model checking
 CanReach_contained == <>(state = contained)

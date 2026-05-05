@@ -1,5 +1,11 @@
 use crate::error::{NucleusError, Result};
 use crate::security::policy::sha256_hex;
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+))]
+use crate::security::syscall_numbers::{SYS_FADVISE64, SYS_SENDFILE};
 use seccompiler::{BpfProgram, SeccompAction, SeccompCondition, SeccompFilter, SeccompRule};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -41,8 +47,6 @@ impl SeccompManager {
             libc::SYS_writev,
             libc::SYS_preadv,
             libc::SYS_pwritev,
-            libc::SYS_preadv2,
-            libc::SYS_pwritev2,
             libc::SYS_pread64,
             libc::SYS_pwrite64,
             libc::SYS_readlinkat,
@@ -63,16 +67,24 @@ impl SeccompManager {
             libc::SYS_truncate,
             libc::SYS_ftruncate,
             libc::SYS_fallocate,
-            #[cfg(target_arch = "x86_64")]
-            libc::SYS_fadvise64,
+            #[cfg(any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64"
+            ))]
+            SYS_FADVISE64,
             libc::SYS_fsync,
             libc::SYS_fdatasync,
             libc::SYS_sync_file_range,
             libc::SYS_flock,
             libc::SYS_fstatfs,
             libc::SYS_statfs,
-            #[cfg(target_arch = "x86_64")]
-            libc::SYS_sendfile,
+            #[cfg(any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64"
+            ))]
+            SYS_SENDFILE,
             libc::SYS_copy_file_range,
             libc::SYS_splice,
             libc::SYS_tee,
@@ -309,12 +321,23 @@ impl SeccompManager {
         // Add user-requested extra syscalls (--seccomp-allow).
         // - Already in default/arg-filtered: silently accepted (no-op).
         // - In OPT_IN_SYSCALLS: added to allowlist.
+        // - Security-critical denied names: WARN and blocked even if later
+        //   accidentally added to OPT_IN_SYSCALLS.
         // - Known but not opt-in: WARN and blocked (defense-in-depth).
         // - Unknown name: WARN and blocked.
         for name in extra_syscalls {
+            if Self::ARG_FILTERED_SYSCALLS.contains(&name.as_str()) {
+                continue;
+            }
+
             if let Some(nr) = syscall_name_to_number(name) {
                 if let std::collections::btree_map::Entry::Vacant(entry) = rules.entry(nr) {
-                    if Self::OPT_IN_SYSCALLS.contains(&name.as_str()) {
+                    if Self::SECURITY_CRITICAL_DENIED_SYSCALLS.contains(&name.as_str()) {
+                        warn!(
+                            "--seccomp-allow: security-critical syscall '{}' is always blocked",
+                            name
+                        );
+                    } else if Self::OPT_IN_SYSCALLS.contains(&name.as_str()) {
                         entry.insert(Vec::new());
                     } else {
                         warn!(
@@ -387,10 +410,11 @@ impl SeccompManager {
         }
         rules.insert(libc::SYS_ioctl, ioctl_rules);
 
-        // prctl: allow only safe operations (arg0 = option).
+        // prctl: allow only safe operations.
         // Notably absent (hit default deny):
         //   PR_CAPBSET_DROP (24) – could weaken the capability bounding set
         //   PR_SET_SECUREBITS (28) – could disable secure-exec restrictions
+        //   PR_CAP_AMBIENT mutations – could activate retained inheritable caps
         let prctl_allowed: &[u64] = &[
             1,  // PR_SET_PDEATHSIG
             2,  // PR_GET_PDEATHSIG
@@ -404,8 +428,6 @@ impl SeccompManager {
             37, // PR_GET_CHILD_SUBREAPER
             38, // PR_SET_NO_NEW_PRIVS
             40, // PR_GET_TID_ADDRESS – read-only, returns thread ID address
-            47, // PR_CAP_AMBIENT – glibc probes ambient caps at startup (read-only
-            // IS_SET queries). Safe after caps are dropped.
             39, // PR_GET_NO_NEW_PRIVS
         ];
         let mut prctl_rules = Vec::new();
@@ -424,6 +446,39 @@ impl SeccompManager {
             })?;
             prctl_rules.push(rule);
         }
+
+        let ambient_option = SeccompCondition::new(
+            0, // arg0 is the option for prctl(option, ...)
+            seccompiler::SeccompCmpArgLen::Dword,
+            seccompiler::SeccompCmpOp::Eq,
+            libc::PR_CAP_AMBIENT as u64,
+        )
+        .map_err(|e| {
+            NucleusError::SeccompError(format!(
+                "Failed to create PR_CAP_AMBIENT prctl condition: {}",
+                e
+            ))
+        })?;
+        let ambient_is_set = SeccompCondition::new(
+            1, // arg1 is the PR_CAP_AMBIENT subcommand.
+            seccompiler::SeccompCmpArgLen::Dword,
+            seccompiler::SeccompCmpOp::Eq,
+            libc::PR_CAP_AMBIENT_IS_SET as u64,
+        )
+        .map_err(|e| {
+            NucleusError::SeccompError(format!(
+                "Failed to create PR_CAP_AMBIENT_IS_SET prctl condition: {}",
+                e
+            ))
+        })?;
+        let ambient_probe_rule =
+            SeccompRule::new(vec![ambient_option, ambient_is_set]).map_err(|e| {
+                NucleusError::SeccompError(format!(
+                    "Failed to create PR_CAP_AMBIENT_IS_SET prctl rule: {}",
+                    e
+                ))
+            })?;
+        prctl_rules.push(ambient_probe_rule);
         rules.insert(libc::SYS_prctl, prctl_rules);
 
         // M3: prlimit64 – only allow GET (new_limit == NULL, i.e. arg2 == 0).
@@ -460,6 +515,31 @@ impl SeccompManager {
             mprotect_rules.push(rule);
         }
         rules.insert(libc::SYS_mprotect, mprotect_rules);
+
+        // preadv2/pwritev2: allow only flags == 0, which makes them equivalent
+        // to preadv/pwritev. Nonzero RWF_* flags include cache-observing
+        // behavior such as RWF_NOWAIT and future flags seccomp cannot review.
+        for (syscall, name) in [
+            (libc::SYS_preadv2, "preadv2"),
+            (libc::SYS_pwritev2, "pwritev2"),
+        ] {
+            let condition = SeccompCondition::new(
+                5, // arg5 = flags for preadv2/pwritev2(fd, iov, iovcnt, off_lo, off_hi, flags)
+                seccompiler::SeccompCmpArgLen::Qword,
+                seccompiler::SeccompCmpOp::Eq,
+                0,
+            )
+            .map_err(|e| {
+                NucleusError::SeccompError(format!(
+                    "Failed to create {} flags condition: {}",
+                    name, e
+                ))
+            })?;
+            let rule = SeccompRule::new(vec![condition]).map_err(|e| {
+                NucleusError::SeccompError(format!("Failed to create {} rule: {}", name, e))
+            })?;
+            rules.insert(syscall, vec![rule]);
+        }
 
         // clone3 is intentionally absent from the allow map. Its flags live in a
         // user pointer (struct clone_args), which seccomp BPF cannot dereference,
@@ -502,6 +582,53 @@ impl SeccompManager {
         rules.insert(libc::SYS_execveat, vec![execveat_rule]);
 
         Ok(rules)
+    }
+
+    /// Validate `--seccomp-allow` entries for production mode.
+    ///
+    /// Development runs warn and ignore unsupported names at filter construction
+    /// time. Production mode rejects them early so operators cannot accidentally
+    /// believe a weakened or unsupported syscall fragment was applied.
+    pub fn validate_extra_syscalls_for_production(
+        allow_network: bool,
+        extra_syscalls: &[String],
+    ) -> Result<()> {
+        let base_syscalls = Self::base_allowed_syscalls();
+        let network_syscalls = Self::network_mode_syscalls(allow_network);
+
+        for name in extra_syscalls {
+            let Some(nr) = syscall_name_to_number(name) else {
+                return Err(NucleusError::ConfigError(format!(
+                    "Production mode rejects unknown --seccomp-allow syscall '{}'",
+                    name
+                )));
+            };
+
+            if base_syscalls.contains(&nr)
+                || network_syscalls.contains(&nr)
+                || Self::ARG_FILTERED_SYSCALLS.contains(&name.as_str())
+            {
+                continue;
+            }
+
+            if Self::SECURITY_CRITICAL_DENIED_SYSCALLS.contains(&name.as_str()) {
+                return Err(NucleusError::ConfigError(format!(
+                    "Production mode forbids --seccomp-allow for security-critical syscall '{}'",
+                    name
+                )));
+            }
+
+            if Self::OPT_IN_SYSCALLS.contains(&name.as_str()) {
+                continue;
+            }
+
+            return Err(NucleusError::ConfigError(format!(
+                "Production mode rejects unsupported --seccomp-allow syscall '{}'",
+                name
+            )));
+        }
+
+        Ok(())
     }
 
     /// Compile the minimal BPF filter without applying it
@@ -820,8 +947,22 @@ impl SeccompManager {
 
     /// Syscalls that the built-in filter restricts at the argument level.
     /// Custom profiles allowing these without argument filters weaken security.
-    const ARG_FILTERED_SYSCALLS: &'static [&'static str] =
-        &["clone", "execveat", "ioctl", "mprotect", "prctl", "socket"];
+    const ARG_FILTERED_SYSCALLS: &'static [&'static str] = &[
+        "clone", "execveat", "ioctl", "mprotect", "preadv2", "prctl", "pwritev2", "socket",
+    ];
+
+    /// Security-critical syscalls that must not be re-enabled by the
+    /// convenience `--seccomp-allow` fragment mechanism.
+    const SECURITY_CRITICAL_DENIED_SYSCALLS: &'static [&'static str] = &[
+        // Namespace entry/creation bypasses clone namespace-flag filtering.
+        "clone3",
+        "unshare",
+        "setns",
+        // Kernel keyrings are deliberately outside the built-in policy.
+        "add_key",
+        "request_key",
+        "keyctl",
+    ];
 
     fn errno_denied_syscalls() -> &'static [(i64, u32)] {
         &[(libc::SYS_clone3, libc::ENOSYS as u32)]
@@ -970,10 +1111,6 @@ impl SeccompManager {
         "futex_requeue",
         // Landlock (already in default but listed for completeness)
         "seccomp",
-        // Keyring
-        "add_key",
-        "request_key",
-        "keyctl",
     ];
 
     /// Warn when a custom seccomp profile allows security-critical syscalls
@@ -1089,6 +1226,10 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "fcntl" => Some(libc::SYS_fcntl),
         "readv" => Some(libc::SYS_readv),
         "writev" => Some(libc::SYS_writev),
+        "preadv" => Some(libc::SYS_preadv),
+        "pwritev" => Some(libc::SYS_pwritev),
+        "preadv2" => Some(libc::SYS_preadv2),
+        "pwritev2" => Some(libc::SYS_pwritev2),
         "pread64" => Some(libc::SYS_pread64),
         "pwrite64" => Some(libc::SYS_pwrite64),
         #[cfg(target_arch = "x86_64")]
@@ -1125,13 +1266,21 @@ fn syscall_name_to_number(name: &str) -> Option<i64> {
         "truncate" => Some(libc::SYS_truncate),
         "ftruncate" => Some(libc::SYS_ftruncate),
         "fallocate" => Some(libc::SYS_fallocate),
-        #[cfg(target_arch = "x86_64")]
-        "fadvise64" => Some(libc::SYS_fadvise64),
+        #[cfg(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        ))]
+        "fadvise64" => Some(SYS_FADVISE64),
         "fsync" => Some(libc::SYS_fsync),
         "fdatasync" => Some(libc::SYS_fdatasync),
         "flock" => Some(libc::SYS_flock),
-        #[cfg(target_arch = "x86_64")]
-        "sendfile" => Some(libc::SYS_sendfile),
+        #[cfg(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        ))]
+        "sendfile" => Some(SYS_SENDFILE),
         "copy_file_range" => Some(libc::SYS_copy_file_range),
         "splice" => Some(libc::SYS_splice),
         "tee" => Some(libc::SYS_tee),
@@ -1590,6 +1739,35 @@ mod tests {
         assert!(base.contains(&libc::SYS_landlock_restrict_self));
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
+    #[test]
+    fn test_generic_file_syscalls_present_in_base_allowlist() {
+        let base = SeccompManager::base_allowed_syscalls();
+        assert!(
+            base.contains(&SYS_FADVISE64),
+            "fadvise64 must be allowed on architectures with a generic syscall table"
+        );
+        assert!(
+            base.contains(&SYS_SENDFILE),
+            "sendfile must be allowed on architectures with a generic syscall table"
+        );
+    }
+
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
+    #[test]
+    fn test_generic_file_syscall_names_resolve_for_profiles() {
+        assert_eq!(syscall_name_to_number("fadvise64"), Some(SYS_FADVISE64));
+        assert_eq!(syscall_name_to_number("sendfile"), Some(SYS_SENDFILE));
+    }
+
     #[test]
     fn test_x32_legacy_range_not_allowlisted() {
         let base = SeccompManager::base_allowed_syscalls();
@@ -1624,23 +1802,25 @@ mod tests {
         let net = SeccompManager::network_mode_syscalls(true);
 
         // Snapshot counts to catch unintended policy drift.
-        // +7 accounts for conditional rules inserted in minimal_filter():
-        // socket/ioctl/prctl/prlimit64/mprotect/clone/execveat.
+        // +9 accounts for conditional rules inserted in minimal_filter():
+        // socket/ioctl/prctl/prlimit64/mprotect/preadv2/pwritev2/clone/execveat.
         // fork removed (forces through filtered clone path).
         // execveat removed from base (arg-filtered separately).
         // sysinfo removed (L8: leaks host info).
         // prlimit64 moved to arg-filtered (M3).
-        assert_eq!(base.len(), 173);
+        assert_eq!(base.len(), 171);
         assert_eq!(net.len(), 11);
-        assert_eq!(base.len() + 7, 180);
-        assert_eq!(base.len() + net.len() + 7, 191);
+        assert_eq!(base.len() + 9, 180);
+        assert_eq!(base.len() + net.len() + 9, 191);
     }
 
     #[test]
     fn test_arg_filtered_syscalls_list_includes_critical_syscalls() {
         // These syscalls must be in the arg-filtered list so custom profiles
         // get warnings when they allow them without filters.
-        for name in &["clone", "execveat", "ioctl", "prctl", "socket"] {
+        for name in &[
+            "clone", "execveat", "ioctl", "preadv2", "prctl", "pwritev2", "socket",
+        ] {
             assert!(
                 SeccompManager::ARG_FILTERED_SYSCALLS.contains(name),
                 "'{}' must be in ARG_FILTERED_SYSCALLS",
@@ -1769,6 +1949,36 @@ mod tests {
     }
 
     #[test]
+    fn test_preadv2_pwritev2_have_flags_arg_filtering() {
+        // v2 vectored I/O has an extra flags argument. The built-in profile
+        // permits the v2 entrypoints only when flags == 0, leaving preadv/pwritev
+        // available for ordinary positioned vectored I/O.
+        let base = SeccompManager::base_allowed_syscalls();
+        let rules = SeccompManager::minimal_filter(true, &[]).unwrap();
+
+        for (name, syscall) in [
+            ("preadv2", libc::SYS_preadv2),
+            ("pwritev2", libc::SYS_pwritev2),
+        ] {
+            assert!(
+                !base.contains(&syscall),
+                "{} must not be unconditionally allowed",
+                name
+            );
+            assert!(
+                rules.get(&syscall).is_some_and(|chain| !chain.is_empty()),
+                "{} must have argument-level conditions",
+                name
+            );
+            assert!(
+                SeccompManager::ARG_FILTERED_SYSCALLS.contains(&name),
+                "{} must be listed as argument-filtered for custom profiles",
+                name
+            );
+        }
+    }
+
+    #[test]
     fn test_unsafe_blocks_have_safety_comments() {
         // SEC-08: All unsafe blocks must have // SAFETY: documentation
         let source = include_str!("seccomp.rs");
@@ -1883,16 +2093,26 @@ mod tests {
 
     #[test]
     fn test_extra_syscalls_do_not_override_arg_filtered() {
-        // If a user requests "clone" via extra_syscalls, the arg-filtered
-        // version from the built-in filter should still be present (not
-        // replaced with an unconditional allow).
-        let extra = vec!["clone".to_string()];
+        // If a user requests an arg-filtered syscall via extra_syscalls, the
+        // version from the built-in filter should still be present (not replaced
+        // with an unconditional allow).
+        let extra = vec![
+            "clone".to_string(),
+            "preadv2".to_string(),
+            "pwritev2".to_string(),
+        ];
         let rules = SeccompManager::minimal_filter(true, &extra).unwrap();
-        let clone_rules = rules.get(&libc::SYS_clone);
-        assert!(
-            clone_rules.is_some() && !clone_rules.unwrap().is_empty(),
-            "clone must retain argument-level filtering even when in extra_syscalls"
-        );
+        for (name, syscall) in [
+            ("clone", libc::SYS_clone),
+            ("preadv2", libc::SYS_preadv2),
+            ("pwritev2", libc::SYS_pwritev2),
+        ] {
+            assert!(
+                rules.get(&syscall).is_some_and(|chain| !chain.is_empty()),
+                "{} must retain argument-level filtering even when in extra_syscalls",
+                name
+            );
+        }
     }
 
     #[test]
@@ -1944,6 +2164,56 @@ mod tests {
     }
 
     #[test]
+    fn test_extra_syscalls_keyring_remain_blocked() {
+        let extra = vec![
+            "add_key".to_string(),
+            "request_key".to_string(),
+            "keyctl".to_string(),
+        ];
+        let rules = SeccompManager::minimal_filter(true, &extra).unwrap();
+
+        for (name, syscall) in [
+            ("add_key", libc::SYS_add_key),
+            ("request_key", libc::SYS_request_key),
+            ("keyctl", libc::SYS_keyctl),
+        ] {
+            assert!(
+                !rules.contains_key(&syscall),
+                "{} must stay blocked even when requested via --seccomp-allow",
+                name
+            );
+            assert!(
+                !SeccompManager::OPT_IN_SYSCALLS.contains(&name),
+                "{} must not be in the seccomp opt-in allowlist",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_security_critical_syscalls_remain_absent_from_filter() {
+        let extra = SeccompManager::SECURITY_CRITICAL_DENIED_SYSCALLS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        let rules = SeccompManager::minimal_filter(true, &extra).unwrap();
+
+        for name in SeccompManager::SECURITY_CRITICAL_DENIED_SYSCALLS {
+            let syscall = syscall_name_to_number(name).unwrap();
+            assert!(
+                !rules.contains_key(&syscall),
+                "{} must not appear in the built-in filter even when requested via --seccomp-allow",
+                name
+            );
+            assert!(
+                !SeccompManager::OPT_IN_SYSCALLS.contains(name),
+                "{} must not be in the seccomp opt-in allowlist",
+                name
+            );
+        }
+    }
+
+    #[test]
     fn test_extra_syscalls_clone3_remains_blocked() {
         let extra = vec!["clone3".to_string()];
         let rules = SeccompManager::minimal_filter(true, &extra).unwrap();
@@ -1968,5 +2238,42 @@ mod tests {
             rules.contains_key(&libc::SYS_io_uring_setup),
             "io_uring_setup is in OPT_IN_SYSCALLS and must be added"
         );
+    }
+
+    #[test]
+    fn test_production_validation_rejects_security_critical_extra_syscalls() {
+        for name in [
+            "clone3",
+            "unshare",
+            "setns",
+            "add_key",
+            "request_key",
+            "keyctl",
+        ] {
+            let extra = vec![name.to_string()];
+            let err =
+                SeccompManager::validate_extra_syscalls_for_production(true, &extra).unwrap_err();
+            assert!(err.to_string().contains("security-critical"));
+            assert!(err.to_string().contains(name));
+        }
+    }
+
+    #[test]
+    fn test_production_validation_rejects_unsupported_extra_syscalls() {
+        let extra = vec!["kexec_load".to_string()];
+        let err = SeccompManager::validate_extra_syscalls_for_production(true, &extra).unwrap_err();
+        assert!(err.to_string().contains("unsupported"));
+        assert!(err.to_string().contains("kexec_load"));
+    }
+
+    #[test]
+    fn test_production_validation_allows_supported_extra_syscalls() {
+        let extra = vec![
+            "read".to_string(),
+            "clone".to_string(),
+            "connect".to_string(),
+            "io_uring_setup".to_string(),
+        ];
+        SeccompManager::validate_extra_syscalls_for_production(true, &extra).unwrap();
     }
 }

@@ -24,9 +24,15 @@ VARIABLES
     \* @type: Seq(Str);
     event_queue,     \* Pending events/messages queue
     \* @type: Str;
-    action_taken     \* MBT: name of the last action (for tla-connect replay)
+    action_taken,     \* MBT: name of the last action (for tla-connect replay)
+    \* @type: Bool;
+    context_populated,
+    \* @type: Bool;
+    tmpfs_mounted,
+    \* @type: Int;
+    persisted_file_count
 
-vars == <<state, pc, history, event_queue, action_taken>>
+vars == <<state, pc, history, event_queue, action_taken, context_populated, tmpfs_mounted, persisted_file_count>>
 
 Init ==
     /\ state = unmounted
@@ -34,6 +40,9 @@ Init ==
     /\ history = <<>>
     /\ event_queue = <<>>
     /\ action_taken = "init"
+    /\ context_populated = FALSE
+    /\ tmpfs_mounted = FALSE
+    /\ persisted_file_count = 0
 
 \* Transition actions
 unmounted_mount_tmpfs ==
@@ -43,6 +52,9 @@ unmounted_mount_tmpfs ==
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
     /\ action_taken' = "unmounted_mount_tmpfs"
+    /\ context_populated' = context_populated
+    /\ tmpfs_mounted' = TRUE
+    /\ persisted_file_count' = persisted_file_count
 
 mounted_populate_context ==
     /\ state = mounted
@@ -51,6 +63,9 @@ mounted_populate_context ==
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
     /\ action_taken' = "mounted_populate_context"
+    /\ context_populated' = TRUE
+    /\ tmpfs_mounted' = tmpfs_mounted
+    /\ persisted_file_count' = 0
 
 populated_pivot_root ==
     /\ state = populated
@@ -59,6 +74,9 @@ populated_pivot_root ==
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
     /\ action_taken' = "populated_pivot_root"
+    /\ context_populated' = context_populated
+    /\ tmpfs_mounted' = tmpfs_mounted
+    /\ persisted_file_count' = persisted_file_count
 
 pivoted_cleanup ==
     /\ state = pivoted
@@ -67,6 +85,9 @@ pivoted_cleanup ==
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
     /\ action_taken' = "pivoted_cleanup"
+    /\ context_populated' = FALSE
+    /\ tmpfs_mounted' = FALSE
+    /\ persisted_file_count' = 0
 
 Next ==
     \/ unmounted_mount_tmpfs
@@ -87,6 +108,9 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
+    /\ context_populated \in BOOLEAN
+    /\ tmpfs_mounted \in BOOLEAN
+    /\ persisted_file_count \in Nat
     \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
@@ -101,9 +125,9 @@ HistoryConsistent ==
     Len(history) = pc
 
 \* Temporal properties (LTL)
-Prop_context_isolation == [][(state = pivoted) => ((state' = pivoted) \/ (state' = unmounted_final))]_vars
-Prop_ephemeral_guarantee == [][(state = unmounted_final) => (state' = unmounted_final)]_vars
-Prop_mount_ordering == [][(state = populated) => ((state' = pivoted) \/ (state' = unmounted_final))]_vars
+Prop_context_isolation == [](state = pivoted => context_populated)
+Prop_ephemeral_guarantee == [](state = unmounted_final => persisted_file_count = 0)
+Prop_mount_ordering == [](state = populated => tmpfs_mounted)
 
 \* State invariant for trace generation (negated to find terminating traces)
 NotTerminated == state \notin TerminalStates

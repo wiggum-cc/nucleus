@@ -878,7 +878,8 @@ pub fn mount_volumes(root: &Path, volumes: &[crate::container::VolumeMount]) -> 
 ///
 /// In rootless mode, procfs mounting should work due to user namespace capabilities.
 /// When `hide_pids` is true, mounts with hidepid=2 so processes cannot enumerate
-/// other PIDs (production hardening).
+/// other PIDs (production hardening). The best-effort fallback only applies to
+/// non-hardened procfs mounts; requested hidepid hardening is fail-closed.
 pub fn mount_procfs(
     proc_path: &Path,
     best_effort: bool,
@@ -892,7 +893,6 @@ pub fn mount_procfs(
     );
 
     let mount_data: Option<&str> = if hide_pids { Some("hidepid=2") } else { None };
-    let mut used_hidepid = hide_pids;
 
     let mounted = match mount(
         Some("proc"),
@@ -902,41 +902,7 @@ pub fn mount_procfs(
         mount_data,
     ) {
         Ok(_) => true,
-        Err(e) if hide_pids && best_effort => {
-            // Some kernels reject hidepid in user namespaces even though the
-            // private PID namespace still prevents host PID enumeration.
-            warn!(
-                "Failed to mount procfs with hidepid=2: {} (retrying without hidepid)",
-                e
-            );
-            match mount(
-                Some("proc"),
-                proc_path,
-                Some("proc"),
-                MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
-                None::<&str>,
-            ) {
-                Ok(_) => {
-                    used_hidepid = false;
-                    true
-                }
-                Err(e) => {
-                    warn!("Failed to mount procfs: {} (continuing anyway)", e);
-                    false
-                }
-            }
-        }
-        Err(e) => {
-            if best_effort {
-                warn!("Failed to mount procfs: {} (continuing anyway)", e);
-                false
-            } else {
-                return Err(NucleusError::FilesystemError(format!(
-                    "Failed to mount procfs: {}",
-                    e
-                )));
-            }
-        }
+        Err(e) => handle_procfs_mount_failure(e, best_effort, hide_pids)?,
     };
 
     if mounted {
@@ -950,24 +916,41 @@ pub fn mount_procfs(
                     | MsFlags::MS_NOSUID
                     | MsFlags::MS_NODEV
                     | MsFlags::MS_NOEXEC,
-                None::<&str>,
+                mount_data,
             )
             .map_err(|e| {
                 NucleusError::FilesystemError(format!("Failed to remount procfs read-only: {}", e))
             })?;
-            if hide_pids && !used_hidepid {
-                info!("Successfully mounted procfs without hidepid (read-only)");
-            } else {
-                info!("Successfully mounted procfs (read-only)");
-            }
-        } else if hide_pids && !used_hidepid {
-            info!("Successfully mounted procfs without hidepid");
+            info!("Successfully mounted procfs (read-only)");
         } else {
             info!("Successfully mounted procfs");
         }
     }
 
     Ok(())
+}
+
+fn handle_procfs_mount_failure(
+    e: nix::errno::Errno,
+    best_effort: bool,
+    hide_pids: bool,
+) -> Result<bool> {
+    if hide_pids {
+        return Err(NucleusError::FilesystemError(format!(
+            "Failed to mount procfs with required hidepid=2: {}",
+            e
+        )));
+    }
+
+    if best_effort {
+        warn!("Failed to mount procfs: {} (continuing anyway)", e);
+        Ok(false)
+    } else {
+        Err(NucleusError::FilesystemError(format!(
+            "Failed to mount procfs: {}",
+            e
+        )))
+    }
 }
 
 /// Paths to mask with /dev/null (files) – matches OCI runtime spec masked paths.
@@ -1788,6 +1771,24 @@ mod tests {
                 path
             );
         }
+    }
+
+    #[test]
+    fn test_procfs_hidepid_failure_fails_closed_even_best_effort() {
+        let err = handle_procfs_mount_failure(nix::errno::Errno::EINVAL, true, true).unwrap_err();
+
+        assert!(
+            err.to_string().contains("required hidepid=2"),
+            "hidepid=2 failures must remain fatal in production/rootless paths, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_procfs_best_effort_only_applies_without_hidepid() {
+        assert!(
+            !handle_procfs_mount_failure(nix::errno::Errno::EPERM, true, false).unwrap(),
+            "best-effort procfs mount failures may only continue when hidepid was not requested"
+        );
     }
 
     #[test]

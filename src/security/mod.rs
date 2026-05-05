@@ -9,6 +9,7 @@ mod seccomp_bpf;
 mod seccomp_generate;
 mod seccomp_trace;
 mod state;
+mod syscall_numbers;
 
 pub use crate::oci::*;
 pub use capabilities::*;

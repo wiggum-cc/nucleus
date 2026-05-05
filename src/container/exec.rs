@@ -210,7 +210,7 @@ impl Container {
                             // Check the stop flag *after* waking so that the
                             // wake-up signal is not forwarded to the child
                             // during shutdown.
-                            if sig_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                            if sig_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
                                 break;
                             }
                             let _ = kill(child_pid, signal);
@@ -254,9 +254,8 @@ impl Container {
                 };
 
                 // Stop the signal-forwarding thread before exiting.
-                sig_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                // Send ourselves a blocked signal to unblock the sigwait() call.
-                let _ = kill(Pid::this(), Signal::SIGUSR1);
+                sig_stop.store(true, std::sync::atomic::Ordering::Release);
+                super::signals::wake_sigwait_thread(&sig_thread, Signal::SIGUSR1);
                 let _ = sig_thread.join();
                 std::process::exit(workload_exit);
             }

@@ -6,6 +6,12 @@
 
 use crate::error::{NucleusError, Result};
 use crate::security::seccomp_trace::TraceRecord;
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+))]
+use crate::security::syscall_numbers::{SYS_FADVISE64, SYS_SENDFILE};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::BufRead;
@@ -155,6 +161,10 @@ fn syscall_table() -> Vec<(&'static str, i64)> {
         ("fcntl", libc::SYS_fcntl),
         ("readv", libc::SYS_readv),
         ("writev", libc::SYS_writev),
+        ("preadv", libc::SYS_preadv),
+        ("pwritev", libc::SYS_pwritev),
+        ("preadv2", libc::SYS_preadv2),
+        ("pwritev2", libc::SYS_pwritev2),
         ("pread64", libc::SYS_pread64),
         ("pwrite64", libc::SYS_pwrite64),
         ("readlinkat", libc::SYS_readlinkat),
@@ -175,9 +185,21 @@ fn syscall_table() -> Vec<(&'static str, i64)> {
         ("truncate", libc::SYS_truncate),
         ("ftruncate", libc::SYS_ftruncate),
         ("fallocate", libc::SYS_fallocate),
+        #[cfg(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        ))]
+        ("fadvise64", SYS_FADVISE64),
         ("fsync", libc::SYS_fsync),
         ("fdatasync", libc::SYS_fdatasync),
         ("flock", libc::SYS_flock),
+        #[cfg(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        ))]
+        ("sendfile", SYS_SENDFILE),
         ("copy_file_range", libc::SYS_copy_file_range),
         ("splice", libc::SYS_splice),
         ("tee", libc::SYS_tee),
@@ -289,8 +311,6 @@ fn syscall_table() -> Vec<(&'static str, i64)> {
         ("link", libc::SYS_link),
         ("symlink", libc::SYS_symlink),
         ("chmod", libc::SYS_chmod),
-        ("fadvise64", libc::SYS_fadvise64),
-        ("sendfile", libc::SYS_sendfile),
         ("fork", libc::SYS_fork),
         ("getpgrp", libc::SYS_getpgrp),
         ("mkdir", libc::SYS_mkdir),
@@ -319,6 +339,17 @@ mod tests {
         assert_eq!(syscall_number_to_name(libc::SYS_write), Some("write"));
         assert_eq!(syscall_number_to_name(libc::SYS_openat), Some("openat"));
         assert_eq!(syscall_number_to_name(99999), None);
+    }
+
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
+    #[test]
+    fn test_generic_file_syscall_numbers_to_name() {
+        assert_eq!(syscall_number_to_name(SYS_FADVISE64), Some("fadvise64"));
+        assert_eq!(syscall_number_to_name(SYS_SENDFILE), Some("sendfile"));
     }
 
     #[test]

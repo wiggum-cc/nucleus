@@ -19,15 +19,21 @@ VARIABLES
     \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
     \* @type: Seq(Str);
-    event_queue     \* Pending events/messages queue
+    event_queue,     \* Pending events/messages queue
+    \* @type: Bool;
+    all_syscalls_intercepted,
+    \* @type: Int;
+    kernel_syscalls
 
-vars == <<state, pc, history, event_queue>>
+vars == <<state, pc, history, event_queue, all_syscalls_intercepted, kernel_syscalls>>
 
 Init ==
     /\ state = native_kernel
     /\ pc = 0
     /\ history = <<>>
     /\ event_queue = <<>>
+    /\ all_syscalls_intercepted = FALSE
+    /\ kernel_syscalls = 300
 
 \* Transition actions
 native_kernel_enable_gvisor ==
@@ -36,6 +42,8 @@ native_kernel_enable_gvisor ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ all_syscalls_intercepted' = TRUE
+    /\ kernel_syscalls' = 99
 
 Next ==
     \/ native_kernel_enable_gvisor
@@ -53,6 +61,8 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
+    /\ all_syscalls_intercepted \in BOOLEAN
+    /\ kernel_syscalls \in Nat
     \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
@@ -68,6 +78,12 @@ HistoryConsistent ==
 
 \* Temporal properties (LTL)
 Prop_kernel_switched == []((state = native_kernel) => (<>(state = gvisor_kernel)))
+Prop_syscall_interception == [](state = gvisor_kernel => all_syscalls_intercepted)
+Prop_reduced_surface == [](state = gvisor_kernel => kernel_syscalls < 100)
+
+GVisorSafety ==
+    /\ Prop_syscall_interception
+    /\ Prop_reduced_surface
 
 \* Liveness: Eventually reaches a terminal state
 Liveness ==

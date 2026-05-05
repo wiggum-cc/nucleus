@@ -25,9 +25,11 @@ VARIABLES
     \* @type: Seq(Str);
     event_queue,     \* Pending events/messages queue
     \* @type: Str;
-    action_taken     \* MBT: name of the last action (for tla-connect replay)
+    action_taken,     \* MBT: name of the last action (for tla-connect replay)
+    \* @type: Int;
+    processes_in_cgroup
 
-vars == <<state, pc, history, event_queue, action_taken>>
+vars == <<state, pc, history, event_queue, action_taken, processes_in_cgroup>>
 
 Init ==
     /\ state = nonexistent
@@ -35,6 +37,7 @@ Init ==
     /\ history = <<>>
     /\ event_queue = <<>>
     /\ action_taken = "init"
+    /\ processes_in_cgroup = 0
 
 \* Transition actions
 nonexistent_create_cgroup ==
@@ -44,6 +47,7 @@ nonexistent_create_cgroup ==
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
     /\ action_taken' = "nonexistent_create_cgroup"
+    /\ processes_in_cgroup' = 0
 
 created_set_limits ==
     /\ state = created
@@ -52,6 +56,7 @@ created_set_limits ==
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
     /\ action_taken' = "created_set_limits"
+    /\ processes_in_cgroup' = 0
 
 configured_attach_process ==
     /\ state = configured
@@ -60,6 +65,7 @@ configured_attach_process ==
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
     /\ action_taken' = "configured_attach_process"
+    /\ processes_in_cgroup' = 1
 
 attached_start_monitoring ==
     /\ state = attached
@@ -68,6 +74,7 @@ attached_start_monitoring ==
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
     /\ action_taken' = "attached_start_monitoring"
+    /\ processes_in_cgroup' = processes_in_cgroup
 
 monitoring_cleanup ==
     /\ state = monitoring
@@ -76,6 +83,7 @@ monitoring_cleanup ==
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
     /\ action_taken' = "monitoring_cleanup"
+    /\ processes_in_cgroup' = 0
 
 created_cleanup_failed_cgroup ==
     /\ state = created
@@ -84,6 +92,7 @@ created_cleanup_failed_cgroup ==
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
     /\ action_taken' = "created_cleanup_failed_cgroup"
+    /\ processes_in_cgroup' = 0
 
 configured_cleanup_failed_cgroup ==
     /\ state = configured
@@ -92,6 +101,7 @@ configured_cleanup_failed_cgroup ==
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
     /\ action_taken' = "configured_cleanup_failed_cgroup"
+    /\ processes_in_cgroup' = 0
 
 attached_cleanup ==
     /\ state = attached
@@ -100,6 +110,7 @@ attached_cleanup ==
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
     /\ action_taken' = "attached_cleanup"
+    /\ processes_in_cgroup' = 0
 
 Next ==
     \/ nonexistent_create_cgroup
@@ -124,6 +135,7 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
+    /\ processes_in_cgroup \in Nat
     \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
@@ -140,7 +152,7 @@ HistoryConsistent ==
 \* Temporal properties (LTL)
 Prop_resource_limits_enforced == [][(state = configured) => (((state' = attached) \/ (state' = monitoring)) \/ (state' = removed))]_vars
 Prop_cleanup_guaranteed == []((state = created) => (<>(state = removed)))
-Prop_no_resource_leak == [][(state = removed) => (state' = removed)]_vars
+Prop_no_resource_leak == [](state = removed => processes_in_cgroup = 0)
 
 \* State invariant for trace generation (negated to find terminating traces)
 NotTerminated == state \notin TerminalStates

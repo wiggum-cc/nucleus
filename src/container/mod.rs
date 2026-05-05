@@ -5,6 +5,7 @@ mod gvisor_setup;
 mod health;
 mod lifecycle;
 mod runtime;
+mod signals;
 mod state;
 
 pub use config::*;

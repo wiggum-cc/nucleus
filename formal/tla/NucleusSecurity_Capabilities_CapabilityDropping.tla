@@ -12,6 +12,21 @@ States == {
     all_caps, minimal_caps, no_caps
 }
 
+DangerousCapabilities == {
+    "CAP_SYS_ADMIN",
+    "CAP_SYS_MODULE",
+    "CAP_SYS_PTRACE",
+    "CAP_NET_ADMIN",
+    "CAP_DAC_OVERRIDE"
+}
+
+NonDangerousCapabilities == {
+    "CAP_CHOWN",
+    "CAP_SETUID"
+}
+
+AllCapabilities == DangerousCapabilities \cup NonDangerousCapabilities
+
 VARIABLES
     \* @type: Str;
     state,      \* Current state
@@ -20,15 +35,18 @@ VARIABLES
     \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
     \* @type: Seq(Str);
-    event_queue     \* Pending events/messages queue
+    event_queue,     \* Pending events/messages queue
+    \* @type: Set(Str);
+    effective_caps
 
-vars == <<state, pc, history, event_queue>>
+vars == <<state, pc, history, event_queue, effective_caps>>
 
 Init ==
     /\ state = all_caps
     /\ pc = 0
     /\ history = <<>>
     /\ event_queue = <<>>
+    /\ effective_caps = AllCapabilities
 
 \* Transition actions
 all_caps_drop_most_capabilities ==
@@ -37,6 +55,7 @@ all_caps_drop_most_capabilities ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ effective_caps' = NonDangerousCapabilities
 
 all_caps_drop_all_capabilities ==
     /\ state = all_caps
@@ -44,6 +63,7 @@ all_caps_drop_all_capabilities ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ effective_caps' = {}
 
 minimal_caps_drop_remaining_capabilities ==
     /\ state = minimal_caps
@@ -51,6 +71,7 @@ minimal_caps_drop_remaining_capabilities ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ effective_caps' = {}
 
 Next ==
     \/ all_caps_drop_most_capabilities
@@ -70,6 +91,7 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
+    /\ effective_caps \in SUBSET AllCapabilities
     \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
@@ -85,6 +107,15 @@ HistoryConsistent ==
 
 \* Temporal properties (LTL)
 Prop_irreversible == [][(state = minimal_caps) => ((state' = minimal_caps) \/ (state' = no_caps))]_vars
+Prop_no_caps_irreversible == [][(state = no_caps) => (state' = no_caps)]_vars
+Prop_no_dangerous_caps == [](state \in {minimal_caps, no_caps} => DangerousCapabilities \cap effective_caps = {})
+Prop_no_caps_terminal_empty == [](state = no_caps => effective_caps = {})
+
+CapabilitySafety ==
+    /\ Prop_irreversible
+    /\ Prop_no_caps_irreversible
+    /\ Prop_no_dangerous_caps
+    /\ Prop_no_caps_terminal_empty
 
 \* Liveness: Eventually reaches a terminal state
 Liveness ==

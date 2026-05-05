@@ -552,7 +552,6 @@ impl Container {
 
                     let mut network_driver: Option<BridgeDriver> = None;
                     let trace_reader = Self::maybe_start_seccomp_trace_reader(&config, target_pid)?;
-                    let deny_logger = Self::maybe_start_seccomp_deny_logger(&config, target_pid)?;
 
                     // Transition: Creating -> Created
                     state.status = OciStatus::Created;
@@ -573,6 +572,12 @@ impl Container {
                     if let Some(ref mut cgroup) = cgroup_opt {
                         cgroup.attach_process(target_pid)?;
                     }
+
+                    let deny_logger = Self::maybe_start_seccomp_deny_logger(
+                        &config,
+                        target_pid,
+                        cgroup_opt.as_ref().map(|cgroup| cgroup.path()),
+                    )?;
 
                     if let NetworkMode::Bridge(ref bridge_config) = config.network {
                         match BridgeDriver::setup_with_id(
@@ -950,10 +955,12 @@ impl Container {
 
         // 8. Mount procfs (hidepid=2 in production mode to prevent PID enumeration)
         let proc_path = container_root.join("proc");
-        let hide_pids = self.config.service_mode == ServiceMode::Production;
+        let production_mode = self.config.service_mode == ServiceMode::Production;
+        let hide_pids = production_mode;
+        let procfs_best_effort = is_rootless && !production_mode;
         mount_procfs(
             &proc_path,
-            is_rootless,
+            procfs_best_effort,
             self.config.proc_readonly,
             hide_pids,
         )?;
@@ -1314,7 +1321,7 @@ impl Container {
                         // Check the stop flag *after* waking so that the
                         // wake-up signal (SIGUSR1) is not forwarded to the
                         // child during shutdown.
-                        if stop_clone.load(Ordering::Relaxed) {
+                        if stop_clone.load(Ordering::Acquire) {
                             break;
                         }
                         let _ = kill(child, signal);
@@ -1740,9 +1747,10 @@ struct SignalThreadGuard {
 impl SignalThreadGuard {
     fn stop(&mut self) {
         if let Some(flag) = self.stop.take() {
-            flag.store(true, Ordering::Relaxed);
-            // Unblock the sigwait() call so the thread can observe the stop flag.
-            let _ = kill(Pid::this(), Signal::SIGUSR1);
+            flag.store(true, Ordering::Release);
+            if let Some(handle) = self.handle.as_ref() {
+                super::signals::wake_sigwait_thread(handle, Signal::SIGUSR1);
+            }
         }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -2052,6 +2060,29 @@ mod tests {
     }
 
     #[test]
+    fn test_native_production_procfs_mount_is_not_rootless_best_effort() {
+        let source = include_str!("runtime.rs");
+        let fn_body = extract_fn_body(source, "fn setup_and_exec");
+
+        assert!(
+            fn_body.contains(
+                "let production_mode = self.config.service_mode == ServiceMode::Production;"
+            ),
+            "setup_and_exec must derive an explicit production-mode guard for procfs hardening"
+        );
+        assert!(
+            fn_body.contains("let procfs_best_effort = is_rootless && !production_mode;"),
+            "rootless best-effort procfs fallback must be disabled in production mode"
+        );
+        assert!(
+            fn_body.contains(
+                "mount_procfs(\n            &proc_path,\n            procfs_best_effort,"
+            ),
+            "mount_procfs must receive the production-aware best-effort flag"
+        );
+    }
+
+    #[test]
     fn test_gvisor_uses_inmemory_secret_staging_for_all_modes() {
         let source = include_str!("gvisor_setup.rs");
         let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
@@ -2155,6 +2186,7 @@ mod tests {
         let create_body = extract_fn_body(source, "fn create_internal");
 
         let cgroup_attach = create_body.find("cgroup.attach_process").unwrap();
+        let deny_logger = create_body.find("maybe_start_seccomp_deny_logger").unwrap();
         let bridge_setup = create_body.find("BridgeDriver::setup_with_id").unwrap();
         let egress_policy = create_body.find("net.apply_egress_policy").unwrap();
         let release = create_body
@@ -2165,6 +2197,14 @@ mod tests {
         assert!(
             cgroup_attach < bridge_setup,
             "parent setup gate must not release before cgroup attachment"
+        );
+        assert!(
+            cgroup_attach < deny_logger && deny_logger < bridge_setup,
+            "seccomp deny logger must start after cgroup attachment and before workload release"
+        );
+        assert!(
+            create_body.contains("cgroup_opt.as_ref().map(|cgroup| cgroup.path())"),
+            "seccomp deny logger must receive the container cgroup scope"
         );
         assert!(
             bridge_setup < egress_policy && egress_policy < release,
@@ -2246,6 +2286,27 @@ mod tests {
         assert!(
             fn_body.contains("self.exec_command()?"),
             "workload child must still route through exec_command for identity application"
+        );
+    }
+
+    #[test]
+    fn test_signal_thread_shutdown_uses_thread_directed_wakeup() {
+        let runtime_source = include_str!("runtime.rs");
+        let exec_source = include_str!("exec.rs");
+        let signal_helper_source = include_str!("signals.rs");
+        let process_directed_wakeup = ["kill(Pid::this()", ", Signal::SIGUSR1)"].concat();
+
+        assert!(
+            !runtime_source.contains(&process_directed_wakeup),
+            "CreatedContainer signal-thread shutdown must not send process-directed SIGUSR1"
+        );
+        assert!(
+            !exec_source.contains(&process_directed_wakeup),
+            "init supervisor signal-thread shutdown must not send process-directed SIGUSR1"
+        );
+        assert!(
+            signal_helper_source.contains("libc::pthread_kill"),
+            "signal-thread shutdown must wake the sigwait owner with a thread-directed signal"
         );
     }
 

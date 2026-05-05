@@ -22,15 +22,24 @@ VARIABLES
     \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
     \* @type: Seq(Str);
-    event_queue     \* Pending events/messages queue
+    event_queue,     \* Pending events/messages queue
+    \* @type: Int;
+    cgroup_count,
+    \* @type: Int;
+    namespace_count,
+    \* @type: Int;
+    tmpfs_mount_count
 
-vars == <<state, pc, history, event_queue>>
+vars == <<state, pc, history, event_queue, cgroup_count, namespace_count, tmpfs_mount_count>>
 
 Init ==
     /\ state = test_start
     /\ pc = 0
     /\ history = <<>>
     /\ event_queue = <<>>
+    /\ cgroup_count = 0
+    /\ namespace_count = 0
+    /\ tmpfs_mount_count = 0
 
 \* Transition actions
 test_start_create_container ==
@@ -39,6 +48,9 @@ test_start_create_container ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ cgroup_count' = 1
+    /\ namespace_count' = 1
+    /\ tmpfs_mount_count' = 1
 
 container_created_start_container ==
     /\ state = container_created
@@ -46,6 +58,9 @@ container_created_start_container ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ cgroup_count' = cgroup_count
+    /\ namespace_count' = namespace_count
+    /\ tmpfs_mount_count' = tmpfs_mount_count
 
 container_running_wait_exit ==
     /\ state = container_running
@@ -53,6 +68,9 @@ container_running_wait_exit ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ cgroup_count' = cgroup_count
+    /\ namespace_count' = namespace_count
+    /\ tmpfs_mount_count' = tmpfs_mount_count
 
 container_exited_verify_cleanup ==
     /\ state = container_exited
@@ -60,6 +78,9 @@ container_exited_verify_cleanup ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ cgroup_count' = 0
+    /\ namespace_count' = 0
+    /\ tmpfs_mount_count' = 0
 
 Next ==
     \/ test_start_create_container
@@ -80,6 +101,9 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
+    /\ cgroup_count \in Nat
+    /\ namespace_count \in Nat
+    /\ tmpfs_mount_count \in Nat
     \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
@@ -94,6 +118,7 @@ HistoryConsistent ==
     Len(history) = pc
 
 \* Temporal properties (LTL)
+Prop_resources_cleaned == [](state = cleanup_done => cgroup_count = 0 /\ namespace_count = 0 /\ tmpfs_mount_count = 0)
 Prop_eventual_cleanup == []((state = test_start) => (<>(state = cleanup_done)))
 
 \* Liveness: Eventually reaches a terminal state

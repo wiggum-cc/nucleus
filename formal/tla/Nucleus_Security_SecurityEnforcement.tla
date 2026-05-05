@@ -24,9 +24,15 @@ VARIABLES
     \* @type: Seq(Str);
     event_queue,     \* Pending events/messages queue
     \* @type: Str;
-    action_taken     \* MBT: name of the last action (for tla-connect replay)
+    action_taken,     \* MBT: name of the last action (for tla-connect replay)
+    \* @type: Bool;
+    capabilities_are_dropped,
+    \* @type: Bool;
+    seccomp_filter_active,
+    \* @type: Bool;
+    landlock_policy_active
 
-vars == <<state, pc, history, event_queue, action_taken>>
+vars == <<state, pc, history, event_queue, action_taken, capabilities_are_dropped, seccomp_filter_active, landlock_policy_active>>
 
 Init ==
     /\ state = privileged
@@ -34,6 +40,9 @@ Init ==
     /\ history = <<>>
     /\ event_queue = <<>>
     /\ action_taken = "init"
+    /\ capabilities_are_dropped = FALSE
+    /\ seccomp_filter_active = FALSE
+    /\ landlock_policy_active = FALSE
 
 \* Transition actions
 privileged_drop_capabilities ==
@@ -43,6 +52,9 @@ privileged_drop_capabilities ==
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
     /\ action_taken' = "privileged_drop_capabilities"
+    /\ capabilities_are_dropped' = TRUE
+    /\ seccomp_filter_active' = seccomp_filter_active
+    /\ landlock_policy_active' = landlock_policy_active
 
 capabilities_dropped_apply_seccomp ==
     /\ state = capabilities_dropped
@@ -51,6 +63,9 @@ capabilities_dropped_apply_seccomp ==
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
     /\ action_taken' = "capabilities_dropped_apply_seccomp"
+    /\ capabilities_are_dropped' = capabilities_are_dropped
+    /\ seccomp_filter_active' = TRUE
+    /\ landlock_policy_active' = landlock_policy_active
 
 seccomp_applied_apply_landlock ==
     /\ state = seccomp_applied
@@ -59,6 +74,9 @@ seccomp_applied_apply_landlock ==
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
     /\ action_taken' = "seccomp_applied_apply_landlock"
+    /\ capabilities_are_dropped' = capabilities_are_dropped
+    /\ seccomp_filter_active' = seccomp_filter_active
+    /\ landlock_policy_active' = TRUE
 
 landlock_applied_finalize ==
     /\ state = landlock_applied
@@ -67,6 +85,9 @@ landlock_applied_finalize ==
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
     /\ action_taken' = "landlock_applied_finalize"
+    /\ capabilities_are_dropped' = capabilities_are_dropped
+    /\ seccomp_filter_active' = seccomp_filter_active
+    /\ landlock_policy_active' = landlock_policy_active
 
 Next ==
     \/ privileged_drop_capabilities
@@ -87,6 +108,9 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
+    /\ capabilities_are_dropped \in BOOLEAN
+    /\ seccomp_filter_active \in BOOLEAN
+    /\ landlock_policy_active \in BOOLEAN
     \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
@@ -103,7 +127,7 @@ HistoryConsistent ==
 \* Temporal properties (LTL)
 Prop_irreversible_lockdown == [][(state = seccomp_applied) => ((state' = seccomp_applied) \/ (state' = landlock_applied))]_vars
 Prop_landlock_lockdown == [][(state = landlock_applied) => ((state' = landlock_applied) \/ (state' = locked))]_vars
-Prop_defense_in_depth == []((state = locked) => ((state = capabilities_dropped) /\ (state = seccomp_applied) /\ (state = landlock_applied)))
+Prop_defense_in_depth == [](state = locked => capabilities_are_dropped /\ seccomp_filter_active /\ landlock_policy_active)
 Prop_no_privilege_escalation == [][(state = capabilities_dropped) => (~(state' = privileged))]_vars
 
 \* State invariant for trace generation (negated to find terminating traces)

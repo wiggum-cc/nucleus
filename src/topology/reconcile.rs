@@ -13,12 +13,14 @@ use crate::topology::config::{
     parse_service_volume_mount, parse_volume_owner, ServiceDef, TopologyConfig, VolumeDef,
 };
 use crate::topology::dag::DependencyGraph;
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
+use std::io::{Seek, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -50,6 +52,55 @@ pub struct ReconcilePlan {
 enum PostStartWait {
     Started,
     Healthy,
+}
+
+struct ServiceRunCommand {
+    args: Vec<String>,
+    secrets_file: Option<File>,
+}
+
+impl ServiceRunCommand {
+    fn prepare_secret_fd_for_spawn(&self) -> Result<Option<FdCloexecGuard<'_>>> {
+        self.secrets_file
+            .as_ref()
+            .map(prepare_inherited_fd)
+            .transpose()
+    }
+}
+
+struct FdCloexecGuard<'a> {
+    file: &'a File,
+    original_flags: FdFlag,
+}
+
+impl Drop for FdCloexecGuard<'_> {
+    fn drop(&mut self) {
+        let _ = fcntl(self.file, FcntlArg::F_SETFD(self.original_flags));
+    }
+}
+
+fn prepare_inherited_fd(file: &File) -> Result<FdCloexecGuard<'_>> {
+    let flags = fcntl(file, FcntlArg::F_GETFD).map_err(|e| {
+        NucleusError::ExecError(format!(
+            "Failed to inspect inherited secrets fd {}: {}",
+            file.as_raw_fd(),
+            e
+        ))
+    })?;
+    let original_flags = FdFlag::from_bits_truncate(flags);
+    let inherited_flags = original_flags & !FdFlag::FD_CLOEXEC;
+    fcntl(file, FcntlArg::F_SETFD(inherited_flags)).map_err(|e| {
+        NucleusError::ExecError(format!(
+            "Failed to prepare inherited secrets fd {}: {}",
+            file.as_raw_fd(),
+            e
+        ))
+    })?;
+
+    Ok(FdCloexecGuard {
+        file,
+        original_flags,
+    })
 }
 
 fn path_component_cstring(component: &std::ffi::OsStr, path: &Path) -> Result<CString> {
@@ -303,7 +354,7 @@ pub fn execute_reconcile(
                         service_name
                     ))
                 })?;
-                let args = build_service_run_args(
+                let run_command = build_service_run_command(
                     config,
                     service_name,
                     svc,
@@ -323,13 +374,16 @@ pub fn execute_reconcile(
                     ))
                 })?;
 
-                match Command::new(&nucleus_bin)
-                    .args(&args[1..]) // skip "nucleus" since we're using current_exe
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
-                    .spawn()
-                {
+                let spawn_result = {
+                    let _secrets_fd_guard = run_command.prepare_secret_fd_for_spawn()?;
+                    Command::new(&nucleus_bin)
+                        .args(&run_command.args[1..]) // skip "nucleus" since we're using current_exe
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit())
+                        .spawn()
+                };
+                match spawn_result {
                     Ok(child) => {
                         info!("Started service {} (PID {})", container_name, child.id());
                     }
@@ -340,6 +394,7 @@ pub fn execute_reconcile(
                         )));
                     }
                 }
+                drop(run_command);
                 wait_for_started(state_mgr, &container_name, Duration::from_secs(10))?;
                 if post_start_wait(&graph, service_name) == PostStartWait::Healthy {
                     wait_for_healthy(state_mgr, &container_name, service_name, svc)?;
@@ -387,15 +442,16 @@ fn prepare_persistent_volume(volume_name: &str, volume_def: &VolumeDef) -> Resul
     Ok(canonical)
 }
 
-fn build_service_run_args(
+fn build_service_run_command(
     config: &TopologyConfig,
     service_name: &str,
     svc: &ServiceDef,
     container_name: &str,
     desired_hash: u64,
     state_root: Option<&std::path::Path>,
-) -> Result<Vec<String>> {
+) -> Result<ServiceRunCommand> {
     let mut args = vec!["nucleus".to_string()];
+    let mut secrets_file = None;
 
     // Propagate --root so the child uses the same state directory
     if let Some(root) = state_root {
@@ -494,11 +550,11 @@ fn build_service_run_args(
         }
     }
 
-    // Pass each secret as a separate --secret SOURCE:DEST flag,
-    // matching the CLI parser's expected format.
-    for secret in &svc.secrets {
-        args.push("--secret".to_string());
-        args.push(secret.clone());
+    if !svc.secrets.is_empty() {
+        let file = write_secrets_fd(container_name, &svc.secrets)?;
+        args.push("--secrets-fd".to_string());
+        args.push(file.as_raw_fd().to_string());
+        secrets_file = Some(file);
     }
 
     for (key, value) in &svc.environment {
@@ -536,7 +592,50 @@ fn build_service_run_args(
     args.push("--sd-notify".to_string());
     args.push("--".to_string());
     args.extend(svc.command.clone());
-    Ok(args)
+    Ok(ServiceRunCommand { args, secrets_file })
+}
+
+fn write_secrets_fd(container_name: &str, secrets: &[String]) -> Result<File> {
+    let mut file = tempfile::tempfile().map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Failed to create anonymous secrets file for {}: {}",
+            container_name, e
+        ))
+    })?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| {
+            NucleusError::ConfigError(format!(
+                "Failed to secure anonymous secrets file for {}: {}",
+                container_name, e
+            ))
+        })?;
+
+    serde_json::to_writer(&mut file, secrets).map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Failed to write anonymous secrets file for {}: {}",
+            container_name, e
+        ))
+    })?;
+    file.write_all(b"\n").map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Failed to terminate anonymous secrets file for {}: {}",
+            container_name, e
+        ))
+    })?;
+    file.flush().map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Failed to flush anonymous secrets file for {}: {}",
+            container_name, e
+        ))
+    })?;
+    file.rewind().map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Failed to rewind anonymous secrets file for {}: {}",
+            container_name, e
+        ))
+    })?;
+
+    Ok(file)
 }
 
 fn post_start_wait(graph: &DependencyGraph, service_name: &str) -> PostStartWait {
@@ -806,7 +905,9 @@ memory = "256M"
 "#;
         let config = TopologyConfig::from_toml(toml).unwrap();
         let svc = config.services.get("web").unwrap();
-        let args = build_service_run_args(&config, "web", svc, "test-web", 42, None).unwrap();
+        let run_command =
+            build_service_run_command(&config, "web", svc, "test-web", 42, None).unwrap();
+        let args = run_command.args;
 
         assert!(args
             .windows(2)
@@ -843,7 +944,9 @@ volumes = [
         );
         let config = TopologyConfig::from_toml(&toml).unwrap();
         let svc = config.services.get("db").unwrap();
-        let args = build_service_run_args(&config, "db", svc, "test-db", 7, None).unwrap();
+        let run_command =
+            build_service_run_command(&config, "db", svc, "test-db", 7, None).unwrap();
+        let args = run_command.args;
 
         assert!(
             persistent_path.exists(),
@@ -857,6 +960,51 @@ volumes = [
         assert!(args
             .windows(2)
             .any(|pair| { pair[0] == "--tmpfs" && pair[1] == "/var/cache/postgresql:64M:ro" }));
+    }
+
+    #[test]
+    fn test_build_service_run_command_passes_topology_secrets_by_fd() {
+        let secret_dir = tempfile::TempDir::new().unwrap();
+        let secret_path = secret_dir.path().join("cloud-provider-token");
+        let secret_spec = format!(
+            "{}:/run/secrets/cloud_api_key",
+            secret_path.to_string_lossy()
+        );
+        let toml = format!(
+            r#"
+name = "test"
+
+[services.web]
+rootfs = "/nix/store/web"
+command = ["/bin/web"]
+memory = "256M"
+secrets = ["{}"]
+"#,
+            secret_spec
+        );
+        let config = TopologyConfig::from_toml(&toml).unwrap();
+        let svc = config.services.get("web").unwrap();
+        let run_command =
+            build_service_run_command(&config, "web", svc, "test-web", 42, None).unwrap();
+
+        assert!(run_command.secrets_file.is_some());
+        assert!(!run_command.args.iter().any(|arg| arg == "--secret"));
+        assert!(!run_command.args.iter().any(|arg| arg == &secret_spec));
+        assert!(!run_command
+            .args
+            .iter()
+            .any(|arg| arg.contains("cloud-provider-token")
+                || arg.contains("/run/secrets/cloud_api_key")));
+        assert!(run_command.args.windows(2).any(|pair| {
+            pair[0] == "--secrets-fd"
+                && pair[1]
+                    == run_command
+                        .secrets_file
+                        .as_ref()
+                        .unwrap()
+                        .as_raw_fd()
+                        .to_string()
+        }));
     }
 
     #[test]
@@ -924,7 +1072,9 @@ nat_backend = "userspace"
 "#;
         let config = TopologyConfig::from_toml(toml).unwrap();
         let svc = config.services.get("web").unwrap();
-        let args = build_service_run_args(&config, "web", svc, "test-web", 42, None).unwrap();
+        let run_command =
+            build_service_run_command(&config, "web", svc, "test-web", 42, None).unwrap();
+        let args = run_command.args;
 
         assert!(args
             .windows(2)
@@ -943,7 +1093,9 @@ memory = "256M"
 "#;
         let config = TopologyConfig::from_toml(toml).unwrap();
         let svc = config.services.get("web").unwrap();
-        let args = build_service_run_args(&config, "web", svc, "test-web", 42, None).unwrap();
+        let run_command =
+            build_service_run_command(&config, "web", svc, "test-web", 42, None).unwrap();
+        let args = run_command.args;
 
         assert!(!args.iter().any(|arg| arg == "--nat-backend"));
     }
@@ -951,7 +1103,7 @@ memory = "256M"
     #[test]
     fn test_topology_reconcile_does_not_forward_oci_hooks() {
         let source = include_str!("reconcile.rs");
-        let fn_body = extract_fn_body(source, "fn build_service_run_args");
+        let fn_body = extract_fn_body(source, "fn build_service_run_command");
         assert!(
             !fn_body.contains("\"--hooks\"") && !fn_body.contains("nucleus-hooks-"),
             "topology reconciliation must not forward OCI hooks from service config"

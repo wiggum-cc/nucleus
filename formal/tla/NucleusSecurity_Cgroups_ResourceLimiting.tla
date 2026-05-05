@@ -19,15 +19,45 @@ VARIABLES
     \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
     \* @type: Seq(Str);
-    event_queue     \* Pending events/messages queue
+    event_queue,     \* Pending events/messages queue
+    \* @type: Bool;
+    has_memory_limit,
+    \* @type: Bool;
+    has_pids_limit,
+    \* @type: Bool;
+    has_cpu_limit,
+    \* @type: Bool;
+    has_swap_limit,
+    \* @type: Int;
+    memory_usage,
+    \* @type: Int;
+    memory_limit,
+    \* @type: Int;
+    pid_count,
+    \* @type: Int;
+    pid_limit,
+    \* @type: Int;
+    cpu_usage,
+    \* @type: Int;
+    cpu_limit
 
-vars == <<state, pc, history, event_queue>>
+vars == <<state, pc, history, event_queue, has_memory_limit, has_pids_limit, has_cpu_limit, has_swap_limit, memory_usage, memory_limit, pid_count, pid_limit, cpu_usage, cpu_limit>>
 
 Init ==
     /\ state = unlimited
     /\ pc = 0
     /\ history = <<>>
     /\ event_queue = <<>>
+    /\ has_memory_limit = FALSE
+    /\ has_pids_limit = FALSE
+    /\ has_cpu_limit = FALSE
+    /\ has_swap_limit = FALSE
+    /\ memory_usage = 0
+    /\ memory_limit = 0
+    /\ pid_count = 0
+    /\ pid_limit = 0
+    /\ cpu_usage = 0
+    /\ cpu_limit = 0
 
 \* Transition actions
 unlimited_set_cgroup_limits ==
@@ -36,6 +66,16 @@ unlimited_set_cgroup_limits ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ has_memory_limit' = TRUE
+    /\ has_pids_limit' = TRUE
+    /\ has_cpu_limit' = TRUE
+    /\ has_swap_limit' = TRUE
+    /\ memory_usage' = 128
+    /\ memory_limit' = 512
+    /\ pid_count' = 1
+    /\ pid_limit' = 64
+    /\ cpu_usage' = 10
+    /\ cpu_limit' = 100
 
 Next ==
     \/ unlimited_set_cgroup_limits
@@ -53,6 +93,16 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
+    /\ has_memory_limit \in BOOLEAN
+    /\ has_pids_limit \in BOOLEAN
+    /\ has_cpu_limit \in BOOLEAN
+    /\ has_swap_limit \in BOOLEAN
+    /\ memory_usage \in Nat
+    /\ memory_limit \in Nat
+    /\ pid_count \in Nat
+    /\ pid_limit \in Nat
+    /\ cpu_usage \in Nat
+    /\ cpu_limit \in Nat
     \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
@@ -68,6 +118,16 @@ HistoryConsistent ==
 
 \* Temporal properties (LTL)
 Prop_limits_enforced == []((state = unlimited) => (<>(state = limited)))
+Prop_memory_bounded == [](state = limited => has_memory_limit /\ memory_limit > 0 /\ memory_usage <= memory_limit)
+Prop_pids_bounded == [](state = limited => has_pids_limit /\ pid_limit > 0 /\ pid_count <= pid_limit)
+Prop_cpu_bounded == [](state = limited => has_cpu_limit /\ cpu_limit > 0 /\ cpu_usage <= cpu_limit)
+Prop_swap_bounded == [](state = limited => has_swap_limit)
+
+ResourceLimitSafety ==
+    /\ Prop_memory_bounded
+    /\ Prop_pids_bounded
+    /\ Prop_cpu_bounded
+    /\ Prop_swap_bounded
 
 \* Liveness: Eventually reaches a terminal state
 Liveness ==

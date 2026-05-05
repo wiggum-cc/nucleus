@@ -69,7 +69,7 @@ system Nucleus {
             }
 
             property no_resource_leak {
-                always(removed => next(removed))
+                always(removed => count(processes_in_cgroup) == 0)
             }
         }
     }
@@ -95,15 +95,15 @@ system Nucleus {
             }
 
             property context_isolation {
-                always(pivoted => next(pivoted | unmounted_final))
+                always(pivoted => context_populated)
             }
 
             property ephemeral_guarantee {
-                always(unmounted_final => next(unmounted_final))
+                always(unmounted_final => count(persisted_files) == 0)
             }
 
             property mount_ordering {
-                always(populated => next(pivoted | unmounted_final))
+                always(populated => tmpfs_mounted)
             }
         }
     }
@@ -117,21 +117,28 @@ system Nucleus {
                 privileged { initial: true }
                 capabilities_dropped
                 seccomp_applied
+                landlock_applied
                 locked { terminal: true }
             }
 
             transitions {
                 privileged -> capabilities_dropped on drop_capabilities
                 capabilities_dropped -> seccomp_applied on apply_seccomp
-                seccomp_applied -> locked on finalize
+                seccomp_applied -> landlock_applied on apply_landlock
+                landlock_applied -> locked on finalize
             }
 
             property irreversible_lockdown {
-                always(seccomp_applied => next(seccomp_applied | locked))
+                always(seccomp_applied => next(seccomp_applied | landlock_applied)) &
+                always(landlock_applied => next(landlock_applied | locked))
             }
 
             property defense_in_depth {
-                always(locked => (capabilities_dropped & seccomp_applied))
+                always(locked => (
+                    capabilities_are_dropped &
+                    seccomp_filter_active &
+                    landlock_policy_active
+                ))
             }
 
             property no_privilege_escalation {
@@ -142,6 +149,9 @@ system Nucleus {
 
     // System-level Constraints
     constraint layering {
+        forall c in [Isolation, Resources, Filesystem, Security]:
+            !c.depends([CLI])
+
         !Isolation.depends([CLI, Resources, Filesystem])
         !Resources.depends([CLI, Isolation, Filesystem, Security])
         !Filesystem.depends([CLI, Isolation, Resources, Security])
@@ -150,6 +160,8 @@ system Nucleus {
 
     constraint namespace_isolation {
         !Isolation.depends([CLI])
+        forall ns in [PID, Mount, Network, UTS, IPC, User]:
+            ns.references([Security])
     }
 
     constraint resource_independence {
@@ -165,23 +177,28 @@ system Nucleus {
     }
 
     constraint fail_closed {
-        Security.references([Isolation, Resources, Filesystem])
+        forall container in containers:
+            check (container.security_applied | !container.running)
     }
 
     constraint minimal_capabilities {
-        !Security.contains([PrivilegedMode])
+        forall container in containers:
+            check count(container.capabilities) <= 2
     }
 
     constraint error_handling {
-        CLI.references([AnyhowResult])
+        forall func in public_functions:
+            check func.returns_result
     }
 
     constraint no_unsafe_except_ffi {
-        !CLI.contains([UnsafeCode])
+        forall unsafe_block in unsafe_blocks:
+            check unsafe_block.in_module("ffi") || unsafe_block.in_module("syscall")
     }
 
     constraint linux_only {
-        !Isolation.depends([WindowsAPI, MacOSAPI])
+        forall module in [Isolation, Resources, Filesystem, Security]:
+            check module.has_cfg("target_os = linux")
     }
 
     // Rationale

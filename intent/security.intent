@@ -14,6 +14,26 @@ system NucleusSecurity {
                 host_view -> isolated_view on enter_namespace
             }
 
+            property pid_isolation {
+                always(isolated_view => !can_see_host_pids)
+            }
+
+            property mount_isolation {
+                always(isolated_view => !can_access_host_fs)
+            }
+
+            property network_isolation {
+                always(isolated_view => !has_network_access)
+            }
+
+            property ipc_isolation {
+                always(isolated_view => !can_access_host_ipc)
+            }
+
+            property user_namespace_isolation {
+                always(isolated_view => user_namespace_remapped)
+            }
+
             property isolation_complete {
                 always(host_view => eventually(isolated_view))
             }
@@ -35,7 +55,18 @@ system NucleusSecurity {
             }
 
             property irreversible {
-                always(minimal_caps => next(minimal_caps | no_caps))
+                always(minimal_caps => next(minimal_caps | no_caps)) &
+                always(no_caps => next(no_caps))
+            }
+
+            property no_dangerous_caps {
+                always((minimal_caps | no_caps) => (
+                    !has_capability("CAP_SYS_ADMIN") &
+                    !has_capability("CAP_SYS_MODULE") &
+                    !has_capability("CAP_SYS_PTRACE") &
+                    !has_capability("CAP_NET_ADMIN") &
+                    !has_capability("CAP_DAC_OVERRIDE")
+                ))
             }
         }
     }
@@ -54,6 +85,25 @@ system NucleusSecurity {
             property irreversible {
                 always(whitelist_active => next(whitelist_active))
             }
+
+            property no_dangerous_syscalls {
+                always(whitelist_active => (
+                    !can_call("ptrace") &
+                    !can_call("kexec_load") &
+                    !can_call("bpf") &
+                    !can_call("userfaultfd") &
+                    !can_call("perf_event_open") &
+                    !can_call("io_uring_setup")
+                ))
+            }
+
+            property whitelist_default_deny {
+                always(whitelist_active => !default_allow)
+            }
+
+            property fail_closed {
+                always(seccomp_failure => !container_running)
+            }
         }
     }
 
@@ -70,6 +120,25 @@ system NucleusSecurity {
 
             property limits_enforced {
                 always(unlimited => eventually(limited))
+            }
+
+            property memory_bounded {
+                always(limited => has_memory_limit) &
+                always(limited => memory_usage <= memory_limit)
+            }
+
+            property pids_bounded {
+                always(limited => has_pids_limit) &
+                always(limited => pid_count <= pid_limit)
+            }
+
+            property cpu_bounded {
+                always(limited => has_cpu_limit) &
+                always(limited => cpu_usage <= cpu_limit)
+            }
+
+            property swap_bounded {
+                always(limited => has_swap_limit)
             }
         }
     }
@@ -88,6 +157,14 @@ system NucleusSecurity {
             property kernel_switched {
                 always(native_kernel => eventually(gvisor_kernel))
             }
+
+            property syscall_interception {
+                always(gvisor_kernel => all_syscalls_intercepted)
+            }
+
+            property reduced_surface {
+                always(gvisor_kernel => kernel_syscalls < 100)
+            }
         }
     }
 
@@ -98,6 +175,15 @@ system NucleusSecurity {
 
         property no_escape {
             always(contained => next(contained))
+        }
+
+        property isolation_layers {
+            always(contained => (
+                namespaces_active &
+                capabilities_dropped &
+                seccomp_active &
+                cgroups_active
+            ))
         }
     }
 
@@ -117,33 +203,84 @@ system NucleusSecurity {
         property eventual_termination {
             always(throttled => eventually(oom_killed | normal_usage))
         }
+
+        property bounded_resources {
+            always(memory_usage <= memory_limit) &
+            always(cpu_usage <= cpu_limit) &
+            always(pid_count <= pid_limit)
+        }
+
+        property no_host_dos {
+            always(!can_exhaust_host_memory &
+                   !can_exhaust_host_cpu &
+                   !can_exhaust_host_pids)
+        }
     }
 
+    // System-level Security Constraints
     constraint all_namespaces_required {
-        Namespaces.references([Isolation])
+        forall container in containers:
+            check (
+                container.has_namespace("pid") &
+                container.has_namespace("mnt") &
+                container.has_namespace("net") &
+                container.has_namespace("uts") &
+                container.has_namespace("ipc") &
+                container.has_namespace("user")
+            )
     }
 
     constraint drop_all_by_default {
-        Capabilities.references([Security])
+        forall container in containers:
+            check (container.capabilities.is_empty() | container.explicit_caps_flag)
     }
 
     constraint whitelist_approach {
-        Seccomp.references([Security])
+        forall syscall in syscalls:
+            check (syscall.allowed_by_default == false)
+    }
+
+    constraint essential_syscalls_allowed {
+        forall syscall in ["read", "write", "open", "close", "exit", "exit_group"]:
+            check syscall.is_allowed
     }
 
     constraint mandatory_limits {
-        Cgroups.references([Resources])
+        forall container in containers:
+            check (
+                container.memory_limit.is_some() &
+                container.pids_limit.is_some() &
+                container.cpu_limit.is_some()
+            )
     }
 
     constraint defense_in_depth {
-        Namespaces.references([Isolation])
-        Capabilities.references([Security])
-        Seccomp.references([Security])
-        Cgroups.references([Resources])
+        forall container in containers:
+            check (
+                container.namespaces_isolated &
+                container.capabilities_dropped &
+                container.seccomp_applied &
+                container.cgroups_limited
+            )
+    }
+
+    constraint fail_closed {
+        forall container in containers:
+            check (container.security_complete | !container.running)
     }
 
     constraint no_privileged_containers {
-        !Capabilities.contains([CAP_SYS_ADMIN])
+        forall container in containers:
+            check !container.privileged
+    }
+
+    constraint minimal_attack_surface {
+        check count(allowed_syscalls) <= 150
+    }
+
+    constraint no_setuid_binaries {
+        forall file in container_filesystem:
+            check !file.has_setuid_bit & !file.has_setgid_bit
     }
 
     rationale SecurityApproach {

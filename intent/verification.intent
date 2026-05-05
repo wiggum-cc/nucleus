@@ -26,8 +26,12 @@ system NucleusVerification {
                 container_exited -> cleanup_done on verify_cleanup
             }
 
-            property eventual_cleanup {
-                always(test_start => eventually(cleanup_done))
+            property resources_cleaned {
+                always(cleanup_done => (
+                    count(cgroups) == 0 &
+                    count(namespaces) == 0 &
+                    count(tmpfs_mounts) == 0
+                ))
             }
         }
     }
@@ -72,19 +76,50 @@ system NucleusVerification {
 
     // System-level constraints
     constraint complete_coverage {
-        UnitTests.references([CLI, Isolation, Resources, Filesystem, Security])
+        forall func in public_functions:
+            check has_unit_test(func)
+    }
+
+    constraint error_path_coverage {
+        forall error_variant in error_types:
+            check has_test_case(error_variant)
     }
 
     constraint integration_testing {
-        IntegrationTests.references([Nucleus])
+        forall test in integration_tests:
+            check (
+                test.verifies_pid_isolation &
+                test.verifies_mount_isolation &
+                test.verifies_network_isolation
+            )
     }
 
     constraint formal_verification {
-        FormalVerification.references([NamespaceLifecycle, CgroupLifecycle])
+        forall spec in tla_specs:
+            check apalache_verified(spec)
     }
 
     constraint security_auditing {
-        SecurityAudits.references([Security])
+        forall unsafe_block in codebase:
+            check (
+                unsafe_block.in_module("syscall") ||
+                unsafe_block.in_module("ffi") ||
+                unsafe_block.has_safety_comment
+            )
+    }
+
+    constraint dependency_audit {
+        check cargo_audit_clean()
+        check cargo_deny_passes()
+    }
+
+    constraint no_regressions {
+        forall pr in pull_requests:
+            check (
+                all_unit_tests_pass(pr) &
+                all_integration_tests_pass(pr) &
+                no_performance_regression(pr)
+            )
     }
 
     rationale TestingStrategy {

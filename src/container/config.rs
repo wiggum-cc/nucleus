@@ -826,6 +826,14 @@ impl ContainerConfig {
             ));
         }
 
+        if !self.seccomp_allow_syscalls.is_empty() {
+            let allow_network = !matches!(self.network, crate::network::NetworkMode::None);
+            crate::security::SeccompManager::validate_extra_syscalls_for_production(
+                allow_network,
+                &self.seccomp_allow_syscalls,
+            )?;
+        }
+
         // L6: Policy files must have SHA-256 verification in production
         if self.caps_policy.is_some() && self.caps_policy_sha256.is_none() {
             return Err(crate::error::NucleusError::ConfigError(
@@ -1312,6 +1320,27 @@ mod tests {
             err.to_string().contains("trace"),
             "Production mode must reject seccomp trace mode"
         );
+    }
+
+    #[test]
+    fn test_production_mode_rejects_security_critical_seccomp_allow() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_service_mode(ServiceMode::Production)
+            .with_rootfs_path(test_rootfs_path())
+            .with_verify_rootfs_attestation(true)
+            .with_seccomp_allow_syscalls(vec!["keyctl".to_string()])
+            .with_limits(
+                crate::resources::ResourceLimits::default()
+                    .with_memory("512M")
+                    .unwrap()
+                    .with_cpu_cores(2.0)
+                    .unwrap(),
+            );
+
+        let err = cfg.validate_production_mode().unwrap_err();
+        assert!(err.to_string().contains("seccomp-allow"));
+        assert!(err.to_string().contains("keyctl"));
     }
 
     #[test]

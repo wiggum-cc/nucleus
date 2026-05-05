@@ -20,6 +20,138 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tracing::info;
 
+const SAFE_PRIVILEGED_HELPER_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+fn validate_privileged_helper(path: &Path, name: &str) -> Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let resolved = std::fs::canonicalize(path).map_err(|e| {
+        NucleusError::ExecError(format!(
+            "Failed to resolve {} helper at {:?}: {}",
+            name, path, e
+        ))
+    })?;
+    let metadata = std::fs::metadata(&resolved).map_err(|e| {
+        NucleusError::ExecError(format!(
+            "Failed to stat {} helper at {:?}: {}",
+            name, resolved, e
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(NucleusError::ExecError(format!(
+            "{} helper at {:?} is not a regular file",
+            name, resolved
+        )));
+    }
+
+    let mode = metadata.permissions().mode();
+    if mode & 0o111 == 0 {
+        return Err(NucleusError::ExecError(format!(
+            "{} helper at {:?} is not executable",
+            name, resolved
+        )));
+    }
+    if mode & 0o022 != 0 {
+        return Err(NucleusError::ExecError(format!(
+            "{} helper at {:?} is writable by group/others (mode {:o}), refusing to execute",
+            name, resolved, mode
+        )));
+    }
+
+    let owner = metadata.uid();
+    let euid = nix::unistd::Uid::effective().as_raw();
+    if owner != 0 && owner != euid && !is_trusted_store_privileged_helper(&resolved, mode) {
+        return Err(NucleusError::ExecError(format!(
+            "{} helper at {:?} is owned by UID {} (expected root or euid {}), refusing to execute",
+            name, resolved, owner, euid
+        )));
+    }
+
+    Ok(resolved)
+}
+
+fn is_trusted_store_privileged_helper(path: &Path, mode: u32) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !path.starts_with("/nix/store") || mode & 0o222 != 0 {
+        return false;
+    }
+
+    path.parent()
+        .and_then(|parent| std::fs::metadata(parent).ok())
+        .map(|metadata| metadata.permissions().mode() & 0o222 == 0)
+        .unwrap_or(false)
+}
+
+fn resolve_privileged_helper(name: &str, trusted_paths: &[&str]) -> Result<PathBuf> {
+    resolve_privileged_helper_impl(name, trusted_paths, nix::unistd::Uid::effective().is_root())
+}
+
+fn resolve_privileged_helper_impl(
+    name: &str,
+    trusted_paths: &[&str],
+    privileged: bool,
+) -> Result<PathBuf> {
+    for candidate in trusted_paths {
+        let path = Path::new(candidate);
+        if path.exists() {
+            return validate_privileged_helper(path, name);
+        }
+    }
+
+    if privileged {
+        return Err(NucleusError::ExecError(format!(
+            "{} helper not found in trusted system paths",
+            name
+        )));
+    }
+
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                return validate_privileged_helper(&candidate, name);
+            }
+        }
+    }
+
+    Err(NucleusError::ExecError(format!(
+        "{} helper not found or failed validation",
+        name
+    )))
+}
+
+fn resolve_journalctl_helper() -> Result<PathBuf> {
+    resolve_privileged_helper(
+        "journalctl",
+        &[
+            "/usr/bin/journalctl",
+            "/bin/journalctl",
+            "/usr/local/bin/journalctl",
+            "/run/current-system/sw/bin/journalctl",
+        ],
+    )
+}
+
+fn resolve_systemd_run_helper() -> Result<PathBuf> {
+    resolve_privileged_helper(
+        "systemd-run",
+        &[
+            "/usr/bin/systemd-run",
+            "/bin/systemd-run",
+            "/usr/local/bin/systemd-run",
+            "/run/current-system/sw/bin/systemd-run",
+        ],
+    )
+}
+
+fn privileged_helper_command(path: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(path);
+    command.env("PATH", SAFE_PRIVILEGED_HELPER_PATH);
+    command
+}
+
 fn validate_systemd_credential_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(NucleusError::ConfigError(
@@ -62,6 +194,38 @@ fn resolve_systemd_credential_source(name: &str) -> Result<PathBuf> {
         )));
     }
     Ok(source)
+}
+
+fn read_secret_specs_from_fd(fd: i32) -> Result<Vec<String>> {
+    if fd <= 2 {
+        return Err(NucleusError::ConfigError(format!(
+            "Invalid inherited secrets fd {}",
+            fd
+        )));
+    }
+
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).map_err(|e| {
+        NucleusError::ConfigError(format!("Failed to read inherited secrets fd {}: {}", fd, e))
+    })?;
+
+    serde_json::from_str(&contents).map_err(|e| {
+        NucleusError::ConfigError(format!(
+            "Failed to parse inherited secrets fd {}: {}",
+            fd, e
+        ))
+    })
+}
+
+fn collect_secret_specs(mut secrets: Vec<String>, secrets_fd: Option<i32>) -> Result<Vec<String>> {
+    if let Some(fd) = secrets_fd {
+        secrets.extend(read_secret_specs_from_fd(fd)?);
+    }
+    Ok(secrets)
 }
 
 fn resolve_uid_spec(spec: &str) -> Result<(u32, Option<u32>)> {
@@ -367,6 +531,10 @@ enum Commands {
         /// Mount a secret file: SOURCE:DEST (repeatable)
         #[arg(long = "secret")]
         secrets: Vec<String>,
+
+        /// Internal: read secret specs from an inherited JSON file descriptor
+        #[arg(long = "secrets-fd", hide = true)]
+        secrets_fd: Option<i32>,
 
         /// Mount a systemd credential by name: NAME:DEST (repeatable)
         #[arg(long = "systemd-credential")]
@@ -687,6 +855,8 @@ struct DetachedCreateRequest {
     health_retries: Option<u32>,
     health_start_period: Option<u64>,
     secrets: Vec<String>,
+    #[serde(default, skip_serializing)]
+    secrets_fd: Option<i32>,
     systemd_credentials: Vec<String>,
     volumes: Vec<String>,
     tmpfs: Vec<String>,
@@ -929,7 +1099,8 @@ fn try_main() -> Result<i32> {
             let state = state_mgr.resolve_container(&container)?;
             let unit_name = format!("nucleus-{}", &state.id[..12.min(state.id.len())]);
 
-            let mut cmd = std::process::Command::new("journalctl");
+            let journalctl = resolve_journalctl_helper()?;
+            let mut cmd = privileged_helper_command(&journalctl);
             cmd.arg("--unit").arg(&unit_name).arg("--no-pager");
             if follow {
                 cmd.arg("--follow");
@@ -1064,6 +1235,7 @@ fn try_main() -> Result<i32> {
             health_retries,
             health_start_period,
             secrets,
+            secrets_fd,
             systemd_credentials,
             volumes,
             tmpfs,
@@ -1149,6 +1321,7 @@ fn try_main() -> Result<i32> {
                     health_retries,
                     health_start_period,
                     secrets,
+                    secrets_fd,
                     systemd_credentials,
                     volumes,
                     tmpfs,
@@ -1184,6 +1357,11 @@ fn try_main() -> Result<i32> {
                     "No command specified".to_string(),
                 ));
             }
+            if create_request.detach && create_request.secrets_fd.is_some() {
+                return Err(NucleusError::ConfigError(
+                    "--secrets-fd cannot be used with --detach".to_string(),
+                ));
+            }
 
             // --detach: re-exec under systemd-run as a transient service using
             // a serialized parsed request instead of argv string surgery.
@@ -1215,7 +1393,8 @@ fn try_main() -> Result<i32> {
                 inner_args.push(serialized);
 
                 let unit_name = format!("nucleus-{}", &id[..12]);
-                let status = std::process::Command::new("systemd-run")
+                let systemd_run = resolve_systemd_run_helper()?;
+                let status = privileged_helper_command(&systemd_run)
                     .arg("--unit")
                     .arg(&unit_name)
                     .arg("--collect")
@@ -1291,6 +1470,7 @@ fn try_main() -> Result<i32> {
                 health_retries,
                 health_start_period,
                 secrets,
+                secrets_fd,
                 systemd_credentials,
                 volumes,
                 tmpfs,
@@ -1592,6 +1772,8 @@ fn try_main() -> Result<i32> {
                 };
                 config = config.with_health_check(hc);
             }
+
+            let secrets = collect_secret_specs(secrets, secrets_fd)?;
 
             // Secrets
             for spec in &secrets {
@@ -1936,6 +2118,78 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn write_test_helper(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn test_validate_privileged_helper_rejects_group_writable_binary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let helper = dir.path().join("journalctl");
+        write_test_helper(&helper, 0o775);
+
+        let err = validate_privileged_helper(&helper, "journalctl").unwrap_err();
+        assert!(err.to_string().contains("writable by group/others"));
+    }
+
+    #[test]
+    fn test_privileged_helper_command_overrides_path() {
+        let cmd = privileged_helper_command(Path::new("/bin/true"));
+        let path_env = cmd
+            .get_envs()
+            .find_map(|(key, value)| (key == "PATH").then_some(value))
+            .flatten()
+            .unwrap();
+
+        assert_eq!(path_env.to_string_lossy(), SAFE_PRIVILEGED_HELPER_PATH);
+    }
+
+    #[test]
+    fn test_privileged_helper_resolution_prefers_trusted_path_over_path() {
+        let _guard = env_lock().lock().unwrap();
+        let trusted_dir = tempfile::TempDir::new().unwrap();
+        let path_dir = tempfile::TempDir::new().unwrap();
+        let trusted_helper = trusted_dir.path().join("journalctl");
+        let path_helper = path_dir.path().join("journalctl");
+        write_test_helper(&trusted_helper, 0o755);
+        write_test_helper(&path_helper, 0o755);
+
+        let original_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", path_dir.path());
+
+        let trusted_helper_str = trusted_helper.to_str().unwrap();
+        let resolved = resolve_privileged_helper("journalctl", &[trusted_helper_str]).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&trusted_helper).unwrap());
+
+        if let Some(path) = original_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+    }
+
+    #[test]
+    fn test_root_helper_resolution_does_not_use_path() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let helper = dir.path().join("systemd-run");
+        write_test_helper(&helper, 0o755);
+        let original_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", dir.path());
+
+        let err = resolve_privileged_helper_impl("systemd-run", &[], true).unwrap_err();
+        assert!(err.to_string().contains("trusted system paths"));
+
+        if let Some(path) = original_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+    }
+
     #[test]
     fn test_detached_create_request_roundtrips_command_tokens() {
         let request = DetachedCreateRequest {
@@ -1980,6 +2234,7 @@ mod tests {
             health_retries: Some(2),
             health_start_period: Some(1),
             secrets: vec!["/tmp/src:/run/secrets/token".to_string()],
+            secrets_fd: None,
             systemd_credentials: vec!["db-password:/run/secrets/db".to_string()],
             volumes: vec!["/tmp/data:/data:ro".to_string()],
             tmpfs: vec!["/cache:64M:rw".to_string()],
@@ -2066,6 +2321,7 @@ mod tests {
             health_retries: None,
             health_start_period: None,
             secrets: Vec::new(),
+            secrets_fd: None,
             systemd_credentials: Vec::new(),
             volumes: Vec::new(),
             tmpfs: Vec::new(),
@@ -2183,6 +2439,25 @@ mod tests {
         let err = resolve_systemd_credential_source("../db-password").unwrap_err();
         assert!(err.to_string().contains("Invalid systemd credential name"));
         std::env::remove_var("CREDENTIALS_DIRECTORY");
+    }
+
+    #[test]
+    fn test_read_secret_specs_from_fd_reads_json_specs() {
+        use std::io::{Seek, Write};
+        use std::os::fd::IntoRawFd;
+
+        let mut file = tempfile::tempfile().unwrap();
+        let specs = vec![
+            "/tmp/token:/run/secrets/token".to_string(),
+            "/tmp/key:/run/secrets/key".to_string(),
+        ];
+        serde_json::to_writer(&mut file, &specs).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.rewind().unwrap();
+
+        let fd = file.into_raw_fd();
+        let decoded = read_secret_specs_from_fd(fd).unwrap();
+        assert_eq!(decoded, specs);
     }
 
     #[test]

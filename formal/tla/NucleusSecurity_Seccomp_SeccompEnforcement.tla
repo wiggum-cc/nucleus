@@ -11,6 +11,26 @@ States == {
     no_filter, whitelist_active
 }
 
+DangerousSyscalls == {
+    "ptrace",
+    "kexec_load",
+    "bpf",
+    "userfaultfd",
+    "perf_event_open",
+    "io_uring_setup"
+}
+
+EssentialSyscalls == {
+    "read",
+    "write",
+    "open",
+    "close",
+    "exit",
+    "exit_group"
+}
+
+Syscalls == DangerousSyscalls \cup EssentialSyscalls
+
 VARIABLES
     \* @type: Str;
     state,      \* Current state
@@ -19,15 +39,27 @@ VARIABLES
     \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
     \* @type: Seq(Str);
-    event_queue     \* Pending events/messages queue
+    event_queue,     \* Pending events/messages queue
+    \* @type: Set(Str);
+    allowed_syscalls,
+    \* @type: Bool;
+    default_allow,
+    \* @type: Bool;
+    seccomp_fail_closed,
+    \* @type: Bool;
+    no_new_privileges
 
-vars == <<state, pc, history, event_queue>>
+vars == <<state, pc, history, event_queue, allowed_syscalls, default_allow, seccomp_fail_closed, no_new_privileges>>
 
 Init ==
     /\ state = no_filter
     /\ pc = 0
     /\ history = <<>>
     /\ event_queue = <<>>
+    /\ allowed_syscalls = Syscalls
+    /\ default_allow = TRUE
+    /\ seccomp_fail_closed = FALSE
+    /\ no_new_privileges = FALSE
 
 \* Transition actions
 no_filter_apply_seccomp_filter ==
@@ -36,6 +68,10 @@ no_filter_apply_seccomp_filter ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ allowed_syscalls' = EssentialSyscalls
+    /\ default_allow' = FALSE
+    /\ seccomp_fail_closed' = TRUE
+    /\ no_new_privileges' = TRUE
 
 Next ==
     \/ no_filter_apply_seccomp_filter
@@ -53,6 +89,10 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
+    /\ allowed_syscalls \in SUBSET Syscalls
+    /\ default_allow \in BOOLEAN
+    /\ seccomp_fail_closed \in BOOLEAN
+    /\ no_new_privileges \in BOOLEAN
     \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
@@ -68,6 +108,17 @@ HistoryConsistent ==
 
 \* Temporal properties (LTL)
 Prop_irreversible == [][(state = whitelist_active) => (state' = whitelist_active)]_vars
+Prop_no_dangerous_syscalls == [](state = whitelist_active => DangerousSyscalls \cap allowed_syscalls = {})
+Prop_whitelist_default_deny == [](state = whitelist_active => ~default_allow)
+Prop_fail_closed == [](state = whitelist_active => seccomp_fail_closed)
+Prop_no_new_privileges == [](state = whitelist_active => no_new_privileges)
+
+SeccompSafety ==
+    /\ Prop_irreversible
+    /\ Prop_no_dangerous_syscalls
+    /\ Prop_whitelist_default_deny
+    /\ Prop_fail_closed
+    /\ Prop_no_new_privileges
 
 \* Liveness: Eventually reaches a terminal state
 Liveness ==

@@ -2,6 +2,7 @@ use crate::container::{ContainerConfig, KernelLockdownMode};
 use crate::error::{NucleusError, Result};
 use crate::network::NetworkMode;
 use crate::security::{GVisorRuntime, SeccompDenyLogger, SeccompTraceReader};
+use std::path::Path;
 use tracing::{info, warn};
 
 use super::runtime::Container;
@@ -156,6 +157,7 @@ impl Container {
     pub(super) fn maybe_start_seccomp_deny_logger(
         config: &ContainerConfig,
         target_pid: u32,
+        cgroup_path: Option<&Path>,
     ) -> Result<Option<SeccompDenyLogger>> {
         if !config.seccomp_log_denied {
             return Ok(None);
@@ -165,7 +167,7 @@ impl Container {
             return Ok(None);
         }
 
-        let mut logger = SeccompDenyLogger::new(target_pid);
+        let mut logger = SeccompDenyLogger::new(target_pid, cgroup_path.map(Path::to_path_buf));
         logger.start()?;
         Ok(Some(logger))
     }

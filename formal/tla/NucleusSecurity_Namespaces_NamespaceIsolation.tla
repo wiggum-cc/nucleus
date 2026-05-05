@@ -19,15 +19,30 @@ VARIABLES
     \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
     \* @type: Seq(Str);
-    event_queue     \* Pending events/messages queue
+    event_queue,     \* Pending events/messages queue
+    \* @type: Bool;
+    can_see_host_pids,
+    \* @type: Bool;
+    can_access_host_fs,
+    \* @type: Bool;
+    has_network_access,
+    \* @type: Bool;
+    can_access_host_ipc,
+    \* @type: Bool;
+    user_namespace_remapped
 
-vars == <<state, pc, history, event_queue>>
+vars == <<state, pc, history, event_queue, can_see_host_pids, can_access_host_fs, has_network_access, can_access_host_ipc, user_namespace_remapped>>
 
 Init ==
     /\ state = host_view
     /\ pc = 0
     /\ history = <<>>
     /\ event_queue = <<>>
+    /\ can_see_host_pids = TRUE
+    /\ can_access_host_fs = TRUE
+    /\ has_network_access = TRUE
+    /\ can_access_host_ipc = TRUE
+    /\ user_namespace_remapped = FALSE
 
 \* Transition actions
 host_view_enter_namespace ==
@@ -36,6 +51,11 @@ host_view_enter_namespace ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ can_see_host_pids' = FALSE
+    /\ can_access_host_fs' = FALSE
+    /\ has_network_access' = FALSE
+    /\ can_access_host_ipc' = FALSE
+    /\ user_namespace_remapped' = TRUE
 
 Next ==
     \/ host_view_enter_namespace
@@ -53,6 +73,11 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
+    /\ can_see_host_pids \in BOOLEAN
+    /\ can_access_host_fs \in BOOLEAN
+    /\ has_network_access \in BOOLEAN
+    /\ can_access_host_ipc \in BOOLEAN
+    /\ user_namespace_remapped \in BOOLEAN
     \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
@@ -67,7 +92,19 @@ HistoryConsistent ==
     Len(history) = pc
 
 \* Temporal properties (LTL)
+Prop_pid_isolation == [](state = isolated_view => ~can_see_host_pids)
+Prop_mount_isolation == [](state = isolated_view => ~can_access_host_fs)
+Prop_network_isolation == [](state = isolated_view => ~has_network_access)
+Prop_ipc_isolation == [](state = isolated_view => ~can_access_host_ipc)
+Prop_user_namespace_remapped == [](state = isolated_view => user_namespace_remapped)
 Prop_isolation_complete == []((state = host_view) => (<>(state = isolated_view)))
+
+IsolationSafety ==
+    /\ Prop_pid_isolation
+    /\ Prop_mount_isolation
+    /\ Prop_network_isolation
+    /\ Prop_ipc_isolation
+    /\ Prop_user_namespace_remapped
 
 \* Liveness: Eventually reaches a terminal state
 Liveness ==

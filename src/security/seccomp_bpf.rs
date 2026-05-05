@@ -635,6 +635,106 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_prctl_cap_ambient_only_allows_is_set() {
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        assert!(
+            rules
+                .get(&libc::SYS_prctl)
+                .is_some_and(|chain| !chain.is_empty()),
+            "prctl must be argument-filtered in the built-in profile"
+        );
+
+        let prog = compile_bitmap_bpf_with_errno_syscalls(
+            rules,
+            crate::security::SeccompManager::errno_denied_syscalls_for_test(),
+            SeccompAction::KillProcess,
+            SeccompAction::Allow,
+            TargetArch::x86_64,
+        )
+        .unwrap();
+
+        const CAP_NET_BIND_SERVICE: u64 = 10;
+        let ambient_probe = make_seccomp_data(
+            libc::SYS_prctl as u32,
+            AUDIT_ARCH_X86_64,
+            [
+                libc::PR_CAP_AMBIENT as u64,
+                libc::PR_CAP_AMBIENT_IS_SET as u64,
+                CAP_NET_BIND_SERVICE,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(bpf_eval(&prog, &ambient_probe), RET_ALLOW);
+
+        for subcommand in [
+            libc::PR_CAP_AMBIENT_RAISE,
+            libc::PR_CAP_AMBIENT_LOWER,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+        ] {
+            let data = make_seccomp_data(
+                libc::SYS_prctl as u32,
+                AUDIT_ARCH_X86_64,
+                [
+                    libc::PR_CAP_AMBIENT as u64,
+                    subcommand as u64,
+                    CAP_NET_BIND_SERVICE,
+                    0,
+                    0,
+                    0,
+                ],
+            );
+            assert_eq!(
+                bpf_eval(&prog, &data),
+                RET_KILL,
+                "PR_CAP_AMBIENT subcommand {} must be denied",
+                subcommand
+            );
+        }
+    }
+
+    #[test]
+    fn test_preadv2_pwritev2_deny_nonzero_flags() {
+        let rules = crate::security::SeccompManager::minimal_filter_for_test(true, &[]);
+        for syscall in [libc::SYS_preadv2, libc::SYS_pwritev2] {
+            assert!(
+                rules.get(&syscall).is_some_and(|chain| !chain.is_empty()),
+                "v2 vectored I/O syscalls must use argument filters"
+            );
+        }
+
+        let prog = compile_bitmap_bpf_with_errno_syscalls(
+            rules,
+            crate::security::SeccompManager::errno_denied_syscalls_for_test(),
+            SeccompAction::KillProcess,
+            SeccompAction::Allow,
+            TargetArch::x86_64,
+        )
+        .unwrap();
+
+        const RWF_NOWAIT: u64 = 0x0000_0008;
+        const RWF_HIPRI: u64 = 0x0000_0001;
+
+        for syscall in [libc::SYS_preadv2, libc::SYS_pwritev2] {
+            let data = make_seccomp_data(syscall as u32, AUDIT_ARCH_X86_64, [0; 6]);
+            assert_eq!(bpf_eval(&prog, &data), RET_ALLOW);
+
+            for flags in [RWF_NOWAIT, RWF_HIPRI, 1u64 << 32, u64::MAX] {
+                let data =
+                    make_seccomp_data(syscall as u32, AUDIT_ARCH_X86_64, [0, 0, 0, 0, 0, flags]);
+                assert_eq!(
+                    bpf_eval(&prog, &data),
+                    RET_KILL,
+                    "syscall {} with flags 0x{:x} must be denied",
+                    syscall,
+                    flags
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_multiple_rules_per_syscall() {
         let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 

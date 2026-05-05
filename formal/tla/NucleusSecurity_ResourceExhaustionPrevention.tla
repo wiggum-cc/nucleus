@@ -20,15 +20,42 @@ VARIABLES
     \* @type: Seq(Str);
     history,    \* Sequence of visited states (for trace analysis)
     \* @type: Seq(Str);
-    event_queue     \* Pending events/messages queue
+    event_queue,     \* Pending events/messages queue
+    \* @type: Int;
+    memory_usage,
+    \* @type: Int;
+    memory_limit,
+    \* @type: Int;
+    cpu_usage,
+    \* @type: Int;
+    cpu_limit,
+    \* @type: Int;
+    pid_count,
+    \* @type: Int;
+    pid_limit,
+    \* @type: Bool;
+    can_exhaust_host_memory,
+    \* @type: Bool;
+    can_exhaust_host_cpu,
+    \* @type: Bool;
+    can_exhaust_host_pids
 
-vars == <<state, pc, history, event_queue>>
+vars == <<state, pc, history, event_queue, memory_usage, memory_limit, cpu_usage, cpu_limit, pid_count, pid_limit, can_exhaust_host_memory, can_exhaust_host_cpu, can_exhaust_host_pids>>
 
 Init ==
     /\ state = normal_usage
     /\ pc = 0
     /\ history = <<>>
     /\ event_queue = <<>>
+    /\ memory_usage = 128
+    /\ memory_limit = 512
+    /\ cpu_usage = 10
+    /\ cpu_limit = 100
+    /\ pid_count = 1
+    /\ pid_limit = 64
+    /\ can_exhaust_host_memory = FALSE
+    /\ can_exhaust_host_cpu = FALSE
+    /\ can_exhaust_host_pids = FALSE
 
 \* Transition actions
 normal_usage_exceed_soft_limit ==
@@ -37,6 +64,15 @@ normal_usage_exceed_soft_limit ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ memory_usage' = memory_limit
+    /\ memory_limit' = memory_limit
+    /\ cpu_usage' = cpu_limit
+    /\ cpu_limit' = cpu_limit
+    /\ pid_count' = pid_limit
+    /\ pid_limit' = pid_limit
+    /\ can_exhaust_host_memory' = FALSE
+    /\ can_exhaust_host_cpu' = FALSE
+    /\ can_exhaust_host_pids' = FALSE
 
 throttled_reduce_usage ==
     /\ state = throttled
@@ -44,6 +80,15 @@ throttled_reduce_usage ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ memory_usage' = 128
+    /\ memory_limit' = memory_limit
+    /\ cpu_usage' = 10
+    /\ cpu_limit' = cpu_limit
+    /\ pid_count' = 1
+    /\ pid_limit' = pid_limit
+    /\ can_exhaust_host_memory' = FALSE
+    /\ can_exhaust_host_cpu' = FALSE
+    /\ can_exhaust_host_pids' = FALSE
 
 throttled_exceed_hard_limit ==
     /\ state = throttled
@@ -51,6 +96,15 @@ throttled_exceed_hard_limit ==
     /\ pc' = pc + 1
     /\ history' = Append(history, state)
     /\ event_queue' = event_queue
+    /\ memory_usage' = memory_limit
+    /\ memory_limit' = memory_limit
+    /\ cpu_usage' = cpu_limit
+    /\ cpu_limit' = cpu_limit
+    /\ pid_count' = pid_limit
+    /\ pid_limit' = pid_limit
+    /\ can_exhaust_host_memory' = FALSE
+    /\ can_exhaust_host_cpu' = FALSE
+    /\ can_exhaust_host_pids' = FALSE
 
 Next ==
     \/ normal_usage_exceed_soft_limit
@@ -70,6 +124,15 @@ Spec ==
 TypeOK ==
     /\ state \in States
     /\ pc \in Nat
+    /\ memory_usage \in Nat
+    /\ memory_limit \in Nat
+    /\ cpu_usage \in Nat
+    /\ cpu_limit \in Nat
+    /\ pid_count \in Nat
+    /\ pid_limit \in Nat
+    /\ can_exhaust_host_memory \in BOOLEAN
+    /\ can_exhaust_host_cpu \in BOOLEAN
+    /\ can_exhaust_host_pids \in BOOLEAN
     \* history: checked via HistoryConsistent (Seq(States) unsupported by Apalache)
 
 \* Terminal states
@@ -85,6 +148,12 @@ HistoryConsistent ==
 
 \* Temporal properties (LTL)
 Prop_eventual_termination == []((state = throttled) => (<>((state = oom_killed) \/ (state = normal_usage))))
+Prop_bounded_resources == [](memory_usage <= memory_limit /\ cpu_usage <= cpu_limit /\ pid_count <= pid_limit)
+Prop_no_host_dos == [](~can_exhaust_host_memory /\ ~can_exhaust_host_cpu /\ ~can_exhaust_host_pids)
+
+ResourceExhaustionSafety ==
+    /\ Prop_bounded_resources
+    /\ Prop_no_host_dos
 
 \* Liveness: Eventually reaches a terminal state
 Liveness ==
