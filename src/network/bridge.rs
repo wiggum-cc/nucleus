@@ -834,7 +834,12 @@ impl BridgeNetwork {
     /// Returns an error if no valid binary is found.
     pub(crate) fn resolve_bin(name: &str) -> Result<String> {
         let search_dirs: &[&str] = match name {
-            "iptables" => &["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"],
+            "iptables" => &[
+                "/usr/sbin/iptables",
+                "/sbin/iptables",
+                "/usr/bin/iptables",
+                "/run/current-system/sw/bin/iptables",
+            ],
             "slirp4netns" => &[
                 "/usr/bin/slirp4netns",
                 "/bin/slirp4netns",
