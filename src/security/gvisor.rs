@@ -11,6 +11,9 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, warn};
 
+const NIX_STORE_EXEC_ROOT: &str = "/nix/store";
+const PROCFS_EXEC_ROOT: &str = "/proc";
+
 /// Network mode for gVisor runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GVisorNetworkMode {
@@ -464,8 +467,11 @@ impl GVisorRuntime {
             ))
         })?;
 
-        if canonical.starts_with("/nix/store") {
-            return Ok((canonical, vec![PathBuf::from("/nix/store")]));
+        if canonical.starts_with(NIX_STORE_EXEC_ROOT) {
+            return Ok((
+                canonical,
+                Self::supervisor_exec_allow_roots(PathBuf::from(NIX_STORE_EXEC_ROOT)),
+            ));
         }
 
         Self::ensure_secure_runsc_dir(runsc_root, "runsc root directory")?;
@@ -476,7 +482,17 @@ impl GVisorRuntime {
         let staged = stage_dir.join("runsc");
         Self::copy_runsc_nofollow(&canonical, &staged)?;
 
-        Ok((staged, vec![private_dir]))
+        Ok((staged, Self::supervisor_exec_allow_roots(private_dir)))
+    }
+
+    fn supervisor_exec_allow_roots(program_root: PathBuf) -> Vec<PathBuf> {
+        // runsc starts its gofer after Nucleus has execve'd into runsc, and
+        // that gofer uses /proc/self/exe. A rule for the runsc backing path
+        // alone does not authorize the procfs magic-link exec. Keep this grant
+        // execute-only and local to the gVisor supervisor policy; it does not
+        // add procfs read/write access or allow direct exec from writable host
+        // filesystem paths such as /run/wrappers.
+        vec![program_root, PathBuf::from(PROCFS_EXEC_ROOT)]
     }
 
     fn secure_runsc_root(container_id: &str) -> Result<PathBuf> {
@@ -955,7 +971,7 @@ impl GVisorRuntime {
 mod tests {
     use super::*;
     use crate::oci::OciConfig;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1183,10 +1199,29 @@ mod tests {
         let (program, allow_roots) = rt.prepare_supervisor_runsc_program(&runsc_root).unwrap();
 
         assert!(program.starts_with(runsc_root.join("exec-allow")));
-        assert_eq!(allow_roots, vec![runsc_root.join("exec-allow")]);
+        assert_eq!(
+            allow_roots,
+            vec![
+                runsc_root.join("exec-allow"),
+                PathBuf::from(PROCFS_EXEC_ROOT)
+            ]
+        );
         assert_eq!(std::fs::read(&program).unwrap(), b"fake-runsc");
         let mode = std::fs::metadata(&program).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o500);
+    }
+
+    #[test]
+    fn test_supervisor_exec_allow_roots_include_procfs_reexec_root() {
+        let roots = GVisorRuntime::supervisor_exec_allow_roots(PathBuf::from(NIX_STORE_EXEC_ROOT));
+
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from(NIX_STORE_EXEC_ROOT),
+                PathBuf::from(PROCFS_EXEC_ROOT)
+            ]
+        );
     }
 
     #[test]

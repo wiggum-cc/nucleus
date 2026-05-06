@@ -384,7 +384,15 @@ impl LandlockManager {
             ));
         }
 
-        let status = ruleset.restrict_self().map_err(ll_err)?;
+        let status = ruleset
+            // gVisor's host-side supervisor must keep no_new_privs clear for
+            // its gofer re-exec path. This execute-only policy is installed
+            // after Nucleus has entered the mapped setup namespace, where
+            // landlock_restrict_self can be authorized by namespace
+            // capabilities instead of PR_SET_NO_NEW_PRIVS.
+            .set_no_new_privs(false)
+            .restrict_self()
+            .map_err(ll_err)?;
         Ok(status.ruleset)
     }
 
@@ -509,6 +517,26 @@ mod tests {
         assert!(
             !fn_body.contains("from_all"),
             "execute allowlist must not accidentally become a broad filesystem policy"
+        );
+    }
+
+    #[test]
+    fn test_execute_allowlist_keeps_no_new_privs_clear_for_gvisor() {
+        let source = include_str!("landlock.rs");
+        let fn_body = extract_fn_body(source, "fn build_execute_allowlist_and_restrict");
+        assert!(
+            fn_body.contains(".set_no_new_privs(false)"),
+            "gVisor supervisor execute allowlist must not set no_new_privs before runsc"
+        );
+    }
+
+    #[test]
+    fn test_container_policy_keeps_default_no_new_privs() {
+        let source = include_str!("landlock.rs");
+        let fn_body = extract_fn_body(source, "fn build_and_restrict");
+        assert!(
+            !fn_body.contains(".set_no_new_privs(false)"),
+            "container Landlock policy must retain the landlock crate default no_new_privs setting"
         );
     }
 
