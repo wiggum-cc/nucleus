@@ -55,23 +55,29 @@ impl CriuRuntime {
     /// Checks permissions (not world/group-writable) and ownership (must be
     /// owned by root or the effective UID) to prevent execution of tampered
     /// binaries.
-    fn validate_binary(path: &Path) -> Result<()> {
+    fn validate_binary(path: &Path) -> Result<PathBuf> {
         use std::os::unix::fs::MetadataExt;
 
-        let metadata = fs::metadata(path).map_err(|e| {
-            NucleusError::CheckpointError(format!("Cannot stat criu binary {:?}: {}", path, e))
+        let resolved = fs::canonicalize(path).map_err(|e| {
+            NucleusError::CheckpointError(format!(
+                "Cannot canonicalize criu binary {:?}: {}",
+                path, e
+            ))
+        })?;
+        let metadata = fs::metadata(&resolved).map_err(|e| {
+            NucleusError::CheckpointError(format!("Cannot stat criu binary {:?}: {}", resolved, e))
         })?;
         let mode = metadata.permissions().mode();
         if mode & 0o022 != 0 {
             return Err(NucleusError::CheckpointError(format!(
                 "criu binary {:?} is writable by group/others (mode {:o}), refusing to execute",
-                path, mode
+                resolved, mode
             )));
         }
         if mode & 0o111 == 0 {
             return Err(NucleusError::CheckpointError(format!(
                 "criu binary {:?} is not executable",
-                path
+                resolved
             )));
         }
         let owner_uid = metadata.uid();
@@ -79,10 +85,10 @@ impl CriuRuntime {
         if owner_uid != 0 && owner_uid != euid {
             return Err(NucleusError::CheckpointError(format!(
                 "criu binary {:?} is owned by UID {} (expected root or euid {}), refusing to execute",
-                path, owner_uid, euid
+                resolved, owner_uid, euid
             )));
         }
-        Ok(())
+        Ok(resolved)
     }
 
     fn find_binary() -> Result<PathBuf> {
@@ -90,8 +96,7 @@ impl CriuRuntime {
         for path in &["/usr/sbin/criu", "/usr/bin/criu", "/usr/local/sbin/criu"] {
             let p = PathBuf::from(path);
             if p.exists() {
-                Self::validate_binary(&p)?;
-                return Ok(p);
+                return Self::validate_binary(&p);
             }
         }
 
@@ -108,8 +113,7 @@ impl CriuRuntime {
             for dir in std::env::split_paths(&path_var) {
                 let candidate = dir.join("criu");
                 if candidate.exists() {
-                    Self::validate_binary(&candidate)?;
-                    return Ok(candidate);
+                    return Self::validate_binary(&candidate);
                 }
             }
         }

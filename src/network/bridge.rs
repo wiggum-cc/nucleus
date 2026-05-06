@@ -300,7 +300,14 @@ impl BridgeNetwork {
     /// of network isolation from accumulated orphaned rules.
     pub fn cleanup_orphaned_rules(subnet: &str) {
         // List NAT rules and look for nucleus-related MASQUERADE entries
-        let output = match Command::new("iptables")
+        let iptables = match Self::resolve_bin("iptables") {
+            Ok(path) => path,
+            Err(e) => {
+                debug!("Cannot resolve iptables for orphaned rule cleanup: {}", e);
+                return;
+            }
+        };
+        let output = match Command::new(&iptables)
             .args(["-t", "nat", "-L", "POSTROUTING", "-n"])
             .output()
         {
@@ -819,13 +826,20 @@ impl BridgeNetwork {
 
     /// Resolve a system binary to a validated absolute path.
     ///
-    /// Searches known sysadmin paths first, then the process PATH, while
-    /// validating ownership and permissions before use. This avoids depending
+    /// Searches known sysadmin paths first while validating ownership and
+    /// permissions before use. When running as root, the process PATH is never
+    /// consulted because bridge networking invokes privileged helpers and must
+    /// not trust an attacker-influenced environment. This also avoids depending
     /// on a separate `which` binary in service managers that set a narrow PATH.
     /// Returns an error if no valid binary is found.
     pub(crate) fn resolve_bin(name: &str) -> Result<String> {
         let search_dirs: &[&str] = match name {
-            "iptables" => &["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"],
+            "iptables" => &[
+                "/usr/sbin/iptables",
+                "/sbin/iptables",
+                "/usr/bin/iptables",
+                "/run/current-system/sw/bin/iptables",
+            ],
             "slirp4netns" => &[
                 "/usr/bin/slirp4netns",
                 "/bin/slirp4netns",
@@ -838,8 +852,21 @@ impl BridgeNetwork {
             let p = std::path::Path::new(path);
             if p.exists() {
                 Self::validate_network_binary(p, name)?;
-                return Ok(path.to_string());
+                let resolved = std::fs::canonicalize(p).map_err(|e| {
+                    NucleusError::NetworkError(format!(
+                        "Cannot canonicalize {} at {:?}: {}",
+                        name, p, e
+                    ))
+                })?;
+                return Ok(resolved.to_string_lossy().into_owned());
             }
+        }
+
+        if nix::unistd::Uid::effective().is_root() {
+            return Err(NucleusError::NetworkError(format!(
+                "Required binary '{}' not found in trusted system paths",
+                name
+            )));
         }
 
         if let Some(path_var) = std::env::var_os("PATH") {
@@ -847,7 +874,13 @@ impl BridgeNetwork {
                 let candidate = dir.join(name);
                 if candidate.exists() {
                     Self::validate_network_binary(&candidate, name)?;
-                    return Ok(candidate.to_string_lossy().into_owned());
+                    let resolved = std::fs::canonicalize(&candidate).map_err(|e| {
+                        NucleusError::NetworkError(format!(
+                            "Cannot canonicalize {} at {:?}: {}",
+                            name, candidate, e
+                        ))
+                    })?;
+                    return Ok(resolved.to_string_lossy().into_owned());
                 }
             }
         }
@@ -868,6 +901,12 @@ impl BridgeNetwork {
         let meta = std::fs::metadata(&resolved)
             .map_err(|e| NucleusError::NetworkError(format!("Cannot stat {}: {}", name, e)))?;
         let mode = meta.mode();
+        if mode & 0o111 == 0 {
+            return Err(NucleusError::NetworkError(format!(
+                "Binary '{}' at {:?} is not executable, refusing to execute",
+                name, resolved
+            )));
+        }
         if mode & 0o022 != 0 {
             return Err(NucleusError::NetworkError(format!(
                 "Binary '{}' at {:?} is writable by group/others (mode {:o}), refusing to execute",
