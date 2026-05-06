@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 - No unreleased changes.
 
+## [0.3.6] - 2026-05-06
+
+### Fixed
+- Include the gVisor `runsc` executable-path patch in the Nix flake source.
+
 ## [0.3.3] - 2026-04-08
 
 ### Added

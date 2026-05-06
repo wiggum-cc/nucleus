@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, warn};
 
+#[cfg(test)]
 const NIX_STORE_EXEC_ROOT: &str = "/nix/store";
 
 /// Network mode for gVisor runtime.
