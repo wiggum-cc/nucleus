@@ -12,7 +12,6 @@ use std::process::Command;
 use tracing::{debug, info, warn};
 
 const NIX_STORE_EXEC_ROOT: &str = "/nix/store";
-const PROCFS_EXEC_ROOT: &str = "/proc";
 
 /// Network mode for gVisor runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,8 +183,8 @@ impl GVisorRuntime {
 
         // If the candidate is a shell wrapper script (common on NixOS where
         // nix wraps binaries to inject PATH), look for the real ELF binary
-        // next to it.  runsc's gofer subprocess re-execs via /proc/self/exe,
-        // which must point to the real binary – not a bash wrapper.
+        // next to it. The gVisor helper re-exec path must stay on the real
+        // binary, not a bash wrapper.
         let resolved = Self::unwrap_nix_wrapper(&canonical).unwrap_or_else(|| canonical.clone());
 
         let metadata = std::fs::metadata(&resolved).map_err(|e| {
@@ -354,11 +353,6 @@ impl GVisorRuntime {
 
         let c_env = self.exec_environment(&runsc_runtime_dir)?;
 
-        // runsc starts its gofer by re-executing /proc/self/exe. Carrying
-        // no_new_privs into runsc makes that helper exec fail with EPERM on
-        // the locked-down NixOS VM profile, so leave gVisor to enforce its own
-        // sandbox process model after exec.
-        //
         // For the rootless bridge path, Nucleus has already entered a mapped
         // user namespace. Install an execute-only Landlock allowlist there:
         // runsc may still re-exec itself, but escaped host-side code cannot
@@ -467,17 +461,14 @@ impl GVisorRuntime {
             ))
         })?;
 
-        if canonical.starts_with(NIX_STORE_EXEC_ROOT) {
-            return Ok((
-                canonical,
-                Self::supervisor_exec_allow_roots(PathBuf::from(NIX_STORE_EXEC_ROOT)),
-            ));
-        }
-
         Self::ensure_secure_runsc_dir(runsc_root, "runsc root directory")?;
         let private_dir = runsc_root.join("exec-allow");
         Self::ensure_secure_runsc_dir(&private_dir, "private runsc exec directory")?;
 
+        // Stage every runsc binary, including immutable Nix store artifacts.
+        // gVisor re-execs runsc helpers after Landlock is installed; keeping the
+        // executable under a per-container allowlist avoids granting execute over
+        // the whole store.
         let stage_dir = Self::create_unique_runsc_stage_dir(&private_dir)?;
         let staged = stage_dir.join("runsc");
         Self::copy_runsc_nofollow(&canonical, &staged)?;
@@ -486,13 +477,11 @@ impl GVisorRuntime {
     }
 
     fn supervisor_exec_allow_roots(program_root: PathBuf) -> Vec<PathBuf> {
-        // runsc starts its gofer after Nucleus has execve'd into runsc, and
-        // that gofer uses /proc/self/exe. A rule for the runsc backing path
-        // alone does not authorize the procfs magic-link exec. Keep this grant
-        // execute-only and local to the gVisor supervisor policy; it does not
-        // add procfs read/write access or allow direct exec from writable host
-        // filesystem paths such as /run/wrappers.
-        vec![program_root, PathBuf::from(PROCFS_EXEC_ROOT)]
+        // Do not allow procfs execution here. The packaged runsc is patched to
+        // re-exec helper processes through its real executable path; allowing
+        // /proc would also allow procfs fd magic-link execution attempts that
+        // are outside the supervisor policy's intended executable root.
+        vec![program_root]
     }
 
     fn secure_runsc_root(container_id: &str) -> Result<PathBuf> {
@@ -1199,28 +1188,20 @@ mod tests {
         let (program, allow_roots) = rt.prepare_supervisor_runsc_program(&runsc_root).unwrap();
 
         assert!(program.starts_with(runsc_root.join("exec-allow")));
-        assert_eq!(
-            allow_roots,
-            vec![
-                runsc_root.join("exec-allow"),
-                PathBuf::from(PROCFS_EXEC_ROOT)
-            ]
-        );
+        assert_eq!(allow_roots, vec![runsc_root.join("exec-allow")]);
         assert_eq!(std::fs::read(&program).unwrap(), b"fake-runsc");
         let mode = std::fs::metadata(&program).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o500);
     }
 
     #[test]
-    fn test_supervisor_exec_allow_roots_include_procfs_reexec_root() {
+    fn test_supervisor_exec_allow_roots_do_not_include_procfs() {
         let roots = GVisorRuntime::supervisor_exec_allow_roots(PathBuf::from(NIX_STORE_EXEC_ROOT));
 
-        assert_eq!(
-            roots,
-            vec![
-                PathBuf::from(NIX_STORE_EXEC_ROOT),
-                PathBuf::from(PROCFS_EXEC_ROOT)
-            ]
+        assert_eq!(roots, vec![PathBuf::from(NIX_STORE_EXEC_ROOT)]);
+        assert!(
+            !roots.iter().any(|root| root == Path::new("/proc")),
+            "the supervisor policy must not allow recursive procfs execution"
         );
     }
 

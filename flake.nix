@@ -73,7 +73,12 @@
 
         inherit (pkgs) lib;
 
-        gvisorRuntimePkgs = lib.optionals pkgs.stdenv.isLinux [ pkgs.gvisor ];
+        gvisor = pkgs.gvisor.overrideAttrs (old: {
+          patches = (old.patches or [ ]) ++ [
+            ./nix/patches/gvisor-runsc-real-exe-path.patch
+          ];
+        });
+        gvisorRuntimePkgs = lib.optionals pkgs.stdenv.isLinux [ gvisor ];
         networkRuntimePkgs = lib.optionals pkgs.stdenv.isLinux [ pkgs.iptables pkgs.slirp4netns ];
         runtimePath = lib.makeBinPath (gvisorRuntimePkgs ++ networkRuntimePkgs);
 

@@ -169,9 +169,9 @@ impl LandlockManager {
     ///
     /// This policy handles only `LANDLOCK_ACCESS_FS_EXECUTE`, leaving normal
     /// read/write access untouched. It is intended for runtimes like gVisor
-    /// that must keep `no_new_privs` clear for their own helper re-exec path,
-    /// while still blocking arbitrary host executable and setuid-wrapper execs
-    /// after the supervisor has entered its setup namespace.
+    /// that need a narrow post-namespace executable allowlist while still
+    /// blocking arbitrary host executable and setuid-wrapper execs after the
+    /// supervisor has entered its setup namespace.
     pub fn apply_execute_allowlist_policy(
         &mut self,
         allowed_roots: &[PathBuf],
@@ -377,22 +377,13 @@ impl LandlockManager {
                 }
             }
         }
-
         if added_rules == 0 {
             return Err(NucleusError::LandlockError(
                 "Landlock execute allowlist has no valid executable roots".to_string(),
             ));
         }
 
-        let status = ruleset
-            // gVisor's host-side supervisor must keep no_new_privs clear for
-            // its gofer re-exec path. This execute-only policy is installed
-            // after Nucleus has entered the mapped setup namespace, where
-            // landlock_restrict_self can be authorized by namespace
-            // capabilities instead of PR_SET_NO_NEW_PRIVS.
-            .set_no_new_privs(false)
-            .restrict_self()
-            .map_err(ll_err)?;
+        let status = ruleset.restrict_self().map_err(ll_err)?;
         Ok(status.ruleset)
     }
 
@@ -521,12 +512,12 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_allowlist_keeps_no_new_privs_clear_for_gvisor() {
+    fn test_execute_allowlist_keeps_default_no_new_privs() {
         let source = include_str!("landlock.rs");
         let fn_body = extract_fn_body(source, "fn build_execute_allowlist_and_restrict");
         assert!(
-            fn_body.contains(".set_no_new_privs(false)"),
-            "gVisor supervisor execute allowlist must not set no_new_privs before runsc"
+            !fn_body.contains(".set_no_new_privs(false)"),
+            "gVisor supervisor execute allowlist must retain Landlock's default no_new_privs setting"
         );
     }
 

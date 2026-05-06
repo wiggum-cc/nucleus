@@ -1,0 +1,51 @@
+diff --git a/runsc/specutils/specutils.go b/runsc/specutils/specutils.go
+index 00cd5fc47..efb1ab160 100644
+--- a/runsc/specutils/specutils.go
++++ b/runsc/specutils/specutils.go
+@@ -72,9 +72,30 @@ const (
+ 	AnnotationTPU = "dev.gvisor.internal.tpuproxy"
+ )
+ 
+-// ExePath must point to runsc binary, which is normally the same binary. It's
+-// changed in tests that aren't linked in the same binary.
+-var ExePath = "/proc/self/exe"
++// ExePath must point to runsc binary, which is normally the same binary. It is
++// changed in tests that aren't linked in the same binary.
++//
++// Upstream defaults this to /proc/self/exe. Nucleus runs runsc below a
++// host-side execute allowlist, and Landlock cannot authorize procfs magic-link
++// execution narrowly enough for that path. Resolve the real executable path so
++// runsc helper processes and user-namespace re-execs stay inside the existing
++// runsc executable root allowlist.
++var ExePath = resolvedExePath()
++
++func resolvedExePath() string {
++	exe, err := os.Executable()
++	if err != nil || !filepath.IsAbs(exe) {
++		return "/proc/self/exe"
++	}
++	if resolved, err := filepath.EvalSymlinks(exe); err == nil && filepath.IsAbs(resolved) {
++		exe = resolved
++	}
++	info, err := os.Stat(exe)
++	if err != nil || info.IsDir() || info.Mode()&0111 == 0 {
++		return "/proc/self/exe"
++	}
++	return exe
++}
+ 
+ // Version is the supported spec version.
+ var Version = specs.Version
+diff --git a/runsc/specutils/namespace.go b/runsc/specutils/namespace.go
+index ce5a97326..2fdf35f0d 100644
+--- a/runsc/specutils/namespace.go
++++ b/runsc/specutils/namespace.go
+@@ -246,7 +246,7 @@ func MaybeRunAsRoot() error {
+ 	// and run as root inside the namespace to acquire capabilities.
+ 	log.Infof("*** Re-running as root in new user namespace ***")
+ 
+-	cmd := exec.Command("/proc/self/exe", os.Args[1:]...)
++	cmd := exec.Command(ExePath, os.Args[1:]...)
+ 
+ 	cmd.SysProcAttr = &unix.SysProcAttr{
+ 		Cloneflags: unix.CLONE_NEWUSER | unix.CLONE_NEWNS,

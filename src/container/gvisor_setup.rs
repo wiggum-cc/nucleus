@@ -44,9 +44,10 @@ impl Container {
         if precreated_userns {
             // In rootless bridge mode Nucleus creates the mapped user namespace
             // before execing runsc so the prepared netns can be inherited.
-            // runsc then starts its gofer by re-execing /proc/self/exe; carrying
-            // OCI noNewPrivileges into that handoff makes the gofer exec fail
-            // with EPERM before the gVisor sandbox starts.
+            // The packaged runsc re-execs helper processes through its real
+            // executable path so the supervisor allowlist does not need procfs.
+            // Keep OCI noNewPrivileges out of this handoff and let gVisor
+            // enforce its own sandbox process model after startup.
             oci_config = oci_config.with_no_new_privileges(false);
         }
         let artifact_dir = Self::gvisor_artifact_dir(&self.config.id);
