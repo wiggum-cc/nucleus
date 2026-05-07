@@ -11,7 +11,6 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, warn};
 
-#[cfg(test)]
 const NIX_STORE_EXEC_ROOT: &str = "/nix/store";
 
 /// Network mode for gVisor runtime.
@@ -468,8 +467,17 @@ impl GVisorRuntime {
                 self.runsc_path, e
             ))
         })?;
+        let canonical = Self::unwrap_nix_wrapper(&canonical).unwrap_or(canonical);
 
         Self::ensure_secure_runsc_dir(runsc_root, "runsc root directory")?;
+
+        if let Some(exec_root) = Self::nix_store_runsc_exec_root(&canonical) {
+            // Nix store paths are immutable and already validated as trusted
+            // runsc artifacts. Use the store binary directly so gVisor helper
+            // re-execs do not depend on private runtime-directory ownership.
+            return Ok((canonical, Self::supervisor_exec_allow_roots(exec_root)));
+        }
+
         let private_dir = runsc_root.join("exec-allow");
         Self::ensure_secure_runsc_dir(&private_dir, "private runsc exec directory")?;
 
@@ -490,6 +498,14 @@ impl GVisorRuntime {
         // /proc would also allow procfs fd magic-link execution attempts that
         // are outside the supervisor policy's intended executable root.
         vec![program_root]
+    }
+
+    fn nix_store_runsc_exec_root(program: &Path) -> Option<PathBuf> {
+        if !program.starts_with(NIX_STORE_EXEC_ROOT) {
+            return None;
+        }
+
+        program.parent().map(Path::to_path_buf)
     }
 
     fn secure_runsc_root(container_id: &str) -> Result<PathBuf> {
@@ -1200,6 +1216,23 @@ mod tests {
         assert_eq!(std::fs::read(&program).unwrap(), b"fake-runsc");
         let mode = std::fs::metadata(&program).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o500);
+    }
+
+    #[test]
+    fn test_nix_store_runsc_uses_package_bin_exec_root() {
+        let program = Path::new("/nix/store/hash-gvisor-20251110.0/bin/.runsc-wrapped");
+
+        assert_eq!(
+            GVisorRuntime::nix_store_runsc_exec_root(program),
+            Some(PathBuf::from("/nix/store/hash-gvisor-20251110.0/bin"))
+        );
+    }
+
+    #[test]
+    fn test_non_nix_runsc_has_no_store_exec_root() {
+        let program = Path::new("/tmp/nucleus/runsc");
+
+        assert_eq!(GVisorRuntime::nix_store_runsc_exec_root(program), None);
     }
 
     #[test]
