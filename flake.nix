@@ -104,7 +104,8 @@
                 || relativePath == "formal"
                 || lib.hasPrefix "formal/" relativePath
                 || relativePath == "intent"
-                || lib.hasPrefix "intent/" relativePath;
+                || lib.hasPrefix "intent/" relativePath
+                || relativePath == "nix/patches/gvisor-runsc-real-exe-path.patch";
             }
           else
             srcRoot;
