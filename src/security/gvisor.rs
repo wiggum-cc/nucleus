@@ -65,7 +65,12 @@ pub struct GVisorOciRunOptions {
     pub network_mode: GVisorNetworkMode,
     /// Skip runsc's cgroup setup when Nucleus manages cgroups externally.
     pub ignore_cgroups: bool,
-    /// Use runsc's rootless execution path for pre-created user namespaces.
+    /// Use runsc's built-in rootless execution path.
+    ///
+    /// This asks runsc to create its own single-ID user namespace and re-exec
+    /// itself there. Callers that already placed runsc inside a mapped user
+    /// namespace should leave this false and invoke runsc as uid 0 in that
+    /// caller-configured namespace.
     pub runsc_rootless: bool,
     /// Fail if the host-side supervisor execute allowlist cannot be installed.
     pub require_supervisor_exec_policy: bool,
@@ -301,9 +306,9 @@ impl GVisorRuntime {
     /// `ignore_cgroups` skips runsc's internal cgroup configuration because
     /// Nucleus already manages cgroups externally and unprivileged callers
     /// cannot configure them directly. `runsc_rootless` selects gVisor's
-    /// built-in rootless execution path for cases where Nucleus already
-    /// entered a mapped user namespace and therefore cannot express the
-    /// namespace setup as an OCI `linux.uidMappings` request.
+    /// built-in single-ID rootless execution path. Callers that already
+    /// entered a mapped user namespace should not set it; runsc should instead
+    /// run as uid 0 in that caller-configured namespace.
     /// `require_supervisor_exec_policy` fail-closes if Nucleus cannot install
     /// the host-side execute allowlist before handing control to runsc.
     pub fn exec_with_oci_bundle_options(
@@ -354,11 +359,13 @@ impl GVisorRuntime {
 
         let c_env = self.exec_environment(&runsc_runtime_dir)?;
 
-        // For the rootless bridge path, Nucleus has already entered a mapped
-        // user namespace. Install an execute-only Landlock allowlist there:
-        // runsc may still re-exec itself, but escaped host-side code cannot
-        // exec arbitrary host binaries such as NixOS setuid wrappers.
-        if options.runsc_rootless {
+        // Install an execute-only Landlock allowlist before handing control to
+        // runsc when the caller requested a fail-closed supervisor policy or
+        // when runsc's built-in rootless path may re-exec itself. This is
+        // intentionally independent from the --rootless flag: caller-configured
+        // user namespace setups still need the supervisor allowlist, but must
+        // not ask runsc to create another user namespace.
+        if options.require_supervisor_exec_policy || options.runsc_rootless {
             self.apply_supervisor_exec_policy(
                 &exec_allow_roots,
                 options.require_supervisor_exec_policy,
@@ -1126,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn test_precreated_rootless_args_pass_runsc_rootless() {
+    fn test_builtin_rootless_args_pass_runsc_rootless() {
         let rt = GVisorRuntime::with_path("/nix/store/fake-runsc/bin/runsc".to_string());
         let tmp = tempfile::tempdir().unwrap();
         let bundle = OciBundle::new(
