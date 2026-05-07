@@ -47,7 +47,16 @@ where
 ///
 /// `program` should be an absolute path (e.g. from `resolve_bin`).
 pub fn exec_in_netns(pid: u32, program: &str, args: &[&str]) -> Result<()> {
-    exec_in_namespaces(pid, false, program, args)
+    exec_in_namespaces(pid, false, program, None, args)
+}
+
+pub(crate) fn exec_in_netns_with_arg0(
+    pid: u32,
+    program: &str,
+    arg0: &str,
+    args: &[&str],
+) -> Result<()> {
+    exec_in_namespaces(pid, false, program, Some(arg0), args)
 }
 
 /// Execute a program inside the user+network namespaces of `pid`.
@@ -56,10 +65,25 @@ pub fn exec_in_netns(pid: u32, program: &str, args: &[&str]) -> Result<()> {
 /// requires first joining the target user namespace, matching the ordering used
 /// by `nsenter -U -n`.
 pub fn exec_in_user_netns(pid: u32, program: &str, args: &[&str]) -> Result<()> {
-    exec_in_namespaces(pid, true, program, args)
+    exec_in_namespaces(pid, true, program, None, args)
 }
 
-fn exec_in_namespaces(pid: u32, enter_userns: bool, program: &str, args: &[&str]) -> Result<()> {
+pub(crate) fn exec_in_user_netns_with_arg0(
+    pid: u32,
+    program: &str,
+    arg0: &str,
+    args: &[&str],
+) -> Result<()> {
+    exec_in_namespaces(pid, true, program, Some(arg0), args)
+}
+
+fn exec_in_namespaces(
+    pid: u32,
+    enter_userns: bool,
+    program: &str,
+    arg0: Option<&str>,
+    args: &[&str],
+) -> Result<()> {
     let userns_file = if enter_userns {
         let userns_path = format!("/proc/{}/ns/user", pid);
         Some(std::fs::File::open(&userns_path).map_err(|e| {
@@ -77,8 +101,13 @@ fn exec_in_namespaces(pid: u32, enter_userns: bool, program: &str, args: &[&str]
     // SAFETY: The pre_exec closure runs after fork() in the child process.
     // setns() is a single syscall and is async-signal-safe.  ns_file is a
     // valid open fd inherited by the child.
+    let mut command = Command::new(program);
+    if let Some(arg0) = arg0 {
+        command.arg0(arg0);
+    }
+
     let output = unsafe {
-        Command::new(program)
+        command
             .args(args)
             .pre_exec(move || {
                 if let Some(ref userns) = userns_file {

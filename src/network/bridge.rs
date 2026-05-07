@@ -9,6 +9,7 @@ use std::os::fd::FromRawFd;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 use tracing::{debug, info, warn};
 
@@ -942,9 +943,15 @@ impl BridgeNetwork {
 
     fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
         let resolved = Self::resolve_bin(program)?;
-        let output = Command::new(&resolved).args(args).output().map_err(|e| {
-            NucleusError::NetworkError(format!("Failed to run {} {:?}: {}", resolved, args, e))
-        })?;
+        // Nix's iptables package exposes applets as symlinks to xtables-*-multi.
+        // Keep the requested applet in argv[0] after canonicalization.
+        let output = Command::new(&resolved)
+            .arg0(program)
+            .args(args)
+            .output()
+            .map_err(|e| {
+                NucleusError::NetworkError(format!("Failed to run {} {:?}: {}", resolved, args, e))
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1454,5 +1461,15 @@ mod tests {
                 "port forward must restrict DNAT rules to the configured host IP"
             );
         }
+    }
+
+    #[test]
+    fn test_network_helper_execution_preserves_applet_argv0() {
+        let source = include_str!("bridge.rs");
+
+        assert!(
+            source.contains("Command::new(&resolved).arg0(program).args(args)"),
+            "canonicalized network helper execution must preserve the requested applet argv[0]"
+        );
     }
 }
