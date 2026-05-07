@@ -12,6 +12,7 @@ use std::process::Command;
 use tracing::{debug, info, warn};
 
 const NIX_STORE_EXEC_ROOT: &str = "/nix/store";
+const PROCFS_EXEC_ROOT: &str = "/proc";
 
 /// Network mode for gVisor runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -493,11 +494,13 @@ impl GVisorRuntime {
     }
 
     fn supervisor_exec_allow_roots(program_root: PathBuf) -> Vec<PathBuf> {
-        // Do not allow procfs execution here. The packaged runsc is patched to
-        // re-exec helper processes through its real executable path; allowing
-        // /proc would also allow procfs fd magic-link execution attempts that
-        // are outside the supervisor policy's intended executable root.
-        vec![program_root]
+        // gVisor's systrap gofer is spawned by re-execing runsc through
+        // /proc/self/exe. Landlock rules are installed before Nucleus execs
+        // runsc, so an exact /proc/self/exe rule would bind to the Nucleus
+        // executable, not the future runsc image. Allow procfs only for this
+        // trusted host-side supervisor policy; the workload remains isolated
+        // by the OCI rootfs and gVisor sandbox.
+        vec![program_root, PathBuf::from(PROCFS_EXEC_ROOT)]
     }
 
     fn nix_store_runsc_exec_root(program: &Path) -> Option<PathBuf> {
@@ -1212,7 +1215,13 @@ mod tests {
         let (program, allow_roots) = rt.prepare_supervisor_runsc_program(&runsc_root).unwrap();
 
         assert!(program.starts_with(runsc_root.join("exec-allow")));
-        assert_eq!(allow_roots, vec![runsc_root.join("exec-allow")]);
+        assert_eq!(
+            allow_roots,
+            vec![
+                runsc_root.join("exec-allow"),
+                PathBuf::from(PROCFS_EXEC_ROOT)
+            ]
+        );
         assert_eq!(std::fs::read(&program).unwrap(), b"fake-runsc");
         let mode = std::fs::metadata(&program).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o500);
@@ -1236,13 +1245,19 @@ mod tests {
     }
 
     #[test]
-    fn test_supervisor_exec_allow_roots_do_not_include_procfs() {
+    fn test_supervisor_exec_allow_roots_include_procfs_for_systrap_reexec() {
         let roots = GVisorRuntime::supervisor_exec_allow_roots(PathBuf::from(NIX_STORE_EXEC_ROOT));
 
-        assert_eq!(roots, vec![PathBuf::from(NIX_STORE_EXEC_ROOT)]);
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from(NIX_STORE_EXEC_ROOT),
+                PathBuf::from(PROCFS_EXEC_ROOT)
+            ]
+        );
         assert!(
-            !roots.iter().any(|root| root == Path::new("/proc")),
-            "the supervisor policy must not allow recursive procfs execution"
+            roots.iter().any(|root| root == Path::new(PROCFS_EXEC_ROOT)),
+            "gVisor systrap gofer re-execs through /proc/self/exe, so the supervisor policy must allow procfs execution"
         );
     }
 
