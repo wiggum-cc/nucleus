@@ -195,7 +195,14 @@ impl Container {
 
         let ignore_cgroups = self.config.user_ns_config.is_some();
         let runsc_rootless = false;
-        let require_supervisor_exec_policy = self.config.service_mode == ServiceMode::Production;
+        // In the pre-created rootless bridge path, runsc's systrap gofer
+        // re-exec fails under Nucleus' Landlock supervisor execute policy
+        // even when the runsc and procfs re-exec roots are allowlisted. This
+        // mode relies on the caller's unit hardening for the host-side
+        // supervisor handoff and keeps the actual frontend workload inside
+        // gVisor.
+        let require_supervisor_exec_policy =
+            self.config.service_mode == ServiceMode::Production && !precreated_userns;
         gvisor.exec_with_oci_bundle_options(
             &self.config.id,
             &bundle,

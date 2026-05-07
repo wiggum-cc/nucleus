@@ -361,10 +361,9 @@ impl GVisorRuntime {
 
         // Install an execute-only Landlock allowlist before handing control to
         // runsc when the caller requested a fail-closed supervisor policy or
-        // when runsc's built-in rootless path may re-exec itself. This is
-        // intentionally independent from the --rootless flag: caller-configured
-        // user namespace setups still need the supervisor allowlist, but must
-        // not ask runsc to create another user namespace.
+        // when runsc's built-in rootless path may re-exec itself. Launch modes
+        // that cannot tolerate this host-side policy must leave
+        // require_supervisor_exec_policy unset.
         if options.require_supervisor_exec_policy || options.runsc_rootless {
             self.apply_supervisor_exec_policy(
                 &exec_allow_roots,
