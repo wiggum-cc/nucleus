@@ -357,7 +357,12 @@ impl LandlockManager {
             .handle_access(access_execute)
             .map_err(ll_err)?
             .create()
-            .map_err(ll_err)?;
+            .map_err(ll_err)?
+            // The gVisor systrap supervisor re-execs runsc after this policy is
+            // installed. Do not silently reintroduce no_new_privs here; callers
+            // that need this host-side allowlist must already be in a context
+            // where Landlock can be restricted without it.
+            .set_no_new_privs(false);
 
         let mut added_rules = 0usize;
         for root in allowed_roots {
@@ -512,12 +517,12 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_allowlist_keeps_default_no_new_privs() {
+    fn test_execute_allowlist_disables_no_new_privs_for_gvisor_supervisor() {
         let source = include_str!("landlock.rs");
         let fn_body = extract_fn_body(source, "fn build_execute_allowlist_and_restrict");
         assert!(
-            !fn_body.contains(".set_no_new_privs(false)"),
-            "gVisor supervisor execute allowlist must retain Landlock's default no_new_privs setting"
+            fn_body.contains(".set_no_new_privs(false)"),
+            "gVisor supervisor execute allowlist must not force no_new_privs"
         );
     }
 
