@@ -45,18 +45,10 @@ where
 /// process after fork, before exec. This is the replacement for
 /// `nsenter -t <pid> -n <program> <args...>`.
 ///
-/// `program` should be an absolute path (e.g. from `resolve_bin`).
-pub fn exec_in_netns(pid: u32, program: &str, args: &[&str]) -> Result<()> {
-    exec_in_namespaces(pid, false, program, None, args)
-}
-
-pub(crate) fn exec_in_netns_with_arg0(
-    pid: u32,
-    program: &str,
-    arg0: &str,
-    args: &[&str],
-) -> Result<()> {
-    exec_in_namespaces(pid, false, program, Some(arg0), args)
+/// `program` should be an absolute path (e.g. from `resolve_bin`). `arg0`
+/// must be the helper applet name expected by multi-call binaries.
+pub(crate) fn exec_in_netns(pid: u32, program: &str, arg0: &str, args: &[&str]) -> Result<()> {
+    exec_in_namespaces(pid, false, program, arg0, args)
 }
 
 /// Execute a program inside the user+network namespaces of `pid`.
@@ -64,24 +56,15 @@ pub(crate) fn exec_in_netns_with_arg0(
 /// For rootless containers, network administration inside the target netns
 /// requires first joining the target user namespace, matching the ordering used
 /// by `nsenter -U -n`.
-pub fn exec_in_user_netns(pid: u32, program: &str, args: &[&str]) -> Result<()> {
-    exec_in_namespaces(pid, true, program, None, args)
-}
-
-pub(crate) fn exec_in_user_netns_with_arg0(
-    pid: u32,
-    program: &str,
-    arg0: &str,
-    args: &[&str],
-) -> Result<()> {
-    exec_in_namespaces(pid, true, program, Some(arg0), args)
+pub(crate) fn exec_in_user_netns(pid: u32, program: &str, arg0: &str, args: &[&str]) -> Result<()> {
+    exec_in_namespaces(pid, true, program, arg0, args)
 }
 
 fn exec_in_namespaces(
     pid: u32,
     enter_userns: bool,
     program: &str,
-    arg0: Option<&str>,
+    arg0: &str,
     args: &[&str],
 ) -> Result<()> {
     let userns_file = if enter_userns {
@@ -102,9 +85,7 @@ fn exec_in_namespaces(
     // setns() is a single syscall and is async-signal-safe.  ns_file is a
     // valid open fd inherited by the child.
     let mut command = Command::new(program);
-    if let Some(arg0) = arg0 {
-        command.arg0(arg0);
-    }
+    command.arg0(arg0);
 
     let output = unsafe {
         command

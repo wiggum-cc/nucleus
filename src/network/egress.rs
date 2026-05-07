@@ -16,9 +16,9 @@ pub(crate) fn apply_egress_policy(
     let ipt = BridgeNetwork::resolve_bin("iptables")?;
     let exec = |args: &[&str]| {
         if join_userns {
-            netns::exec_in_user_netns_with_arg0(pid, &ipt, "iptables", args)
+            netns::exec_in_user_netns(pid, &ipt, "iptables", args)
         } else {
-            netns::exec_in_netns_with_arg0(pid, &ipt, "iptables", args)
+            netns::exec_in_netns(pid, &ipt, "iptables", args)
         }
     };
 
@@ -99,11 +99,11 @@ mod tests {
         let source = include_str!("egress.rs");
 
         assert!(
-            source.contains("exec_in_user_netns_with_arg0(pid, &ipt, \"iptables\", args)"),
+            source.contains("exec_in_user_netns(pid, &ipt, \"iptables\", args)"),
             "rootless egress policy must preserve iptables argv[0] inside the target namespaces"
         );
         assert!(
-            source.contains("exec_in_netns_with_arg0(pid, &ipt, \"iptables\", args)"),
+            source.contains("exec_in_netns(pid, &ipt, \"iptables\", args)"),
             "privileged egress policy must preserve iptables argv[0] inside the target netns"
         );
     }
