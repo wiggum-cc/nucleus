@@ -97,13 +97,14 @@ mod tests {
     #[test]
     fn test_egress_policy_preserves_iptables_applet_argv0() {
         let source = include_str!("egress.rs");
+        let implementation = source.split("#[cfg(test)]").next().unwrap();
 
         assert!(
-            source.contains("exec_in_user_netns(pid, &ipt, \"iptables\", args)"),
+            implementation.contains("exec_in_user_netns(pid, &ipt, \"iptables\", args)"),
             "rootless egress policy must preserve iptables argv[0] inside the target namespaces"
         );
         assert!(
-            source.contains("exec_in_netns(pid, &ipt, \"iptables\", args)"),
+            implementation.contains("exec_in_netns(pid, &ipt, \"iptables\", args)"),
             "privileged egress policy must preserve iptables argv[0] inside the target netns"
         );
     }

@@ -1466,9 +1466,10 @@ mod tests {
     #[test]
     fn test_network_helper_execution_preserves_applet_argv0() {
         let source = include_str!("bridge.rs");
+        let implementation = source.split("#[cfg(test)]").next().unwrap();
 
         assert!(
-            source.contains("Command::new(&resolved).arg0(program).args(args)"),
+            implementation.contains(".arg0(program)"),
             "canonicalized network helper execution must preserve the requested applet argv[0]"
         );
     }
