@@ -44,10 +44,8 @@ impl Container {
         if precreated_userns {
             // In rootless bridge mode Nucleus creates the mapped user namespace
             // before execing runsc so the prepared netns can be inherited.
-            // Invoke runsc as uid 0 in that caller-configured namespace rather
-            // than asking runsc --rootless to create and re-exec into another
-            // user namespace. Keep OCI noNewPrivileges out of this handoff and
-            // let gVisor enforce its own sandbox process model after startup.
+            // Keep OCI noNewPrivileges out of this handoff and let gVisor
+            // enforce its own sandbox process model after startup.
             oci_config = oci_config.with_no_new_privileges(false);
         }
         let artifact_dir = Self::gvisor_artifact_dir(&self.config.id);
@@ -194,7 +192,10 @@ impl Container {
         };
 
         let ignore_cgroups = self.config.user_ns_config.is_some();
-        let runsc_rootless = false;
+        // When Nucleus pre-creates the rootless bridge user namespace, runsc
+        // still needs --rootless so its supervisor/gofer handoff keeps the
+        // caller's mapped privileges instead of dropping to unmapped host IDs.
+        let runsc_rootless = precreated_userns;
         // In the pre-created rootless bridge path, runsc's systrap gofer
         // re-exec fails under Nucleus' Landlock supervisor execute policy
         // even when the runsc and procfs re-exec roots are allowlisted. This

@@ -65,12 +65,12 @@ pub struct GVisorOciRunOptions {
     pub network_mode: GVisorNetworkMode,
     /// Skip runsc's cgroup setup when Nucleus manages cgroups externally.
     pub ignore_cgroups: bool,
-    /// Use runsc's built-in rootless execution path.
+    /// Tell runsc it is being launched without host-root privileges.
     ///
-    /// This asks runsc to create its own single-ID user namespace and re-exec
-    /// itself there. Callers that already placed runsc inside a mapped user
-    /// namespace should leave this false and invoke runsc as uid 0 in that
-    /// caller-configured namespace.
+    /// This is needed both for runsc's built-in rootless path and for callers
+    /// that have already placed runsc inside a mapped user namespace. In both
+    /// cases the supervisor and gofer must keep caller privileges instead of
+    /// switching to host IDs that may not exist in the active user namespace.
     pub runsc_rootless: bool,
     /// Fail if the host-side supervisor execute allowlist cannot be installed.
     pub require_supervisor_exec_policy: bool,
@@ -305,10 +305,10 @@ impl GVisorRuntime {
     ///
     /// `ignore_cgroups` skips runsc's internal cgroup configuration because
     /// Nucleus already manages cgroups externally and unprivileged callers
-    /// cannot configure them directly. `runsc_rootless` selects gVisor's
-    /// built-in single-ID rootless execution path. Callers that already
-    /// entered a mapped user namespace should not set it; runsc should instead
-    /// run as uid 0 in that caller-configured namespace.
+    /// cannot configure them directly. `runsc_rootless` tells runsc its
+    /// supervisor is not running with host-root privileges, so helpers must run
+    /// with caller privileges. This also applies when Nucleus already entered a
+    /// mapped user namespace before execing runsc.
     /// `require_supervisor_exec_policy` fail-closes if Nucleus cannot install
     /// the host-side execute allowlist before handing control to runsc.
     pub fn exec_with_oci_bundle_options(
@@ -360,11 +360,12 @@ impl GVisorRuntime {
         let c_env = self.exec_environment(&runsc_runtime_dir)?;
 
         // Install an execute-only Landlock allowlist before handing control to
-        // runsc when the caller requested a fail-closed supervisor policy or
-        // when runsc's built-in rootless path may re-exec itself. Launch modes
-        // that cannot tolerate this host-side policy must leave
-        // require_supervisor_exec_policy unset.
-        if options.require_supervisor_exec_policy || options.runsc_rootless {
+        // runsc when the caller requested a fail-closed supervisor policy.
+        // Rootless bridge mode uses runsc --rootless from a pre-created user
+        // namespace and cannot tolerate this host-side policy during runsc's
+        // supervisor/gofer handoff, so rootless flag selection is intentionally
+        // independent from policy selection.
+        if options.require_supervisor_exec_policy {
             self.apply_supervisor_exec_policy(
                 &exec_allow_roots,
                 options.require_supervisor_exec_policy,
@@ -1174,6 +1175,26 @@ mod tests {
 
         assert!(args.iter().any(|arg| arg == "--rootless"));
         assert!(args.iter().any(|arg| arg == "--ignore-cgroups"));
+    }
+
+    #[test]
+    fn test_runsc_rootless_does_not_force_supervisor_exec_policy() {
+        let source = include_str!("gvisor.rs");
+        let start = source.find("pub fn exec_with_oci_bundle_options").unwrap();
+        let end = source[start..]
+            .find("pub fn exec_with_oci_bundle_network")
+            .map(|offset| start + offset)
+            .unwrap();
+        let fn_body = &source[start..end];
+
+        assert!(
+            fn_body.contains("if options.require_supervisor_exec_policy"),
+            "supervisor execute policy must be selected explicitly"
+        );
+        assert!(
+            !fn_body.contains("|| options.runsc_rootless"),
+            "runsc --rootless must not force the host-side supervisor execute policy"
+        );
     }
 
     #[test]
