@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+
 //! Extremely lightweight Docker alternative for agents and production services.
 //!
 //! Nucleus provides isolated execution using Linux cgroups, namespaces, seccomp,
