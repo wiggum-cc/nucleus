@@ -211,6 +211,7 @@ impl Container {
                 network_mode: gvisor_net,
                 ignore_cgroups,
                 runsc_rootless,
+                stage_runsc_binary: precreated_userns,
                 require_supervisor_exec_policy,
                 platform: self.config.gvisor_platform,
             },

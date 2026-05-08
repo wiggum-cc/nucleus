@@ -72,6 +72,14 @@ pub struct GVisorOciRunOptions {
     /// cases the supervisor and gofer must keep caller privileges instead of
     /// switching to host IDs that may not exist in the active user namespace.
     pub runsc_rootless: bool,
+    /// Stage runsc into the per-container runtime directory before exec.
+    ///
+    /// This is required after Nucleus has entered a single-ID user namespace:
+    /// immutable store binaries may be owned by host IDs that are unmapped
+    /// there, while a staged copy created inside the namespace is owned by the
+    /// mapped uid 0 and can retain the capabilities runsc's helper handoff
+    /// needs.
+    pub stage_runsc_binary: bool,
     /// Fail if the host-side supervisor execute allowlist cannot be installed.
     pub require_supervisor_exec_policy: bool,
     /// gVisor Sentry platform backend.
@@ -84,6 +92,7 @@ impl Default for GVisorOciRunOptions {
             network_mode: GVisorNetworkMode::None,
             ignore_cgroups: false,
             runsc_rootless: false,
+            stage_runsc_binary: false,
             require_supervisor_exec_policy: false,
             platform: GVisorPlatform::default(),
         }
@@ -308,7 +317,9 @@ impl GVisorRuntime {
     /// cannot configure them directly. `runsc_rootless` tells runsc its
     /// supervisor is not running with host-root privileges, so helpers must run
     /// with caller privileges. This also applies when Nucleus already entered a
-    /// mapped user namespace before execing runsc.
+    /// mapped user namespace before execing runsc. `stage_runsc_binary` forces
+    /// a private runsc copy when the resolved runsc path's store ownership may
+    /// not be mapped in that namespace.
     /// `require_supervisor_exec_policy` fail-closes if Nucleus cannot install
     /// the host-side execute allowlist before handing control to runsc.
     pub fn exec_with_oci_bundle_options(
@@ -334,7 +345,7 @@ impl GVisorRuntime {
         Self::ensure_secure_runsc_dir(&runsc_runtime_dir, "runsc runtime directory")?;
 
         let (program_path, exec_allow_roots) =
-            self.prepare_supervisor_runsc_program(&runsc_root)?;
+            self.prepare_supervisor_runsc_program(&runsc_root, options.stage_runsc_binary)?;
 
         // Build runsc command with OCI bundle.
         // Global flags (--root, --network, --platform) must come BEFORE the subcommand.
@@ -390,6 +401,7 @@ impl GVisorRuntime {
         network_mode: GVisorNetworkMode,
         ignore_cgroups: bool,
         runsc_rootless: bool,
+        stage_runsc_binary: bool,
         require_supervisor_exec_policy: bool,
         platform: GVisorPlatform,
     ) -> Result<()> {
@@ -400,6 +412,7 @@ impl GVisorRuntime {
                 network_mode,
                 ignore_cgroups,
                 runsc_rootless,
+                stage_runsc_binary,
                 require_supervisor_exec_policy,
                 platform,
             },
@@ -461,6 +474,7 @@ impl GVisorRuntime {
     fn prepare_supervisor_runsc_program(
         &self,
         runsc_root: &Path,
+        force_private_stage: bool,
     ) -> Result<(PathBuf, Vec<PathBuf>)> {
         let canonical = fs::canonicalize(&self.runsc_path).map_err(|e| {
             NucleusError::GVisorError(format!(
@@ -472,20 +486,35 @@ impl GVisorRuntime {
 
         Self::ensure_secure_runsc_dir(runsc_root, "runsc root directory")?;
 
-        if let Some(exec_root) = Self::nix_store_runsc_exec_root(&canonical) {
-            // Nix store paths are immutable and already validated as trusted
-            // runsc artifacts. Use the store binary directly so gVisor helper
-            // re-execs do not depend on private runtime-directory ownership.
-            return Ok((canonical, Self::supervisor_exec_allow_roots(exec_root)));
+        if !force_private_stage {
+            if let Some(exec_root) = Self::nix_store_runsc_exec_root(&canonical) {
+                // Nix store paths are immutable and already validated as trusted
+                // runsc artifacts. Use the store binary directly so gVisor helper
+                // re-execs do not depend on private runtime-directory ownership.
+                return Ok((canonical, Self::supervisor_exec_allow_roots(exec_root)));
+            }
         }
 
         let private_dir = runsc_root.join("exec-allow");
         Self::ensure_secure_runsc_dir(&private_dir, "private runsc exec directory")?;
 
-        // Stage every runsc binary, including immutable Nix store artifacts.
-        // gVisor re-execs runsc helpers after Landlock is installed; keeping the
-        // executable under a per-container allowlist avoids granting execute over
-        // the whole store.
+        if force_private_stage {
+            // Nix store paths are immutable and already validated as trusted
+            // runsc artifacts, but a single-ID user namespace may not map the
+            // store owner. Staging makes the executable owned by the mapped
+            // uid 0 before runsc forks helper processes.
+            debug!(
+                source = ?canonical,
+                target_root = ?private_dir,
+                "Staging runsc binary for mapped user namespace"
+            );
+        }
+
+        // Stage runsc when it is not an immutable Nix store artifact, or when
+        // the caller needs namespace-local file ownership for helper exec.
+        // Keeping the executable under a per-container allowlist also avoids
+        // granting execute over broader host paths when a supervisor policy is
+        // installed.
         let stage_dir = Self::create_unique_runsc_stage_dir(&private_dir)?;
         let staged = stage_dir.join("runsc");
         Self::copy_runsc_nofollow(&canonical, &staged)?;
@@ -1168,6 +1197,7 @@ mod tests {
                 network_mode: GVisorNetworkMode::Host,
                 ignore_cgroups: true,
                 runsc_rootless: true,
+                stage_runsc_binary: false,
                 require_supervisor_exec_policy: false,
                 platform: GVisorPlatform::Systrap,
             },
@@ -1214,6 +1244,7 @@ mod tests {
                 network_mode: GVisorNetworkMode::Host,
                 ignore_cgroups: true,
                 runsc_rootless: false,
+                stage_runsc_binary: false,
                 require_supervisor_exec_policy: false,
                 platform: GVisorPlatform::Systrap,
             },
@@ -1232,7 +1263,9 @@ mod tests {
 
         let rt = GVisorRuntime::with_path(fake_runsc.to_string_lossy().to_string());
         let runsc_root = tmp.path().join("runsc-root");
-        let (program, allow_roots) = rt.prepare_supervisor_runsc_program(&runsc_root).unwrap();
+        let (program, allow_roots) = rt
+            .prepare_supervisor_runsc_program(&runsc_root, false)
+            .unwrap();
 
         assert!(program.starts_with(runsc_root.join("exec-allow")));
         assert_eq!(
@@ -1323,7 +1356,7 @@ mod tests {
 
         let rt = GVisorRuntime::with_path(fake_runsc.to_string_lossy().to_string());
         let err = rt
-            .prepare_supervisor_runsc_program(&runsc_root)
+            .prepare_supervisor_runsc_program(&runsc_root, false)
             .unwrap_err()
             .to_string();
 
