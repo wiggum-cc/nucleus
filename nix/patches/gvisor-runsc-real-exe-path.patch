@@ -17,8 +17,10 @@ index 00cd5fc47..efb1ab160 100644
 +// execution narrowly enough for that path. Resolve the real executable path so
 +// runsc helper processes and user-namespace re-execs stay inside the existing
 +// runsc executable root allowlist. Nucleus can opt back into /proc/self/exe
-+// for rootless bridge mode, where no host-side execute allowlist is active and
-+// the gofer may not retain filesystem credentials for private runtime paths.
++// for modes that execute an immutable host binary directly. When Nucleus
++// stages runsc inside a mapped user namespace, helpers must re-exec that
++// staged path so they retain namespace-local file ownership and avoid procfs
++// magic-link exec denials.
 +var ExePath = resolvedExePath()
 +
 +func resolvedExePath() string {

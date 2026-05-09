@@ -369,8 +369,9 @@ impl GVisorRuntime {
             .collect();
         let c_args = c_args?;
 
-        let c_env =
-            self.exec_environment(&runsc_runtime_dir, !options.require_supervisor_exec_policy)?;
+        let reexec_via_proc_self_exe =
+            !options.require_supervisor_exec_policy && !options.stage_runsc_binary;
+        let c_env = self.exec_environment(&runsc_runtime_dir, reexec_via_proc_self_exe)?;
 
         // Install an execute-only Landlock allowlist before handing control to
         // runsc when the caller requested a fail-closed supervisor policy.
@@ -1199,7 +1200,7 @@ mod tests {
         assert!(
             env.iter()
                 .any(|entry| entry.to_str().is_ok_and(|entry| entry == expected)),
-            "runsc env must request /proc/self/exe re-exec when no supervisor policy is active"
+            "runsc env must request /proc/self/exe re-exec when explicitly requested"
         );
     }
 
@@ -1261,6 +1262,11 @@ mod tests {
         assert!(
             !fn_body.contains("|| options.runsc_rootless"),
             "runsc --rootless must not force the host-side supervisor execute policy"
+        );
+        assert!(
+            fn_body
+                .contains("!options.require_supervisor_exec_policy && !options.stage_runsc_binary"),
+            "privately staged runsc must not request /proc/self/exe helper re-exec"
         );
     }
 
