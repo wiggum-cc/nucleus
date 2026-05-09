@@ -311,6 +311,7 @@ mod tests {
         // Host network without allow_host_network should fail before startup.
         let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
+            .with_gvisor(false)
             .with_network(NetworkMode::Host)
             .with_namespaces(NamespaceConfig::minimal());
 

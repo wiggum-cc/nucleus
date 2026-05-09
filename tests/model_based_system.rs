@@ -48,6 +48,7 @@ enum SecurityState {
 enum NetworkMode {
     None,
     Host,
+    GVisorHost,
     Bridge,
 }
 
@@ -374,8 +375,13 @@ impl SystemModel {
         match c.trust_level {
             TrustLevel::Trusted => Ok(()),
             TrustLevel::Untrusted => {
-                if c.network_mode == NetworkMode::Host && !(c.use_gvisor && c.allow_host_network) {
-                    return Err("untrusted workloads cannot use host network");
+                if c.network_mode == NetworkMode::Host {
+                    return Err("untrusted workloads cannot use native host network");
+                }
+                if c.network_mode == NetworkMode::GVisorHost
+                    && !(c.use_gvisor && c.allow_host_network)
+                {
+                    return Err("untrusted workloads require explicit gvisor-host boundary");
                 }
                 if !c.use_gvisor {
                     if c.gvisor_available {
@@ -1012,7 +1018,7 @@ proptest! {
             m.set_trust_level("c1", TrustLevel::Trusted);
         }
         if host_network {
-            m.set_network_mode("c1", NetworkMode::Host);
+            m.set_network_mode("c1", NetworkMode::GVisorHost);
         }
         if explicit_gvisor {
             m.enable_gvisor_runtime("c1");
@@ -1059,7 +1065,7 @@ fn test_untrusted_host_network_denied_without_explicit_gvisor_boundary() {
     let mut m = SystemModel::new(&["c1"]);
     m.create("c1");
     m.set_trust_level("c1", TrustLevel::Untrusted);
-    m.set_network_mode("c1", NetworkMode::Host);
+    m.set_network_mode("c1", NetworkMode::GVisorHost);
     m.set_gvisor_available("c1", true);
     m.enable_degraded("c1");
 
@@ -1075,7 +1081,7 @@ fn test_untrusted_host_network_allowed_with_explicit_gvisor_boundary() {
     let mut m = SystemModel::new(&["c1"]);
     m.create("c1");
     m.set_trust_level("c1", TrustLevel::Untrusted);
-    m.set_network_mode("c1", NetworkMode::Host);
+    m.set_network_mode("c1", NetworkMode::GVisorHost);
     m.enable_gvisor_runtime("c1");
     m.enable_host_network_opt_in("c1");
 

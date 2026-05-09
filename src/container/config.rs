@@ -127,9 +127,12 @@ pub enum NetworkModeArg {
     /// No network (default).
     #[value(name = "none")]
     None,
-    /// Share host network namespace (dangerous).
+    /// Native host network namespace sharing (dangerous).
     #[value(name = "host")]
     Host,
+    /// gVisor hostinet mode; requires --runtime gvisor and --allow-host-network.
+    #[value(name = "gvisor-host")]
+    GVisorHost,
     /// Virtual bridge with veth pair.
     #[value(name = "bridge")]
     Bridge,
@@ -803,18 +806,25 @@ impl ContainerConfig {
         }
 
         let host_network = matches!(self.network, crate::network::NetworkMode::Host);
-        let gvisor_host_network = self.use_gvisor && host_network;
+        let gvisor_host_network = matches!(self.network, crate::network::NetworkMode::GVisorHost);
 
         if self.allow_host_network && !gvisor_host_network {
             return Err(crate::error::NucleusError::ConfigError(
-                "Production mode only allows --allow-host-network with gVisor host network mode"
+                "Production mode only allows --allow-host-network with --network gvisor-host"
                     .to_string(),
             ));
         }
 
-        if host_network && !gvisor_host_network {
+        if host_network {
             return Err(crate::error::NucleusError::ConfigError(
-                "Production mode forbids host network mode without gVisor".to_string(),
+                "Production mode forbids native host network mode; use --network gvisor-host with --runtime gvisor and --allow-host-network"
+                    .to_string(),
+            ));
+        }
+
+        if gvisor_host_network && !self.use_gvisor {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Production gVisor host network mode requires --runtime gvisor".to_string(),
             ));
         }
 
@@ -1253,7 +1263,7 @@ mod tests {
         let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
             .with_service_mode(ServiceMode::Production)
-            .with_network(NetworkMode::Host)
+            .with_network(NetworkMode::GVisorHost)
             .with_allow_host_network(true)
             .with_rootfs_path(rootfs.clone())
             .with_verify_rootfs_attestation(true)
@@ -1291,7 +1301,33 @@ mod tests {
             );
 
         let err = cfg.validate_production_mode().unwrap_err();
-        assert!(err.to_string().contains("gVisor host network"));
+        assert!(err.to_string().contains("gvisor-host"));
+    }
+
+    #[test]
+    fn test_production_mode_rejects_gvisor_host_without_gvisor_runtime() {
+        let rootfs = test_rootfs_path();
+        if !rootfs.is_dir() {
+            return;
+        }
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_gvisor(false)
+            .with_service_mode(ServiceMode::Production)
+            .with_network(NetworkMode::GVisorHost)
+            .with_allow_host_network(true)
+            .with_rootfs_path(rootfs.clone())
+            .with_verify_rootfs_attestation(true)
+            .with_limits(
+                crate::resources::ResourceLimits::default()
+                    .with_memory("512M")
+                    .unwrap()
+                    .with_cpu_cores(2.0)
+                    .unwrap(),
+            );
+
+        let err = cfg.validate_production_mode().unwrap_err();
+        assert!(err.to_string().contains("--runtime gvisor"));
     }
 
     #[test]

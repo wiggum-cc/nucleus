@@ -5,8 +5,11 @@ use std::net::Ipv4Addr;
 pub enum NetworkMode {
     /// No networking (default, fully isolated)
     None,
-    /// Share host network namespace
+    /// Native runtime host network namespace sharing.
     Host,
+    /// gVisor hostinet mode; omits the OCI network namespace and passes
+    /// `--network host` to runsc.
+    GVisorHost,
     /// Bridge network with NAT
     Bridge(BridgeConfig),
 }

@@ -2009,6 +2009,7 @@ mod tests {
     fn test_host_network_requires_explicit_opt_in() {
         let mut config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
+            .with_gvisor(false)
             .with_network(NetworkMode::Host)
             .with_allow_host_network(false);
         let err = Container::apply_network_mode_guards(&mut config, true).unwrap_err();
@@ -2019,11 +2020,45 @@ mod tests {
     fn test_host_network_opt_in_disables_net_namespace() {
         let mut config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
+            .with_gvisor(false)
             .with_network(NetworkMode::Host)
             .with_allow_host_network(true);
         assert!(config.namespaces.net);
         Container::apply_network_mode_guards(&mut config, true).unwrap();
         assert!(!config.namespaces.net);
+    }
+
+    #[test]
+    fn test_host_network_with_gvisor_requires_gvisor_host_mode() {
+        let mut config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_network(NetworkMode::Host)
+            .with_allow_host_network(true);
+        let err = Container::apply_network_mode_guards(&mut config, true).unwrap_err();
+        assert!(matches!(err, NucleusError::NetworkError(_)));
+        assert!(err.to_string().contains("gvisor-host"));
+    }
+
+    #[test]
+    fn test_gvisor_host_requires_explicit_opt_in() {
+        let mut config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_network(NetworkMode::GVisorHost)
+            .with_allow_host_network(false);
+        let err = Container::apply_network_mode_guards(&mut config, true).unwrap_err();
+        assert!(matches!(err, NucleusError::NetworkError(_)));
+        assert!(err.to_string().contains("--allow-host-network"));
+    }
+
+    #[test]
+    fn test_gvisor_host_preserves_namespace_config_for_oci_setup() {
+        let mut config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_network(NetworkMode::GVisorHost)
+            .with_allow_host_network(true);
+        assert!(config.namespaces.net);
+        Container::apply_network_mode_guards(&mut config, true).unwrap();
+        assert!(config.namespaces.net);
     }
 
     #[test]
@@ -2243,6 +2278,19 @@ mod tests {
         assert!(
             create_body.contains("matches!(config.network, NetworkMode::Bridge(_))"),
             "external mapping request must be scoped to gVisor bridge networking"
+        );
+    }
+
+    #[test]
+    fn test_gvisor_host_does_not_request_external_userns_mapping() {
+        let source = include_str!("runtime.rs");
+        let create_body = extract_fn_body(source, "fn create_internal");
+        assert!(
+            !create_body.contains("NetworkMode::GVisorHost")
+                || !create_body.contains(
+                    "matches!(config.network, NetworkMode::Bridge(_) | NetworkMode::GVisorHost)"
+                ),
+            "gVisor host mode must not use the bridge pre-created userns/netns handoff"
         );
     }
 

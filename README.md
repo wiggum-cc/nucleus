@@ -86,7 +86,7 @@ Nucleus leverages Linux kernel isolation primitives:
 - **Capabilities** – All capabilities dropped by default, or configured via TOML policy file (irreversible)
 - **seccomp** – Syscall whitelist filtering with per-service JSON profiles and trace-based generation (irreversible)
 - **Landlock** – Path-based filesystem access control via hardcoded defaults or TOML policy file (Linux 5.13+)
-- **gVisor** – Optional application kernel (runsc) with None/Sandbox/Host network modes
+- **gVisor** – Optional application kernel (runsc) with none, bridge handoff, and explicit gvisor-host network modes
 - **OCI bundle generation** – Emits OCI `config.json` plus bundle layout for gVisor, including `process.user`, lifecycle hooks, seccomp, resource limits, and namespace mappings
 - **PID 1 init** – Mini-init supervisor in production mode for zombie reaping and signal forwarding
 - **In-memory secrets** – Dedicated tmpfs at `/run/secrets` with volatile zeroing of source buffers
@@ -672,15 +672,15 @@ This changes the native rootless behavior from "degrade to `none`" to a real use
 
 ## gVisor Network Modes
 
-When using gVisor (`--runtime gvisor`), the network mode is automatically selected:
+When using gVisor (`--runtime gvisor`), the network mode is selected explicitly:
 
 | Container `--network` | gVisor `--network` flag | Description |
 |---|---|---|
 | `none` | `none` | Fully isolated (default for agents) |
-| `bridge` | `sandbox` | gVisor user-space network stack |
-| `host` | `host` | Shared host network namespace |
+| `bridge` | `host` | Nucleus prepares a bridge/userspace NAT namespace, then runsc inherits it |
+| `gvisor-host` | `host` | gVisor hostinet mode; omits the OCI network namespace and requires `--allow-host-network` |
 
-The `sandbox` mode gives gVisor-isolated services full network access through gVisor's user-space TCP/IP stack, without exposing the host kernel's network code.
+The `gvisor-host` mode is intentionally separate from native `host` networking. Native `host` remains a direct host namespace mode. `gvisor-host` keeps the gVisor runtime boundary, but weakens network isolation by letting runsc hostinet use the host network stack.
 
 ## OCI Support
 

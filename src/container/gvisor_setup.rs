@@ -70,10 +70,14 @@ impl Container {
             oci_config = oci_config.without_user_namespace();
         }
         oci_config = oci_config.with_process_identity(&self.config.process_identity);
-        if matches!(self.config.network, NetworkMode::Bridge(_)) {
-            // Nucleus configures bridge/userspace NAT against the child process'
-            // network namespace before exec. Keep runsc in that namespace instead
-            // of asking it to create an unconnected network namespace of its own.
+        if matches!(
+            self.config.network,
+            NetworkMode::Bridge(_) | NetworkMode::GVisorHost
+        ) {
+            // Bridge: Nucleus configures userspace NAT against the child
+            // process' network namespace before exec, then runsc inherits it.
+            // gvisor-host: runsc hostinet only reaches the host namespace when
+            // no OCI network namespace entry is present.
             oci_config = oci_config.without_network_namespace();
         }
         oci_config = oci_config.with_rlimits(&self.config.limits);
@@ -194,7 +198,13 @@ impl Container {
         // Select gVisor network mode based on container network config
         let gvisor_net = match &self.config.network {
             NetworkMode::None => GVisorNetworkMode::None,
-            NetworkMode::Host => GVisorNetworkMode::Host,
+            NetworkMode::Host => {
+                return Err(NucleusError::ConfigError(
+                    "gVisor runtime requires --network gvisor-host for host networking; --network host is native host networking"
+                        .to_string(),
+                ));
+            }
+            NetworkMode::GVisorHost => GVisorNetworkMode::Host,
             NetworkMode::Bridge(_) => GVisorNetworkMode::Host,
         };
 

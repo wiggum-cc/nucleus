@@ -453,7 +453,7 @@ enum Commands {
         #[arg(long)]
         console_socket: Option<PathBuf>,
 
-        /// Network mode: none, host, or bridge (default: none)
+        /// Network mode: none, host, gvisor-host, or bridge (default: none)
         #[arg(long, default_value = "none")]
         network: NetworkModeArg,
 
@@ -1552,6 +1552,7 @@ fn try_main() -> Result<i32> {
             let net_mode = match network {
                 NetworkModeArg::None => NetworkMode::None,
                 NetworkModeArg::Host => NetworkMode::Host,
+                NetworkModeArg::GVisorHost => NetworkMode::GVisorHost,
                 NetworkModeArg::Bridge => {
                     // Production mode requires explicit DNS to avoid silent empty resolv.conf
                     if service_mode == ServiceMode::Production && dns.is_empty() {

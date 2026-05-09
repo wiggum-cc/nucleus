@@ -29,15 +29,24 @@ impl Container {
             TrustLevel::Trusted => Ok(()),
             TrustLevel::Untrusted => {
                 // Native host networking collapses the network isolation
-                // boundary. Permit it for untrusted workloads only when gVisor
-                // remains the runtime boundary and the operator opted in.
-                if matches!(config.network, NetworkMode::Host)
+                // boundary and is never acceptable for untrusted workloads.
+                // The explicit gvisor-host mode keeps gVisor as the runtime
+                // boundary while opting out of network namespace isolation.
+                if matches!(config.network, NetworkMode::Host) {
+                    return Err(NucleusError::ConfigError(
+                        "Untrusted workloads cannot use native host network mode. Use \
+                         --network gvisor-host with --runtime gvisor and --allow-host-network, \
+                         or set --trust-level trusted to override."
+                            .to_string(),
+                    ));
+                }
+
+                if matches!(config.network, NetworkMode::GVisorHost)
                     && !(config.use_gvisor && config.allow_host_network)
                 {
                     return Err(NucleusError::ConfigError(
-                        "Untrusted workloads cannot use host network mode unless gVisor runtime \
-                         and --allow-host-network are both enabled. Set --trust-level trusted to \
-                         override."
+                        "Untrusted workloads require --runtime gvisor and --allow-host-network \
+                         for --network gvisor-host. Set --trust-level trusted to override."
                             .to_string(),
                     ));
                 }
@@ -76,20 +85,47 @@ impl Container {
         config: &mut ContainerConfig,
         _is_root: bool,
     ) -> Result<()> {
-        if let NetworkMode::Host = &config.network {
-            if !config.allow_host_network {
-                return Err(NucleusError::NetworkError(
-                    "Host network mode requires explicit opt-in: pass --allow-host-network"
-                        .to_string(),
-                ));
+        match &config.network {
+            NetworkMode::Host => {
+                if config.use_gvisor {
+                    return Err(NucleusError::NetworkError(
+                        "gVisor host networking requires --network gvisor-host; --network host is native host networking"
+                            .to_string(),
+                    ));
+                }
+                if !config.allow_host_network {
+                    return Err(NucleusError::NetworkError(
+                        "Host network mode requires explicit opt-in: pass --allow-host-network"
+                            .to_string(),
+                    ));
+                }
+                warn!(
+                    "Host network mode enabled: container shares host network namespace and can \
+                     access localhost services, scan LAN-reachable endpoints, and bypass network \
+                     namespace isolation"
+                );
+                info!("Host network mode: skipping network namespace");
+                config.namespaces.net = false;
             }
-            warn!(
-                "Host network mode enabled: container shares host network namespace and can \
-                 access localhost services, scan LAN-reachable endpoints, and bypass network \
-                 namespace isolation"
-            );
-            info!("Host network mode: skipping network namespace");
-            config.namespaces.net = false;
+            NetworkMode::GVisorHost => {
+                if !config.use_gvisor {
+                    return Err(NucleusError::NetworkError(
+                        "gVisor host network mode requires --runtime gvisor".to_string(),
+                    ));
+                }
+                if !config.allow_host_network {
+                    return Err(NucleusError::NetworkError(
+                        "gVisor host network mode requires explicit opt-in: pass --allow-host-network"
+                            .to_string(),
+                    ));
+                }
+                warn!(
+                    "gVisor host network mode enabled: runsc uses hostinet and the OCI network \
+                     namespace is omitted, weakening network isolation"
+                );
+                info!("gVisor host network mode: preserving config namespace state for OCI setup");
+            }
+            NetworkMode::None | NetworkMode::Bridge(_) => {}
         }
         Ok(())
     }
