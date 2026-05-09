@@ -2181,12 +2181,12 @@ mod tests {
     }
 
     #[test]
-    fn test_gvisor_bridge_precreated_userns_avoids_runsc_rootless() {
+    fn test_gvisor_bridge_precreated_userns_passes_runsc_rootless() {
         let source = include_str!("gvisor_setup.rs");
         let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
         assert!(
-            fn_body.contains("let runsc_rootless = false"),
-            "pre-created rootless bridge userns must not stack runsc's rootless launcher on the mapped namespace"
+            fn_body.contains("let runsc_rootless = precreated_userns"),
+            "pre-created rootless bridge userns must tell runsc to keep rootless supervisor semantics"
         );
     }
 
