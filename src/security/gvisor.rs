@@ -65,12 +65,12 @@ pub struct GVisorOciRunOptions {
     pub network_mode: GVisorNetworkMode,
     /// Skip runsc's cgroup setup when Nucleus manages cgroups externally.
     pub ignore_cgroups: bool,
-    /// Tell runsc it is being launched without host-root privileges.
+    /// Tell runsc to use its own rootless launcher.
     ///
-    /// This is needed both for runsc's built-in rootless path and for callers
-    /// that have already placed runsc inside a mapped user namespace. In both
-    /// cases the supervisor and gofer must keep caller privileges instead of
-    /// switching to host IDs that may not exist in the active user namespace.
+    /// Do not set this when Nucleus has already entered a mapped user
+    /// namespace and is uid 0 there. That path runs runsc as a regular
+    /// supervisor inside the mapped namespace, with only the capability set
+    /// needed for startup restored before exec.
     pub runsc_rootless: bool,
     /// Stage runsc into the per-container runtime directory before exec.
     ///
@@ -313,12 +313,11 @@ impl GVisorRuntime {
     ///
     /// `ignore_cgroups` skips runsc's internal cgroup configuration because
     /// Nucleus already manages cgroups externally and unprivileged callers
-    /// cannot configure them directly. `runsc_rootless` tells runsc its
-    /// supervisor is not running with host-root privileges, so helpers must run
-    /// with caller privileges. This also applies when Nucleus already entered a
-    /// mapped user namespace before execing runsc. `stage_runsc_binary` forces
-    /// a private runsc copy for non-store binaries or host-side supervisor
-    /// execute policy isolation.
+    /// cannot configure them directly. `runsc_rootless` tells runsc to use its
+    /// own rootless launcher; Nucleus' pre-created mapped namespace path should
+    /// leave it false because runsc already starts as uid 0 inside that
+    /// namespace. `stage_runsc_binary` forces a private runsc copy for
+    /// non-store binaries or host-side supervisor execute policy isolation.
     /// `require_supervisor_exec_policy` fail-closes if Nucleus cannot install
     /// the host-side execute allowlist before handing control to runsc.
     pub fn exec_with_oci_bundle_options(
@@ -376,10 +375,10 @@ impl GVisorRuntime {
 
         // Install an execute-only Landlock allowlist before handing control to
         // runsc when the caller requested a fail-closed supervisor policy.
-        // Rootless bridge mode uses runsc --rootless from a pre-created user
-        // namespace and cannot tolerate this host-side policy during runsc's
-        // supervisor/gofer handoff, so rootless flag selection is intentionally
-        // independent from policy selection.
+        // Nucleus' pre-created bridge namespace cannot tolerate this
+        // host-side policy during runsc's supervisor/gofer handoff, so
+        // rootless flag selection is intentionally independent from policy
+        // selection.
         if options.require_supervisor_exec_policy {
             self.apply_supervisor_exec_policy(
                 &exec_allow_roots,

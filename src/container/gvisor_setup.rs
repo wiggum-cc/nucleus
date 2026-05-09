@@ -199,10 +199,12 @@ impl Container {
         };
 
         let ignore_cgroups = self.config.user_ns_config.is_some();
-        // When Nucleus pre-creates the rootless bridge user namespace, runsc
-        // still needs --rootless so its supervisor/gofer handoff keeps the
-        // caller's mapped privileges instead of dropping to unmapped host IDs.
-        let runsc_rootless = precreated_userns;
+        // Nucleus already entered a mapped user namespace and restored the
+        // small capability set runsc needs for the supervisor handoff. Do not
+        // stack runsc's own rootless launcher on top of that pre-created
+        // namespace; it tries to manage a second privilege model for sandbox
+        // startup and can die before the workload is created.
+        let runsc_rootless = false;
         // In the pre-created rootless bridge path, runsc inherits a mapped
         // user+network namespace prepared by Nucleus. Keep host-side Landlock
         // exec policy out of that supervisor handoff; the workload still runs
