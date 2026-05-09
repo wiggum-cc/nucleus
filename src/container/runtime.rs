@@ -2160,10 +2160,11 @@ mod tests {
         let source = include_str!("gvisor_setup.rs");
         let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
         let precreated_check = fn_body.find("if precreated_userns").unwrap();
+        let remove_oci_userns = fn_body.find("without_user_namespace").unwrap();
         let oci_userns = fn_body.find("with_rootless_user_namespace").unwrap();
         assert!(
-            precreated_check < oci_userns,
-            "pre-created rootless bridge userns must skip nested OCI user namespace setup"
+            precreated_check < remove_oci_userns && remove_oci_userns < oci_userns,
+            "pre-created rootless bridge userns must remove nested OCI user namespace setup"
         );
     }
 

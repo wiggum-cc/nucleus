@@ -1252,6 +1252,20 @@ impl OciConfig {
         self
     }
 
+    /// Remove the OCI user namespace entry so runsc inherits a namespace that
+    /// Nucleus already created and mapped before exec.
+    pub fn without_user_namespace(mut self) -> Self {
+        if let Some(linux) = &mut self.linux {
+            if let Some(namespaces) = &mut linux.namespaces {
+                namespaces.retain(|ns| ns.namespace_type != "user");
+            }
+            linux.uid_mappings.clear();
+            linux.gid_mappings.clear();
+        }
+
+        self
+    }
+
     /// Configure gVisor's true rootless OCI path.
     ///
     /// gVisor expects UID/GID mappings in the OCI spec for this mode, and its
@@ -1726,6 +1740,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_without_user_namespace_removes_namespace_and_mappings() {
+        let user_ns = UserNamespaceConfig::rootless();
+        let mut namespaces = NamespaceConfig::default();
+        namespaces.user = true;
+
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None)
+            .with_namespace_config(&namespaces)
+            .with_rootless_user_namespace(&user_ns)
+            .without_user_namespace();
+        let linux = config.linux.unwrap();
+
+        assert!(!linux
+            .namespaces
+            .unwrap()
+            .iter()
+            .any(|namespace| namespace.namespace_type == "user"));
+        assert!(linux.uid_mappings.is_empty());
+        assert!(linux.gid_mappings.is_empty());
     }
 
     #[test]

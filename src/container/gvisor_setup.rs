@@ -62,6 +62,13 @@ impl Container {
 
         oci_config = oci_config.with_resources(&self.config.limits);
         oci_config = oci_config.with_namespace_config(&self.config.namespaces);
+        if precreated_userns {
+            // Nucleus already created and mapped the user namespace before
+            // execing runsc. Do not leave an OCI user namespace request in the
+            // bundle, or runsc will try to create a nested user namespace for
+            // its gofer/sandbox helper exec path.
+            oci_config = oci_config.without_user_namespace();
+        }
         oci_config = oci_config.with_process_identity(&self.config.process_identity);
         if matches!(self.config.network, NetworkMode::Bridge(_)) {
             // Nucleus configures bridge/userspace NAT against the child process'
