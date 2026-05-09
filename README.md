@@ -103,13 +103,13 @@ Container filesystem is backed by tmpfs and either populated with context files 
 ## Installation
 
 ```bash
-cargo install nucleus-container --version 0.3.6
+cargo install nucleus-container
 ```
 
 Or via Nix (recommended for reproducible builds and NixOS integration):
 
 ```bash
-nix run github:wiggum-cc/nucleus/v0.3.6
+nix run github:wiggum-cc/nucleus
 ```
 
 The Cargo package name is `nucleus-container`; it installs the `nucleus` binary. The repository itself is packaged as a Nix flake, so `nix run`, `nix build`, and the NixOS module all share the same pinned inputs.
@@ -434,7 +434,7 @@ Nucleus provides a declarative NixOS module for running containers as systemd se
 
 ```nix
 {
-  inputs.nucleus.url = "github:wiggum-cc/nucleus/v0.3.6";
+  inputs.nucleus.url = "github:wiggum-cc/nucleus";
 
   outputs = { self, nixpkgs, nucleus, ... }: {
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
