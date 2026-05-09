@@ -2214,13 +2214,16 @@ mod tests {
     }
 
     #[test]
-    fn test_gvisor_bridge_precreated_userns_skips_supervisor_exec_policy() {
+    fn test_gvisor_rootless_skips_supervisor_exec_policy() {
         let source = include_str!("gvisor_setup.rs");
         let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
         let policy = fn_body.find("let require_supervisor_exec_policy").unwrap();
         assert!(
-            fn_body[policy..].contains("ServiceMode::Production && !precreated_userns"),
-            "pre-created rootless bridge userns must not apply the host-side Landlock exec policy"
+            fn_body.contains("let rootless_gvisor = self.config.user_ns_config.is_some();")
+                && fn_body[policy..].contains("ServiceMode::Production")
+                && fn_body[policy..].contains("!precreated_userns")
+                && fn_body[policy..].contains("!rootless_gvisor"),
+            "rootless gVisor must not apply the host-side Landlock exec policy"
         );
     }
 

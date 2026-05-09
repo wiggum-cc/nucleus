@@ -213,13 +213,14 @@ impl Container {
         } else {
             self.config.gvisor_platform
         };
-        // In the pre-created rootless bridge path, runsc inherits a mapped
-        // user+network namespace prepared by Nucleus. Keep host-side Landlock
-        // exec policy out of that supervisor handoff; the workload still runs
-        // inside gVisor, while Nucleus restores only the small capability set
-        // needed by runsc inside the mapped namespace before exec.
-        let require_supervisor_exec_policy =
-            self.config.service_mode == ServiceMode::Production && !precreated_userns;
+        // Rootless gVisor supervisor handoffs cannot reliably install a
+        // host-side Landlock execute allowlist after namespace setup. Keep
+        // that policy for rootful production gVisor only; rootless workloads
+        // still execute inside the gVisor sandbox boundary.
+        let rootless_gvisor = self.config.user_ns_config.is_some();
+        let require_supervisor_exec_policy = self.config.service_mode == ServiceMode::Production
+            && !precreated_userns
+            && !rootless_gvisor;
         // Keep runsc on its immutable package path for the pre-created
         // rootless bridge namespace. gVisor helper processes may drop to
         // credentials that cannot traverse Nucleus' private runtime directory,
