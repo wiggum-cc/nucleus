@@ -47,7 +47,7 @@
           for path in bin sbin lib lib64 usr etc; do
             if [ -e "${baseRootfs}/$path" ]; then
               mkdir -p "$out/$path"
-              cp -a -P "${baseRootfs}/$path/." "$out/$path/"
+              cp -a -P --no-preserve=mode,ownership "${baseRootfs}/$path/." "$out/$path/"
             fi
           done
           mkdir -p "$out/etc"
