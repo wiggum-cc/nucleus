@@ -53,3 +53,10 @@ index ce5a97326..2fdf35f0d 100644
  
  	cmd.SysProcAttr = &unix.SysProcAttr{
  		Cloneflags: unix.CLONE_NEWUSER | unix.CLONE_NEWNS,
+diff --git a/runsc/sandbox/sandbox.go b/runsc/sandbox/sandbox.go
+index 0124180ec..ba6f2cd31 100644
+--- a/runsc/sandbox/sandbox.go
++++ b/runsc/sandbox/sandbox.go
+@@ -1987,0 +1988,2 @@ func ConfigureCmdForRootless(cmd *exec.Cmd, donations *donation.Agency) (*os.Fil
++		// Needed by the ptrace platform when runsc starts rootless with host networking.
++		unix.CAP_SYS_PTRACE,
