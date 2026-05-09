@@ -368,11 +368,14 @@ impl GVisorRuntime {
             .collect();
         let c_args = c_args?;
 
-        // Keep gVisor helper re-execs anchored on the concrete runsc path.
-        // /proc/self/exe is blocked by strict host-side execute policies and
-        // private staged paths can be inaccessible after helper credential
-        // changes in rootless bridge mode.
-        let reexec_via_proc_self_exe = false;
+        // Rootless runsc helper processes may re-exec after switching into a
+        // user namespace where the concrete Nix store path is no longer
+        // executable. Use upstream's /proc/self/exe handoff for rootless
+        // launches when no host-side execute allowlist is active. Rootful
+        // production still keeps helpers anchored on the concrete path so the
+        // supervisor Landlock policy can fail closed.
+        let reexec_via_proc_self_exe =
+            options.runsc_rootless && !options.require_supervisor_exec_policy;
         let c_env = self.exec_environment(&runsc_runtime_dir, reexec_via_proc_self_exe)?;
 
         // Install an execute-only Landlock allowlist before handing control to
@@ -1261,8 +1264,8 @@ mod tests {
             "runsc --rootless must not force the host-side supervisor execute policy"
         );
         assert!(
-            fn_body.contains("let reexec_via_proc_self_exe = false"),
-            "runsc must not request /proc/self/exe helper re-exec"
+            fn_body.contains("options.runsc_rootless && !options.require_supervisor_exec_policy"),
+            "rootless runsc must use /proc/self/exe helper re-exec only without supervisor policy"
         );
     }
 
