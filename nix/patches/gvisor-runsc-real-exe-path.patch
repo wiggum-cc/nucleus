@@ -16,10 +16,15 @@ index 00cd5fc47..efb1ab160 100644
 +// host-side execute allowlist, and Landlock cannot authorize procfs magic-link
 +// execution narrowly enough for that path. Resolve the real executable path so
 +// runsc helper processes and user-namespace re-execs stay inside the existing
-+// runsc executable root allowlist.
++// runsc executable root allowlist. Nucleus can opt back into /proc/self/exe
++// for rootless bridge mode, where no host-side execute allowlist is active and
++// the gofer may not retain filesystem credentials for private runtime paths.
 +var ExePath = resolvedExePath()
 +
 +func resolvedExePath() string {
++	if os.Getenv("NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE") == "1" {
++		return "/proc/self/exe"
++	}
 +	exe, err := os.Executable()
 +	if err != nil || !filepath.IsAbs(exe) {
 +		return "/proc/self/exe"

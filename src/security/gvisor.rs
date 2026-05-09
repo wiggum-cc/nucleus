@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 
 const NIX_STORE_EXEC_ROOT: &str = "/nix/store";
 const PROCFS_EXEC_ROOT: &str = "/proc";
+const RUNSC_REEXEC_VIA_PROC_SELF_EXE_ENV: &str = "NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE";
 
 /// Network mode for gVisor runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,7 +369,8 @@ impl GVisorRuntime {
             .collect();
         let c_args = c_args?;
 
-        let c_env = self.exec_environment(&runsc_runtime_dir)?;
+        let c_env =
+            self.exec_environment(&runsc_runtime_dir, !options.require_supervisor_exec_policy)?;
 
         // Install an execute-only Landlock allowlist before handing control to
         // runsc when the caller requested a fail-closed supervisor policy.
@@ -441,7 +443,11 @@ impl GVisorRuntime {
         Ok(version.trim().to_string())
     }
 
-    fn exec_environment(&self, runtime_dir: &Path) -> Result<Vec<CString>> {
+    fn exec_environment(
+        &self,
+        runtime_dir: &Path,
+        reexec_via_proc_self_exe: bool,
+    ) -> Result<Vec<CString>> {
         let mut env = Vec::new();
         let mut push = |key: &str, value: String| -> Result<()> {
             env.push(
@@ -467,6 +473,9 @@ impl GVisorRuntime {
         push("HOME", "/root".to_string())?;
         push("USER", "root".to_string())?;
         push("LOGNAME", "root".to_string())?;
+        if reexec_via_proc_self_exe {
+            push(RUNSC_REEXEC_VIA_PROC_SELF_EXE_ENV, "1".to_string())?;
+        }
 
         Ok(env)
     }
@@ -1163,7 +1172,7 @@ mod tests {
         std::env::set_var("PATH", "/tmp/evil-inject/bin:/opt/attacker/sbin");
         let rt = GVisorRuntime::with_path("/fake/runsc".to_string());
         let tmp = tempfile::tempdir().unwrap();
-        let env = rt.exec_environment(tmp.path()).unwrap();
+        let env = rt.exec_environment(tmp.path(), false).unwrap();
         let path_entry = env
             .iter()
             .find(|e| e.to_str().is_ok_and(|s| s.starts_with("PATH=")))
@@ -1177,6 +1186,34 @@ mod tests {
         assert_eq!(
             path_val, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "exec_environment PATH must be the standard hardcoded value"
+        );
+    }
+
+    #[test]
+    fn test_exec_environment_can_request_proc_self_exe_reexec() {
+        let rt = GVisorRuntime::with_path("/fake/runsc".to_string());
+        let tmp = tempfile::tempdir().unwrap();
+        let env = rt.exec_environment(tmp.path(), true).unwrap();
+        let expected = format!("{}=1", RUNSC_REEXEC_VIA_PROC_SELF_EXE_ENV);
+
+        assert!(
+            env.iter()
+                .any(|entry| entry.to_str().is_ok_and(|entry| entry == expected)),
+            "runsc env must request /proc/self/exe re-exec when no supervisor policy is active"
+        );
+    }
+
+    #[test]
+    fn test_exec_environment_keeps_real_exe_reexec_for_supervisor_policy() {
+        let rt = GVisorRuntime::with_path("/fake/runsc".to_string());
+        let tmp = tempfile::tempdir().unwrap();
+        let env = rt.exec_environment(tmp.path(), false).unwrap();
+
+        assert!(
+            env.iter().all(|entry| entry.to_str().map_or(true, |entry| {
+                !entry.starts_with(RUNSC_REEXEC_VIA_PROC_SELF_EXE_ENV)
+            })),
+            "runsc env must not enable /proc/self/exe re-exec when supervisor policy is active"
         );
     }
 
