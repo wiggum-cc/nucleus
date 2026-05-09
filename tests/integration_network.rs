@@ -4,7 +4,7 @@
 /// egress policies, and port forwarding without requiring root privileges.
 #[cfg(test)]
 mod tests {
-    use nucleus::container::{ContainerConfig, TrustLevel};
+    use nucleus::container::ContainerConfig;
     use nucleus::error::NucleusError;
     use nucleus::isolation::NamespaceConfig;
     use nucleus::network::{
@@ -308,19 +308,17 @@ mod tests {
 
     #[test]
     fn test_host_network_requires_opt_in() {
-        // Host network without allow_host_network should fail for untrusted
+        // Host network without allow_host_network should fail before startup.
         let config = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
-            .with_trust_level(TrustLevel::Untrusted)
             .with_network(NetworkMode::Host)
-            .with_allow_host_network(true)
             .with_namespaces(NamespaceConfig::minimal());
 
         let container = nucleus::container::Container::new(config);
         let result = container.run();
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, NucleusError::ConfigError(_)));
+        assert!(matches!(err, NucleusError::NetworkError(_)));
     }
 
     #[test]

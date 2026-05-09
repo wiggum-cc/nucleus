@@ -77,6 +77,7 @@ struct ContainerModel {
     gvisor_available: bool,
     use_gvisor: bool,
     allow_degraded: bool,
+    allow_host_network: bool,
     caps_dropped: bool,
     seccomp_on: bool,
     landlock_on: bool,
@@ -104,6 +105,7 @@ impl Default for ContainerModel {
             gvisor_available: false,
             use_gvisor: false,
             allow_degraded: false,
+            allow_host_network: false,
             caps_dropped: false,
             seccomp_on: false,
             landlock_on: false,
@@ -208,6 +210,18 @@ impl SystemModel {
         let c = self.c_mut(id);
         assert_eq!(c.lifecycle, Lifecycle::Created);
         c.allow_degraded = true;
+    }
+
+    fn enable_gvisor_runtime(&mut self, id: &str) {
+        let c = self.c_mut(id);
+        assert_eq!(c.lifecycle, Lifecycle::Created);
+        c.use_gvisor = true;
+    }
+
+    fn enable_host_network_opt_in(&mut self, id: &str) {
+        let c = self.c_mut(id);
+        assert_eq!(c.lifecycle, Lifecycle::Created);
+        c.allow_host_network = true;
     }
 
     fn drop_capabilities(&mut self, id: &str) {
@@ -360,7 +374,7 @@ impl SystemModel {
         match c.trust_level {
             TrustLevel::Trusted => Ok(()),
             TrustLevel::Untrusted => {
-                if c.network_mode == NetworkMode::Host {
+                if c.network_mode == NetworkMode::Host && !(c.use_gvisor && c.allow_host_network) {
                     return Err("untrusted workloads cannot use host network");
                 }
                 if !c.use_gvisor {
@@ -986,6 +1000,8 @@ proptest! {
     fn prop_trust_level_policy_invariants(
         trust_trusted in any::<bool>(),
         host_network in any::<bool>(),
+        explicit_gvisor in any::<bool>(),
+        allow_host_network in any::<bool>(),
         gvisor_available in any::<bool>(),
         allow_degraded in any::<bool>(),
     ) {
@@ -997,6 +1013,12 @@ proptest! {
         }
         if host_network {
             m.set_network_mode("c1", NetworkMode::Host);
+        }
+        if explicit_gvisor {
+            m.enable_gvisor_runtime("c1");
+        }
+        if allow_host_network {
+            m.enable_host_network_opt_in("c1");
         }
         m.set_gvisor_available("c1", gvisor_available);
         if allow_degraded {
@@ -1010,11 +1032,12 @@ proptest! {
             prop_assert!(result.is_ok());
         } else {
             // Untrusted
-            if host_network {
-                // Always denied
+            if host_network && !(explicit_gvisor && allow_host_network) {
+                // Denied unless gVisor remains the runtime boundary and host
+                // networking was explicitly requested.
                 prop_assert!(result.is_err());
-            } else if gvisor_available {
-                // Auto-enables gVisor → Ok
+            } else if explicit_gvisor || gvisor_available {
+                // Explicit gVisor or auto-enabled gVisor satisfies the trust policy.
                 prop_assert!(result.is_ok());
                 prop_assert!(m.c("c1").use_gvisor);
             } else if allow_degraded {
@@ -1032,7 +1055,7 @@ proptest! {
 // --- Trust-level deterministic model tests ---
 
 #[test]
-fn test_untrusted_host_network_always_denied() {
+fn test_untrusted_host_network_denied_without_explicit_gvisor_boundary() {
     let mut m = SystemModel::new(&["c1"]);
     m.create("c1");
     m.set_trust_level("c1", TrustLevel::Untrusted);
@@ -1043,7 +1066,23 @@ fn test_untrusted_host_network_always_denied() {
     let result = m.apply_trust_level_policy("c1");
     assert!(
         result.is_err(),
-        "Untrusted + host network must always be denied"
+        "Untrusted + host network must be denied without explicit gVisor runtime"
+    );
+}
+
+#[test]
+fn test_untrusted_host_network_allowed_with_explicit_gvisor_boundary() {
+    let mut m = SystemModel::new(&["c1"]);
+    m.create("c1");
+    m.set_trust_level("c1", TrustLevel::Untrusted);
+    m.set_network_mode("c1", NetworkMode::Host);
+    m.enable_gvisor_runtime("c1");
+    m.enable_host_network_opt_in("c1");
+
+    let result = m.apply_trust_level_policy("c1");
+    assert!(
+        result.is_ok(),
+        "Untrusted + host network should pass trust policy when gVisor remains the runtime boundary"
     );
 }
 

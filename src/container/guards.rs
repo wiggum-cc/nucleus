@@ -28,11 +28,16 @@ impl Container {
         match config.trust_level {
             TrustLevel::Trusted => Ok(()),
             TrustLevel::Untrusted => {
-                // Untrusted workloads must never use host networking
-                if matches!(config.network, NetworkMode::Host) {
+                // Native host networking collapses the network isolation
+                // boundary. Permit it for untrusted workloads only when gVisor
+                // remains the runtime boundary and the operator opted in.
+                if matches!(config.network, NetworkMode::Host)
+                    && !(config.use_gvisor && config.allow_host_network)
+                {
                     return Err(NucleusError::ConfigError(
-                        "Untrusted workloads cannot use host network mode. \
-                         Set --trust-level trusted to override."
+                        "Untrusted workloads cannot use host network mode unless gVisor runtime \
+                         and --allow-host-network are both enabled. Set --trust-level trusted to \
+                         override."
                             .to_string(),
                     ));
                 }

@@ -92,7 +92,8 @@ pub enum ServiceMode {
     #[default]
     Agent,
     /// Long-running production service. Enforces strict security invariants:
-    /// - Forbids degraded security, chroot fallback, and host networking
+    /// - Forbids degraded security, chroot fallback, and native host networking
+    /// - Requires explicit host-network opt-in for gVisor host networking
     /// - Requires cgroup resource limits
     /// - Requires pivot_root (no chroot fallback)
     /// - Requires explicit rootfs path (no host bind mounts)
@@ -801,15 +802,25 @@ impl ContainerConfig {
             ));
         }
 
-        if self.allow_host_network {
+        let host_network = matches!(self.network, crate::network::NetworkMode::Host);
+        let gvisor_host_network = self.use_gvisor && host_network;
+
+        if self.allow_host_network && !gvisor_host_network {
             return Err(crate::error::NucleusError::ConfigError(
-                "Production mode forbids --allow-host-network".to_string(),
+                "Production mode only allows --allow-host-network with gVisor host network mode"
+                    .to_string(),
             ));
         }
 
-        if matches!(self.network, crate::network::NetworkMode::Host) {
+        if host_network && !gvisor_host_network {
             return Err(crate::error::NucleusError::ConfigError(
-                "Production mode forbids host network mode".to_string(),
+                "Production mode forbids host network mode without gVisor".to_string(),
+            ));
+        }
+
+        if gvisor_host_network && !self.allow_host_network {
+            return Err(crate::error::NucleusError::ConfigError(
+                "Production gVisor host network mode requires --allow-host-network".to_string(),
             ));
         }
 
@@ -1231,6 +1242,56 @@ mod tests {
             );
         let result = cfg.validate_production_mode();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_production_mode_allows_explicit_gvisor_host_network() {
+        let rootfs = test_rootfs_path();
+        if !rootfs.is_dir() {
+            return;
+        }
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_service_mode(ServiceMode::Production)
+            .with_network(NetworkMode::Host)
+            .with_allow_host_network(true)
+            .with_rootfs_path(rootfs.clone())
+            .with_verify_rootfs_attestation(true)
+            .with_limits(
+                crate::resources::ResourceLimits::default()
+                    .with_memory("512M")
+                    .unwrap()
+                    .with_cpu_cores(2.0)
+                    .unwrap(),
+            );
+
+        assert!(cfg.validate_production_mode().is_ok());
+    }
+
+    #[test]
+    fn test_production_mode_rejects_native_host_network() {
+        let rootfs = test_rootfs_path();
+        if !rootfs.is_dir() {
+            return;
+        }
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_gvisor(false)
+            .with_service_mode(ServiceMode::Production)
+            .with_network(NetworkMode::Host)
+            .with_allow_host_network(true)
+            .with_rootfs_path(rootfs.clone())
+            .with_verify_rootfs_attestation(true)
+            .with_limits(
+                crate::resources::ResourceLimits::default()
+                    .with_memory("512M")
+                    .unwrap()
+                    .with_cpu_cores(2.0)
+                    .unwrap(),
+            );
+
+        let err = cfg.validate_production_mode().unwrap_err();
+        assert!(err.to_string().contains("gVisor host network"));
     }
 
     #[test]

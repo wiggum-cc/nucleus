@@ -325,6 +325,7 @@ mod tests {
             vec!["/bin/sh".to_string()],
         )
         .unwrap()
+        .with_gvisor(false)
         .with_trust_level(TrustLevel::Untrusted)
         .with_network(NetworkMode::Host)
         .with_allow_host_network(true)
