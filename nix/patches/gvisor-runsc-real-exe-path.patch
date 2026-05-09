@@ -2,7 +2,7 @@ diff --git a/runsc/specutils/specutils.go b/runsc/specutils/specutils.go
 index 00cd5fc47..efb1ab160 100644
 --- a/runsc/specutils/specutils.go
 +++ b/runsc/specutils/specutils.go
-@@ -72,9 +72,30 @@ const (
+@@ -72,9 +72,35 @@ const (
  	AnnotationTPU = "dev.gvisor.internal.tpuproxy"
  )
  
