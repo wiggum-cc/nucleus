@@ -57,6 +57,10 @@ diff --git a/runsc/sandbox/sandbox.go b/runsc/sandbox/sandbox.go
 index 0124180ec..ba6f2cd31 100644
 --- a/runsc/sandbox/sandbox.go
 +++ b/runsc/sandbox/sandbox.go
+@@ -916,0 +917,3 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args Args, startSync
++		if value := os.Getenv("NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE"); value != "" {
++			cmd.Env = append(cmd.Env, "NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE="+value)
++		}
 @@ -1987,0 +1988,2 @@ func ConfigureCmdForRootless(cmd *exec.Cmd, donations *donation.Agency) (*os.Fil
 +		// Needed by the ptrace platform when runsc starts rootless with host networking.
 +		unix.CAP_SYS_PTRACE,

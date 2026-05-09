@@ -64,3 +64,18 @@ fn gvisor_patch_preserves_ptrace_capability_for_rootless_sandbox_helpers() {
     );
     assert_patch_contains(&patch, r#"+		unix.CAP_SYS_PTRACE,"#);
 }
+
+#[test]
+fn gvisor_patch_preserves_proc_self_reexec_env_for_sandbox_boot() {
+    let patch = read_gvisor_patch();
+
+    assert_patch_contains(&patch, "NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE");
+    assert_patch_contains(
+        &patch,
+        r#"+		if value := os.Getenv("NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE"); value != "" {"#,
+    );
+    assert_patch_contains(
+        &patch,
+        r#"+			cmd.Env = append(cmd.Env, "NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE="+value)"#,
+    );
+}
