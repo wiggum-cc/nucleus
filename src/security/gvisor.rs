@@ -13,6 +13,8 @@ use tracing::{debug, info, warn};
 
 const NIX_STORE_EXEC_ROOT: &str = "/nix/store";
 const RUNSC_REEXEC_VIA_PROC_SELF_EXE_ENV: &str = "NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE";
+const RUNSC_SUPERVISOR_PATH: &str =
+    "/run/wrappers/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Network mode for gVisor runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -459,11 +461,10 @@ impl GVisorRuntime {
         };
 
         // Use a hardcoded PATH for the runsc supervisor process to prevent
-        // host PATH from leaking into the gVisor environment.
-        push(
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-        )?;
+        // host PATH from leaking into the gVisor environment. NixOS exposes
+        // privileged rootless-userns helpers through /run/wrappers/bin; runsc
+        // needs newuidmap/newgidmap there when it creates an OCI user namespace.
+        push("PATH", RUNSC_SUPERVISOR_PATH.to_string())?;
         let runtime_dir = runtime_dir.to_string_lossy().to_string();
         push("TMPDIR", runtime_dir.clone())?;
         push("XDG_RUNTIME_DIR", runtime_dir)?;
@@ -1180,7 +1181,8 @@ mod tests {
             path_val
         );
         assert_eq!(
-            path_val, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            path_val,
+            format!("PATH={RUNSC_SUPERVISOR_PATH}"),
             "exec_environment PATH must be the standard hardcoded value"
         );
     }
