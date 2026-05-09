@@ -2222,11 +2222,13 @@ mod tests {
         let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
         let policy = fn_body.find("let require_supervisor_exec_policy").unwrap();
         assert!(
-            fn_body.contains("let rootless_gvisor = self.config.user_ns_config.is_some();")
+            fn_body.contains("let rootless_gvisor =")
+                && fn_body.contains("self.config.user_ns_config.is_some()")
+                && fn_body.contains("!Uid::effective().is_root()")
                 && fn_body[policy..].contains("ServiceMode::Production")
                 && fn_body[policy..].contains("!precreated_userns")
                 && fn_body[policy..].contains("!rootless_gvisor"),
-            "rootless gVisor must not apply the host-side Landlock exec policy"
+            "explicit user namespaces and effective non-root gVisor must not apply the host-side Landlock exec policy"
         );
     }
 

@@ -198,7 +198,7 @@ impl Container {
             NetworkMode::Bridge(_) => GVisorNetworkMode::Host,
         };
 
-        let rootless_gvisor = self.config.user_ns_config.is_some();
+        let rootless_gvisor = self.config.user_ns_config.is_some() || !Uid::effective().is_root();
         let ignore_cgroups = rootless_gvisor;
         // Tell runsc whenever the launch is rootless. Pre-created bridge
         // namespaces need this so helper handoff keeps mapped privileges; OCI
