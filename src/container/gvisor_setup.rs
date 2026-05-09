@@ -6,8 +6,8 @@ use crate::filesystem::{
 };
 use crate::network::{BridgeNetwork, NetworkMode};
 use crate::security::{
-    load_json_policy, GVisorNetworkMode, GVisorOciRunOptions, GVisorRuntime, OciBundle, OciConfig,
-    OciMount, OciSeccomp,
+    load_json_policy, GVisorNetworkMode, GVisorOciRunOptions, GVisorPlatform, GVisorRuntime,
+    OciBundle, OciConfig, OciMount, OciSeccomp,
 };
 use nix::unistd::Uid;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -205,6 +205,14 @@ impl Container {
         // namespace; it tries to manage a second privilege model for sandbox
         // startup and can die before the workload is created.
         let runsc_rootless = false;
+        let platform = if precreated_userns
+            && matches!(self.config.gvisor_platform, GVisorPlatform::Systrap)
+        {
+            info!("Using gVisor ptrace platform for pre-created rootless bridge namespace");
+            GVisorPlatform::Ptrace
+        } else {
+            self.config.gvisor_platform
+        };
         // In the pre-created rootless bridge path, runsc inherits a mapped
         // user+network namespace prepared by Nucleus. Keep host-side Landlock
         // exec policy out of that supervisor handoff; the workload still runs
@@ -227,7 +235,7 @@ impl Container {
                 runsc_rootless,
                 stage_runsc_binary,
                 require_supervisor_exec_policy,
-                platform: self.config.gvisor_platform,
+                platform,
             },
         )?;
 

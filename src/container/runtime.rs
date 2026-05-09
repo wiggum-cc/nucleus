@@ -2191,6 +2191,18 @@ mod tests {
     }
 
     #[test]
+    fn test_gvisor_bridge_precreated_userns_uses_ptrace_for_default_systrap() {
+        let source = include_str!("gvisor_setup.rs");
+        let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
+        assert!(
+            fn_body.contains("matches!(self.config.gvisor_platform, GVisorPlatform::Systrap)")
+                && fn_body.contains("GVisorPlatform::Ptrace")
+                && fn_body.contains("platform,"),
+            "pre-created rootless bridge userns must avoid systrap sandbox startup"
+        );
+    }
+
+    #[test]
     fn test_gvisor_bridge_precreated_userns_keeps_store_runsc_binary() {
         let source = include_str!("gvisor_setup.rs");
         let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
