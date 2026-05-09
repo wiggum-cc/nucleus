@@ -1458,7 +1458,6 @@ impl Container {
     }
 
     fn become_userns_root_for_setup() -> Result<()> {
-        Self::set_keepcaps(true)?;
         setresgid(Gid::from_raw(0), Gid::from_raw(0), Gid::from_raw(0)).map_err(|e| {
             NucleusError::NamespaceError(format!(
                 "Failed to become gid 0 inside mapped user namespace: {}",
@@ -1472,23 +1471,7 @@ impl Container {
             ))
         })?;
         Self::restore_gvisor_bridge_handoff_capabilities()?;
-        Self::set_keepcaps(false)?;
         debug!("Switched setup process to uid/gid 0 inside mapped user namespace");
-        Ok(())
-    }
-
-    fn set_keepcaps(enabled: bool) -> Result<()> {
-        let value = i32::from(enabled);
-        // SAFETY: PR_SET_KEEPCAPS only toggles the current process' capability
-        // retention behavior across the following uid/gid transition.
-        let rc = unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, value, 0, 0, 0) };
-        if rc != 0 {
-            return Err(NucleusError::CapabilityError(format!(
-                "Failed to set PR_SET_KEEPCAPS={}: {}",
-                value,
-                std::io::Error::last_os_error()
-            )));
-        }
         Ok(())
     }
 
@@ -1511,12 +1494,19 @@ impl Container {
 
     fn restore_gvisor_bridge_handoff_capabilities() -> Result<()> {
         let caps = Self::gvisor_bridge_handoff_capabilities();
-        caps::set(None, CapSet::Permitted, &caps).map_err(|e| {
+        let permitted = caps::read(None, CapSet::Permitted).map_err(|e| {
             NucleusError::CapabilityError(format!(
-                "Failed to set gVisor bridge handoff permitted capabilities: {}",
+                "Failed to read gVisor bridge handoff permitted capabilities: {}",
                 e
             ))
         })?;
+        let missing: Vec<_> = caps.difference(&permitted).copied().collect();
+        if !missing.is_empty() {
+            return Err(NucleusError::CapabilityError(format!(
+                "Missing gVisor bridge handoff permitted capabilities after entering mapped user namespace: {:?}",
+                missing
+            )));
+        }
         caps::set(None, CapSet::Inheritable, &caps).map_err(|e| {
             NucleusError::CapabilityError(format!(
                 "Failed to set gVisor bridge handoff inheritable capabilities: {}",
@@ -2251,15 +2241,31 @@ mod tests {
     fn test_gvisor_bridge_userns_preserves_caps_for_runsc_exec() {
         let source = include_str!("runtime.rs");
         let fn_body = extract_fn_body(source, "fn become_userns_root_for_setup");
-        let keepcaps = fn_body.find("set_keepcaps(true)").unwrap();
         let setuid = fn_body.find("setresuid").unwrap();
         let restore = fn_body
             .find("restore_gvisor_bridge_handoff_capabilities")
             .unwrap();
-        let clear_keepcaps = fn_body.find("set_keepcaps(false)").unwrap();
         assert!(
-            keepcaps < setuid && setuid < restore && restore < clear_keepcaps,
-            "gVisor bridge setup must retain capabilities across the uid switch and restore them before execing runsc"
+            setuid < restore,
+            "gVisor bridge setup must restore exec-time capabilities after switching to uid 0 in the mapped namespace"
+        );
+        assert!(
+            !fn_body.contains("set_keepcaps"),
+            "gVisor bridge setup must let the uid 0 switch grant namespace capabilities instead of preserving the pre-switch empty set"
+        );
+    }
+
+    #[test]
+    fn test_gvisor_bridge_handoff_does_not_raise_permitted_caps() {
+        let source = include_str!("runtime.rs");
+        let fn_body = extract_fn_body(source, "fn restore_gvisor_bridge_handoff_capabilities");
+        assert!(
+            fn_body.contains("caps::read(None, CapSet::Permitted)"),
+            "gVisor bridge handoff must verify existing permitted capabilities"
+        );
+        assert!(
+            !fn_body.contains("caps::set(None, CapSet::Permitted"),
+            "gVisor bridge handoff must not try to raise permitted capabilities after the uid switch"
         );
     }
 
