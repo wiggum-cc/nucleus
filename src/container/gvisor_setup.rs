@@ -196,12 +196,11 @@ impl Container {
         // still needs --rootless so its supervisor/gofer handoff keeps the
         // caller's mapped privileges instead of dropping to unmapped host IDs.
         let runsc_rootless = precreated_userns;
-        // In the pre-created rootless bridge path, runsc's systrap gofer
-        // re-exec fails under Nucleus' Landlock supervisor execute policy
-        // even when the runsc and procfs re-exec roots are allowlisted. This
-        // mode relies on the caller's unit hardening for the host-side
-        // supervisor handoff and keeps the actual frontend workload inside
-        // gVisor.
+        // In the pre-created rootless bridge path, runsc inherits a mapped
+        // user+network namespace prepared by Nucleus. Keep host-side Landlock
+        // exec policy out of that supervisor handoff; the workload still runs
+        // inside gVisor, while Nucleus restores only the small capability set
+        // needed by runsc inside the mapped namespace before exec.
         let require_supervisor_exec_policy =
             self.config.service_mode == ServiceMode::Production && !precreated_userns;
         gvisor.exec_with_oci_bundle_options(

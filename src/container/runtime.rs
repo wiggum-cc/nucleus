@@ -17,6 +17,7 @@ use crate::security::{
     CapabilityManager, GVisorRuntime, LandlockManager, OciContainerState, OciHooks,
     SeccompDenyLogger, SeccompManager, SeccompTraceReader, SecurityState,
 };
+use caps::{CapSet, Capability, CapsHashSet};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
 use nix::sys::stat::Mode;
@@ -1457,6 +1458,7 @@ impl Container {
     }
 
     fn become_userns_root_for_setup() -> Result<()> {
+        Self::set_keepcaps(true)?;
         setresgid(Gid::from_raw(0), Gid::from_raw(0), Gid::from_raw(0)).map_err(|e| {
             NucleusError::NamespaceError(format!(
                 "Failed to become gid 0 inside mapped user namespace: {}",
@@ -1469,7 +1471,74 @@ impl Container {
                 e
             ))
         })?;
+        Self::restore_gvisor_bridge_handoff_capabilities()?;
+        Self::set_keepcaps(false)?;
         debug!("Switched setup process to uid/gid 0 inside mapped user namespace");
+        Ok(())
+    }
+
+    fn set_keepcaps(enabled: bool) -> Result<()> {
+        let value = i32::from(enabled);
+        // SAFETY: PR_SET_KEEPCAPS only toggles the current process' capability
+        // retention behavior across the following uid/gid transition.
+        let rc = unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, value, 0, 0, 0) };
+        if rc != 0 {
+            return Err(NucleusError::CapabilityError(format!(
+                "Failed to set PR_SET_KEEPCAPS={}: {}",
+                value,
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+
+    fn gvisor_bridge_handoff_capabilities() -> CapsHashSet {
+        [
+            Capability::CAP_CHOWN,
+            Capability::CAP_DAC_OVERRIDE,
+            Capability::CAP_DAC_READ_SEARCH,
+            Capability::CAP_FOWNER,
+            Capability::CAP_FSETID,
+            Capability::CAP_SYS_CHROOT,
+            Capability::CAP_SETUID,
+            Capability::CAP_SETGID,
+            Capability::CAP_SYS_ADMIN,
+            Capability::CAP_SETPCAP,
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    fn restore_gvisor_bridge_handoff_capabilities() -> Result<()> {
+        let caps = Self::gvisor_bridge_handoff_capabilities();
+        caps::set(None, CapSet::Permitted, &caps).map_err(|e| {
+            NucleusError::CapabilityError(format!(
+                "Failed to set gVisor bridge handoff permitted capabilities: {}",
+                e
+            ))
+        })?;
+        caps::set(None, CapSet::Inheritable, &caps).map_err(|e| {
+            NucleusError::CapabilityError(format!(
+                "Failed to set gVisor bridge handoff inheritable capabilities: {}",
+                e
+            ))
+        })?;
+        caps::set(None, CapSet::Effective, &caps).map_err(|e| {
+            NucleusError::CapabilityError(format!(
+                "Failed to set gVisor bridge handoff effective capabilities: {}",
+                e
+            ))
+        })?;
+        caps::set(None, CapSet::Ambient, &caps).map_err(|e| {
+            NucleusError::CapabilityError(format!(
+                "Failed to set gVisor bridge handoff ambient capabilities: {}",
+                e
+            ))
+        })?;
+        debug!(
+            ?caps,
+            "Restored gVisor bridge handoff capabilities inside mapped user namespace"
+        );
         Ok(())
     }
 
@@ -2175,6 +2244,55 @@ mod tests {
         assert!(
             userns < request && request < become_root && become_root < netns,
             "rootless gVisor bridge setup must map userns before creating the netns"
+        );
+    }
+
+    #[test]
+    fn test_gvisor_bridge_userns_preserves_caps_for_runsc_exec() {
+        let source = include_str!("runtime.rs");
+        let fn_body = extract_fn_body(source, "fn become_userns_root_for_setup");
+        let keepcaps = fn_body.find("set_keepcaps(true)").unwrap();
+        let setuid = fn_body.find("setresuid").unwrap();
+        let restore = fn_body
+            .find("restore_gvisor_bridge_handoff_capabilities")
+            .unwrap();
+        let clear_keepcaps = fn_body.find("set_keepcaps(false)").unwrap();
+        assert!(
+            keepcaps < setuid && setuid < restore && restore < clear_keepcaps,
+            "gVisor bridge setup must retain capabilities across the uid switch and restore them before execing runsc"
+        );
+    }
+
+    #[test]
+    fn test_gvisor_bridge_handoff_caps_are_bounded_to_runsc_startup() {
+        let caps = Container::gvisor_bridge_handoff_capabilities();
+        for cap in [
+            Capability::CAP_CHOWN,
+            Capability::CAP_DAC_OVERRIDE,
+            Capability::CAP_DAC_READ_SEARCH,
+            Capability::CAP_FOWNER,
+            Capability::CAP_FSETID,
+            Capability::CAP_SYS_CHROOT,
+            Capability::CAP_SETUID,
+            Capability::CAP_SETGID,
+            Capability::CAP_SYS_ADMIN,
+            Capability::CAP_SETPCAP,
+        ] {
+            assert!(
+                caps.contains(&cap),
+                "gVisor bridge handoff caps must include {cap:?}"
+            );
+        }
+        assert_eq!(
+            caps.len(),
+            10,
+            "gVisor bridge handoff caps must stay aligned with the frontend systemd bounding set"
+        );
+        assert!(
+            !caps.contains(&Capability::CAP_NET_ADMIN)
+                && !caps.contains(&Capability::CAP_SYS_PTRACE)
+                && !caps.contains(&Capability::CAP_MKNOD),
+            "gVisor bridge handoff must not grow into broader host-style privilege"
         );
     }
 
