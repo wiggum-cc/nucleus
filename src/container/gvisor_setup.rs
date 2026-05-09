@@ -203,6 +203,12 @@ impl Container {
         // needed by runsc inside the mapped namespace before exec.
         let require_supervisor_exec_policy =
             self.config.service_mode == ServiceMode::Production && !precreated_userns;
+        // Keep runsc on its immutable package path for the pre-created
+        // rootless bridge namespace. gVisor helper processes may drop to
+        // credentials that cannot traverse Nucleus' private runtime directory,
+        // while the Nix store binary is world-executable and validated before
+        // this handoff.
+        let stage_runsc_binary = false;
         gvisor.exec_with_oci_bundle_options(
             &self.config.id,
             &bundle,
@@ -210,7 +216,7 @@ impl Container {
                 network_mode: gvisor_net,
                 ignore_cgroups,
                 runsc_rootless,
-                stage_runsc_binary: precreated_userns,
+                stage_runsc_binary,
                 require_supervisor_exec_policy,
                 platform: self.config.gvisor_platform,
             },

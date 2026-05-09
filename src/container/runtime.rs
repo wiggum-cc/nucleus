@@ -2189,12 +2189,13 @@ mod tests {
     }
 
     #[test]
-    fn test_gvisor_bridge_precreated_userns_stages_runsc_binary() {
+    fn test_gvisor_bridge_precreated_userns_keeps_store_runsc_binary() {
         let source = include_str!("gvisor_setup.rs");
         let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
         assert!(
-            fn_body.contains("stage_runsc_binary: precreated_userns"),
-            "pre-created rootless bridge userns must stage runsc under mapped runtime ownership"
+            fn_body.contains("let stage_runsc_binary = false")
+                && fn_body.contains("stage_runsc_binary,"),
+            "pre-created rootless bridge userns must keep runsc on its validated store path"
         );
     }
 

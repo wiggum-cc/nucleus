@@ -12,7 +12,6 @@ use std::process::Command;
 use tracing::{debug, info, warn};
 
 const NIX_STORE_EXEC_ROOT: &str = "/nix/store";
-const PROCFS_EXEC_ROOT: &str = "/proc";
 const RUNSC_REEXEC_VIA_PROC_SELF_EXE_ENV: &str = "NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE";
 
 /// Network mode for gVisor runtime.
@@ -75,11 +74,10 @@ pub struct GVisorOciRunOptions {
     pub runsc_rootless: bool,
     /// Stage runsc into the per-container runtime directory before exec.
     ///
-    /// This is required after Nucleus has entered a single-ID user namespace:
-    /// immutable store binaries may be owned by host IDs that are unmapped
-    /// there, while a staged copy created inside the namespace is owned by the
-    /// mapped uid 0 and can retain the capabilities runsc's helper handoff
-    /// needs.
+    /// This is for non-store runsc binaries and host-side supervisor execute
+    /// policy isolation. Rootless bridge mode should normally leave runsc on
+    /// its immutable package path so gVisor helpers can re-exec a globally
+    /// traversable binary after they adjust credentials.
     pub stage_runsc_binary: bool,
     /// Fail if the host-side supervisor execute allowlist cannot be installed.
     pub require_supervisor_exec_policy: bool,
@@ -319,8 +317,8 @@ impl GVisorRuntime {
     /// supervisor is not running with host-root privileges, so helpers must run
     /// with caller privileges. This also applies when Nucleus already entered a
     /// mapped user namespace before execing runsc. `stage_runsc_binary` forces
-    /// a private runsc copy when the resolved runsc path's store ownership may
-    /// not be mapped in that namespace.
+    /// a private runsc copy for non-store binaries or host-side supervisor
+    /// execute policy isolation.
     /// `require_supervisor_exec_policy` fail-closes if Nucleus cannot install
     /// the host-side execute allowlist before handing control to runsc.
     pub fn exec_with_oci_bundle_options(
@@ -369,8 +367,11 @@ impl GVisorRuntime {
             .collect();
         let c_args = c_args?;
 
-        let reexec_via_proc_self_exe =
-            !options.require_supervisor_exec_policy && !options.stage_runsc_binary;
+        // Keep gVisor helper re-execs anchored on the concrete runsc path.
+        // /proc/self/exe is blocked by strict host-side execute policies and
+        // private staged paths can be inaccessible after helper credential
+        // changes in rootless bridge mode.
+        let reexec_via_proc_self_exe = false;
         let c_env = self.exec_environment(&runsc_runtime_dir, reexec_via_proc_self_exe)?;
 
         // Install an execute-only Landlock allowlist before handing control to
@@ -509,22 +510,21 @@ impl GVisorRuntime {
         Self::ensure_secure_runsc_dir(&private_dir, "private runsc exec directory")?;
 
         if force_private_stage {
-            // Nix store paths are immutable and already validated as trusted
-            // runsc artifacts, but a single-ID user namespace may not map the
-            // store owner. Staging makes the executable owned by the mapped
-            // uid 0 before runsc forks helper processes.
+            // Force a private copy only when the caller explicitly wants a
+            // per-container executable root. Rootless bridge mode should not
+            // set this: gVisor helpers may re-exec after changing credentials,
+            // and the Nix store path remains easier to traverse safely.
             debug!(
                 source = ?canonical,
                 target_root = ?private_dir,
-                "Staging runsc binary for mapped user namespace"
+                "Staging runsc binary for private supervisor exec root"
             );
         }
 
         // Stage runsc when it is not an immutable Nix store artifact, or when
-        // the caller needs namespace-local file ownership for helper exec.
-        // Keeping the executable under a per-container allowlist also avoids
-        // granting execute over broader host paths when a supervisor policy is
-        // installed.
+        // the caller explicitly requests a private executable root. Keeping the
+        // executable under a per-container allowlist avoids granting execute
+        // over broader host paths when a supervisor policy is installed.
         let stage_dir = Self::create_unique_runsc_stage_dir(&private_dir)?;
         let staged = stage_dir.join("runsc");
         Self::copy_runsc_nofollow(&canonical, &staged)?;
@@ -533,13 +533,9 @@ impl GVisorRuntime {
     }
 
     fn supervisor_exec_allow_roots(program_root: PathBuf) -> Vec<PathBuf> {
-        // gVisor's systrap gofer is spawned by re-execing runsc through
-        // /proc/self/exe. Landlock rules are installed before Nucleus execs
-        // runsc, so an exact /proc/self/exe rule would bind to the Nucleus
-        // executable, not the future runsc image. Allow procfs only for this
-        // trusted host-side supervisor policy; the workload remains isolated
-        // by the OCI rootfs and gVisor sandbox.
-        vec![program_root, PathBuf::from(PROCFS_EXEC_ROOT)]
+        // The patched runsc resolves helper re-execs to its concrete binary
+        // path. Keep the supervisor policy scoped to that executable root.
+        vec![program_root]
     }
 
     fn nix_store_runsc_exec_root(program: &Path) -> Option<PathBuf> {
@@ -1264,9 +1260,8 @@ mod tests {
             "runsc --rootless must not force the host-side supervisor execute policy"
         );
         assert!(
-            fn_body
-                .contains("!options.require_supervisor_exec_policy && !options.stage_runsc_binary"),
-            "privately staged runsc must not request /proc/self/exe helper re-exec"
+            fn_body.contains("let reexec_via_proc_self_exe = false"),
+            "runsc must not request /proc/self/exe helper re-exec"
         );
     }
 
@@ -1311,13 +1306,7 @@ mod tests {
             .unwrap();
 
         assert!(program.starts_with(runsc_root.join("exec-allow")));
-        assert_eq!(
-            allow_roots,
-            vec![
-                runsc_root.join("exec-allow"),
-                PathBuf::from(PROCFS_EXEC_ROOT)
-            ]
-        );
+        assert_eq!(allow_roots, vec![runsc_root.join("exec-allow")]);
         assert_eq!(std::fs::read(&program).unwrap(), b"fake-runsc");
         let mode = std::fs::metadata(&program).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o500);
@@ -1341,20 +1330,10 @@ mod tests {
     }
 
     #[test]
-    fn test_supervisor_exec_allow_roots_include_procfs_for_systrap_reexec() {
+    fn test_supervisor_exec_allow_roots_use_only_runsc_exec_root() {
         let roots = GVisorRuntime::supervisor_exec_allow_roots(PathBuf::from(NIX_STORE_EXEC_ROOT));
 
-        assert_eq!(
-            roots,
-            vec![
-                PathBuf::from(NIX_STORE_EXEC_ROOT),
-                PathBuf::from(PROCFS_EXEC_ROOT)
-            ]
-        );
-        assert!(
-            roots.iter().any(|root| root == Path::new(PROCFS_EXEC_ROOT)),
-            "gVisor systrap gofer re-execs through /proc/self/exe, so the supervisor policy must allow procfs execution"
-        );
+        assert_eq!(roots, vec![PathBuf::from(NIX_STORE_EXEC_ROOT)]);
     }
 
     #[test]
