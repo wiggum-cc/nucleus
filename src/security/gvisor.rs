@@ -12,6 +12,7 @@ use std::process::Command;
 use tracing::{debug, info, warn};
 
 const NIX_STORE_EXEC_ROOT: &str = "/nix/store";
+const RUNSC_DEBUG_DIR_ENV: &str = "NUCLEUS_RUNSC_DEBUG_DIR";
 const RUNSC_REEXEC_VIA_PROC_SELF_EXE_ENV: &str = "NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE";
 const RUNSC_SUPERVISOR_PATH: &str =
     "/run/wrappers/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -350,7 +351,14 @@ impl GVisorRuntime {
         // Build runsc command with OCI bundle.
         // Global flags (--root, --network, --platform) must come BEFORE the subcommand.
         // runsc --root <dir> --network <mode> --platform <plat> run --bundle <path> <id>
-        let mut args = self.build_oci_run_args(container_id, bundle, &runsc_root, options);
+        let debug_dir = Self::runsc_debug_dir()?;
+        let mut args = self.build_oci_run_args(
+            container_id,
+            bundle,
+            &runsc_root,
+            options,
+            debug_dir.as_deref(),
+        );
         args[0] = program_path.to_string_lossy().to_string();
 
         debug!("runsc OCI args: {:?}", args);
@@ -483,6 +491,17 @@ impl GVisorRuntime {
         }
 
         Ok(env)
+    }
+
+    fn runsc_debug_dir() -> Result<Option<PathBuf>> {
+        let Some(raw) = std::env::var_os(RUNSC_DEBUG_DIR_ENV).filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        let path = Self::absolute_path(Path::new(&raw), "runsc debug directory")?;
+        Self::ensure_secure_runsc_dir(&path, "runsc debug directory")?;
+        Ok(Some(path))
     }
 
     fn prepare_supervisor_runsc_program(
@@ -991,6 +1010,7 @@ impl GVisorRuntime {
         bundle: &OciBundle,
         runsc_root: &Path,
         options: GVisorOciRunOptions,
+        debug_dir: Option<&Path>,
     ) -> Vec<String> {
         let mut args = vec![
             self.runsc_path.clone(),
@@ -1004,6 +1024,26 @@ impl GVisorRuntime {
 
         if options.ignore_cgroups {
             args.push("--ignore-cgroups".to_string());
+        }
+
+        if let Some(debug_dir) = debug_dir {
+            let debug_pattern = debug_dir
+                .join("%TIMESTAMP%.%COMMAND%.log")
+                .to_string_lossy()
+                .to_string();
+            let panic_log = debug_dir
+                .join("panic.%TIMESTAMP%.log")
+                .to_string_lossy()
+                .to_string();
+            args.extend([
+                "--debug".to_string(),
+                "--alsologtostderr".to_string(),
+                "--debug-to-user-log".to_string(),
+                "--debug-log".to_string(),
+                debug_pattern,
+                "--panic-log".to_string(),
+                panic_log,
+            ]);
         }
 
         args.extend([
@@ -1239,6 +1279,7 @@ mod tests {
                 require_supervisor_exec_policy: false,
                 platform: GVisorPlatform::Systrap,
             },
+            None,
         );
 
         assert!(args.iter().any(|arg| arg == "--rootless"));
@@ -1290,10 +1331,49 @@ mod tests {
                 require_supervisor_exec_policy: false,
                 platform: GVisorPlatform::Systrap,
             },
+            None,
         );
 
         assert!(!args.iter().any(|arg| arg == "--rootless"));
         assert!(args.iter().any(|arg| arg == "--ignore-cgroups"));
+    }
+
+    #[test]
+    fn test_runsc_debug_dir_adds_debug_flags_before_subcommand() {
+        let rt = GVisorRuntime::with_path("/nix/store/fake-runsc/bin/runsc".to_string());
+        let tmp = tempfile::tempdir().unwrap();
+        let debug_dir = tmp.path().join("runsc-debug");
+        let bundle = OciBundle::new(
+            tmp.path().join("bundle"),
+            OciConfig::new(vec!["/bin/true".to_string()], None),
+        );
+
+        let args = rt.build_oci_run_args(
+            "container-id",
+            &bundle,
+            tmp.path(),
+            GVisorOciRunOptions {
+                network_mode: GVisorNetworkMode::Host,
+                ignore_cgroups: true,
+                runsc_rootless: true,
+                stage_runsc_binary: false,
+                require_supervisor_exec_policy: false,
+                platform: GVisorPlatform::Ptrace,
+            },
+            Some(&debug_dir),
+        );
+
+        let run_index = args.iter().position(|arg| arg == "run").unwrap();
+        let debug_index = args.iter().position(|arg| arg == "--debug").unwrap();
+        assert!(
+            debug_index < run_index,
+            "runsc debug flags must be top-level flags before the subcommand"
+        );
+        assert!(args.iter().any(|arg| arg == "--alsologtostderr"));
+        assert!(args.iter().any(|arg| arg == "--debug-to-user-log"));
+        assert!(args.iter().any(|arg| arg == "--debug-log"));
+        assert!(args.iter().any(|arg| arg.contains("%COMMAND%.log")));
+        assert!(args.iter().any(|arg| arg.contains("panic.%TIMESTAMP%.log")));
     }
 
     #[test]
