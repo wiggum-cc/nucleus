@@ -200,12 +200,11 @@ impl Container {
 
         let rootless_gvisor = self.config.user_ns_config.is_some();
         let ignore_cgroups = rootless_gvisor;
-        // Nucleus already entered a mapped user namespace and restored the
-        // small capability set runsc needs for the supervisor handoff. Still
-        // tell runsc this is a rootless launch so its supervisor/gofer handoff
-        // keeps the caller's mapped privileges instead of treating uid 0 in
-        // the namespace as host root.
-        let runsc_rootless = precreated_userns;
+        // Tell runsc whenever the launch is rootless. Pre-created bridge
+        // namespaces need this so helper handoff keeps mapped privileges; OCI
+        // user namespace launches need it because runsc itself starts as the
+        // non-root service user.
+        let runsc_rootless = rootless_gvisor;
         let platform =
             if rootless_gvisor && matches!(self.config.gvisor_platform, GVisorPlatform::Systrap) {
                 info!("Using gVisor ptrace platform for rootless user namespace");
