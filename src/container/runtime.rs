@@ -1483,6 +1483,7 @@ impl Container {
             Capability::CAP_FOWNER,
             Capability::CAP_FSETID,
             Capability::CAP_SYS_CHROOT,
+            Capability::CAP_SYS_PTRACE,
             Capability::CAP_SETUID,
             Capability::CAP_SETGID,
             Capability::CAP_SYS_ADMIN,
@@ -2281,6 +2282,7 @@ mod tests {
             Capability::CAP_FOWNER,
             Capability::CAP_FSETID,
             Capability::CAP_SYS_CHROOT,
+            Capability::CAP_SYS_PTRACE,
             Capability::CAP_SETUID,
             Capability::CAP_SETGID,
             Capability::CAP_SYS_ADMIN,
@@ -2293,13 +2295,11 @@ mod tests {
         }
         assert_eq!(
             caps.len(),
-            10,
+            11,
             "gVisor bridge handoff caps must stay aligned with the frontend systemd bounding set"
         );
         assert!(
-            !caps.contains(&Capability::CAP_NET_ADMIN)
-                && !caps.contains(&Capability::CAP_SYS_PTRACE)
-                && !caps.contains(&Capability::CAP_MKNOD),
+            !caps.contains(&Capability::CAP_NET_ADMIN) && !caps.contains(&Capability::CAP_MKNOD),
             "gVisor bridge handoff must not grow into broader host-style privilege"
         );
     }
