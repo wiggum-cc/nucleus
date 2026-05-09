@@ -34,26 +34,39 @@
           baseRootfs = pkgs.buildEnv {
             inherit name;
             paths = [ pkgs.coreutils pkgs.bashInteractive ] ++ packages;
-            pathsToLink = [ "/bin" "/sbin" "/lib" "/lib64" "/usr" "/etc" "/nix" ];
+            pathsToLink = [ "/bin" "/sbin" "/lib" "/lib64" "/usr" "/etc" ];
+          };
+          closure = pkgs.closureInfo {
+            rootPaths = [ baseRootfs ];
           };
         in
         pkgs.runCommand name {
           nativeBuildInputs = [ pkgs.coreutils pkgs.findutils ];
         } ''
           mkdir -p "$out"
-          for path in bin sbin lib lib64 usr etc nix; do
+          for path in bin sbin lib lib64 usr etc; do
             if [ -e "${baseRootfs}/$path" ]; then
-              if [ "$path" = etc ]; then
-                mkdir -p "$out/etc"
-                find "${baseRootfs}/etc" -mindepth 1 -maxdepth 1 -exec ln -s '{}' "$out/etc/" \;
-              else
-                ln -s "${baseRootfs}/$path" "$out/$path"
-              fi
+              mkdir -p "$out/$path"
+              cp -a -P "${baseRootfs}/$path/." "$out/$path/"
             fi
           done
           mkdir -p "$out/etc"
           rm -f "$out/etc/resolv.conf"
           : > "$out/etc/resolv.conf"
+
+          mkdir -p "$out/nix/store"
+          store_paths="$out/.nucleus-rootfs-store-paths"
+          : > "$store_paths"
+          while IFS= read -r store_path; do
+            case "$store_path" in
+              /nix/store/*)
+                basename="$(basename "$store_path")"
+                mkdir -p "$out/nix/store/$basename"
+                printf '%s\n' "$store_path" >> "$store_paths"
+                ;;
+            esac
+          done < "${closure}/store-paths"
+          sort -u -o "$store_paths" "$store_paths"
 
           manifest="$out/.nucleus-rootfs-sha256"
           find -L "$out" -type f ! -name ".nucleus-rootfs-sha256" -printf '%P\0' \

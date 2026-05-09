@@ -8,6 +8,7 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 
 pub const ROOTFS_ATTESTATION_FILE: &str = ".nucleus-rootfs-sha256";
+pub const ROOTFS_STORE_PATHS_FILE: &str = ".nucleus-rootfs-store-paths";
 
 pub type DirectoryManifest = BTreeMap<String, String>;
 

@@ -108,7 +108,7 @@ impl Container {
             if self.config.verify_rootfs_attestation {
                 verify_rootfs_attestation(&rootfs_path)?;
             }
-            oci_config = oci_config.with_rootfs_binds(&rootfs_path);
+            oci_config = oci_config.with_rootfs_binds(&rootfs_path)?;
         } else {
             oci_config = oci_config.with_host_runtime_binds();
         }

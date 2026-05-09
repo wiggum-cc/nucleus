@@ -1,6 +1,8 @@
 use crate::container::OciStatus;
 use crate::error::{NucleusError, Result};
-use crate::filesystem::{normalize_container_destination, normalize_volume_destination};
+use crate::filesystem::{
+    normalize_container_destination, normalize_volume_destination, ROOTFS_STORE_PATHS_FILE,
+};
 use crate::isolation::{IdMapping, NamespaceConfig, UserNamespaceConfig};
 use crate::resources::ResourceLimits;
 use serde::{Deserialize, Serialize};
@@ -1120,25 +1122,96 @@ impl OciConfig {
     }
 
     /// Add rootfs bind mounts from a pre-built rootfs path.
-    pub fn with_rootfs_binds(mut self, rootfs_path: &std::path::Path) -> Self {
+    pub fn with_rootfs_binds(mut self, rootfs_path: &std::path::Path) -> Result<Self> {
         let subdirs = ["bin", "sbin", "lib", "lib64", "usr", "etc", "nix"];
         for subdir in &subdirs {
             let source = rootfs_path.join(subdir);
             if source.exists() {
-                self.mounts.push(OciMount {
-                    destination: format!("/{}", subdir),
-                    source: source.to_string_lossy().to_string(),
-                    mount_type: "bind".to_string(),
-                    options: vec![
-                        "bind".to_string(),
-                        "ro".to_string(),
-                        "nosuid".to_string(),
-                        "nodev".to_string(),
-                    ],
-                });
+                let source = fs::canonicalize(&source).map_err(|e| {
+                    NucleusError::FilesystemError(format!(
+                        "Failed to canonicalize rootfs mount source {:?}: {}",
+                        source, e
+                    ))
+                })?;
+                self.mounts
+                    .push(Self::readonly_bind_mount(format!("/{}", subdir), source));
             }
         }
-        self
+        self.add_rootfs_store_path_binds(rootfs_path)?;
+        Ok(self)
+    }
+
+    fn readonly_bind_mount(destination: String, source: PathBuf) -> OciMount {
+        OciMount {
+            destination,
+            source: source.to_string_lossy().to_string(),
+            mount_type: "bind".to_string(),
+            options: vec![
+                "bind".to_string(),
+                "ro".to_string(),
+                "nosuid".to_string(),
+                "nodev".to_string(),
+            ],
+        }
+    }
+
+    fn add_rootfs_store_path_binds(&mut self, rootfs_path: &Path) -> Result<()> {
+        let store_paths_file = rootfs_path.join(ROOTFS_STORE_PATHS_FILE);
+        if !store_paths_file.exists() {
+            return Ok(());
+        }
+
+        let content = fs::read_to_string(&store_paths_file).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to read rootfs store paths {:?}: {}",
+                store_paths_file, e
+            ))
+        })?;
+
+        for (line_no, line) in content.lines().enumerate() {
+            let source = line.trim();
+            if source.is_empty() {
+                continue;
+            }
+            let source = Path::new(source);
+            if !source.starts_with("/nix/store") {
+                return Err(NucleusError::FilesystemError(format!(
+                    "Invalid rootfs store path on line {} in {:?}: {}",
+                    line_no + 1,
+                    store_paths_file,
+                    source.display()
+                )));
+            }
+            let store_name = source.file_name().ok_or_else(|| {
+                NucleusError::FilesystemError(format!(
+                    "Invalid rootfs store path on line {} in {:?}: {}",
+                    line_no + 1,
+                    store_paths_file,
+                    source.display()
+                ))
+            })?;
+            let canonical = fs::canonicalize(source).map_err(|e| {
+                NucleusError::FilesystemError(format!(
+                    "Failed to canonicalize rootfs store path {:?}: {}",
+                    source, e
+                ))
+            })?;
+            if !canonical.starts_with("/nix/store") {
+                return Err(NucleusError::FilesystemError(format!(
+                    "Rootfs store path escapes /nix/store: {} -> {}",
+                    source.display(),
+                    canonical.display()
+                )));
+            }
+            let destination = Path::new("/nix/store")
+                .join(store_name)
+                .to_string_lossy()
+                .to_string();
+            self.mounts
+                .push(Self::readonly_bind_mount(destination, canonical));
+        }
+
+        Ok(())
     }
 
     /// Replace the default namespace list with an explicit configuration.
@@ -1604,6 +1677,62 @@ mod tests {
         let resources = linux.resources.unwrap();
         assert!(resources.memory.is_some());
         assert!(resources.cpu.is_some());
+    }
+
+    #[test]
+    fn test_rootfs_binds_canonicalize_top_level_sources() {
+        let temp_dir = TempDir::new().unwrap();
+        let rootfs = temp_dir.path().join("rootfs");
+        let real_bin = temp_dir.path().join("real-bin");
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::create_dir_all(&real_bin).unwrap();
+        symlink(&real_bin, rootfs.join("bin")).unwrap();
+
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None)
+            .with_rootfs_binds(&rootfs)
+            .unwrap();
+        let bin_mount = config
+            .mounts
+            .iter()
+            .find(|mount| mount.destination == "/bin")
+            .unwrap();
+
+        assert_eq!(bin_mount.source, real_bin.to_string_lossy());
+    }
+
+    #[test]
+    fn test_rootfs_binds_mount_declared_nix_store_closure_paths() {
+        let Some(store_path) = fs::read_dir("/nix/store").ok().and_then(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|path| path.is_dir())
+        }) else {
+            return;
+        };
+        let temp_dir = TempDir::new().unwrap();
+        let rootfs = temp_dir.path().join("rootfs");
+        fs::create_dir_all(rootfs.join("nix/store")).unwrap();
+        fs::write(
+            rootfs.join(ROOTFS_STORE_PATHS_FILE),
+            format!("{}\n", store_path.display()),
+        )
+        .unwrap();
+
+        let config = OciConfig::new(vec!["/bin/sh".to_string()], None)
+            .with_rootfs_binds(&rootfs)
+            .unwrap();
+        let store_name = store_path.file_name().unwrap();
+        let destination = Path::new("/nix/store")
+            .join(store_name)
+            .to_string_lossy()
+            .to_string();
+
+        assert!(config
+            .mounts
+            .iter()
+            .any(|mount| mount.destination == destination
+                && mount.source == fs::canonicalize(&store_path).unwrap().to_string_lossy()));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use super::attestation::ROOTFS_STORE_PATHS_FILE;
 use crate::error::{NucleusError, Result};
 use nix::fcntl::{open, OFlag};
 use nix::mount::{mount, MsFlags};
@@ -431,6 +432,12 @@ pub fn bind_mount_rootfs(root: &Path, rootfs_path: &Path) -> Result<()> {
             debug!("Rootfs subdir {} not present, skipping", subdir);
             continue;
         }
+        let source = std::fs::canonicalize(&source).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to canonicalize rootfs mount source {:?}: {}",
+                source, e
+            ))
+        })?;
 
         let target = root.join(subdir);
         std::fs::create_dir_all(&target).map_err(|e| {
@@ -475,6 +482,101 @@ pub fn bind_mount_rootfs(root: &Path, rootfs_path: &Path) -> Result<()> {
         })?;
 
         info!("Mounted rootfs/{} read-only", subdir);
+    }
+
+    bind_mount_rootfs_store_paths(root, rootfs_path)?;
+
+    Ok(())
+}
+
+fn bind_mount_rootfs_store_paths(root: &Path, rootfs_path: &Path) -> Result<()> {
+    let store_paths_file = rootfs_path.join(ROOTFS_STORE_PATHS_FILE);
+    if !store_paths_file.exists() {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&store_paths_file).map_err(|e| {
+        NucleusError::FilesystemError(format!(
+            "Failed to read rootfs store paths {:?}: {}",
+            store_paths_file, e
+        ))
+    })?;
+
+    for (line_no, line) in content.lines().enumerate() {
+        let source = line.trim();
+        if source.is_empty() {
+            continue;
+        }
+        let source = Path::new(source);
+        if !source.starts_with("/nix/store") {
+            return Err(NucleusError::FilesystemError(format!(
+                "Invalid rootfs store path on line {} in {:?}: {}",
+                line_no + 1,
+                store_paths_file,
+                source.display()
+            )));
+        }
+        let store_name = source.file_name().ok_or_else(|| {
+            NucleusError::FilesystemError(format!(
+                "Invalid rootfs store path on line {} in {:?}: {}",
+                line_no + 1,
+                store_paths_file,
+                source.display()
+            ))
+        })?;
+        let source = std::fs::canonicalize(source).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to canonicalize rootfs store path {:?}: {}",
+                source, e
+            ))
+        })?;
+        if !source.starts_with("/nix/store") {
+            return Err(NucleusError::FilesystemError(format!(
+                "Rootfs store path escapes /nix/store: {}",
+                source.display()
+            )));
+        }
+
+        let target = root.join("nix/store").join(store_name);
+        std::fs::create_dir_all(&target).map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to create rootfs store mount point {:?}: {}",
+                target, e
+            ))
+        })?;
+
+        mount(
+            Some(&source),
+            &target,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to bind mount rootfs store path {:?} -> {:?}: {}",
+                source, target, e
+            ))
+        })?;
+
+        mount(
+            None::<&str>,
+            &target,
+            None::<&str>,
+            MsFlags::MS_REMOUNT
+                | MsFlags::MS_BIND
+                | MsFlags::MS_RDONLY
+                | MsFlags::MS_REC
+                | MsFlags::MS_NOSUID
+                | MsFlags::MS_NODEV,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            NucleusError::FilesystemError(format!(
+                "Failed to remount rootfs store path {:?} read-only: {}",
+                target, e
+            ))
+        })?;
     }
 
     Ok(())
