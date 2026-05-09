@@ -2191,16 +2191,17 @@ mod tests {
     }
 
     #[test]
-    fn test_gvisor_rootless_uses_ptrace_for_default_systrap() {
+    fn test_gvisor_rootless_preserves_configured_platform() {
         let source = include_str!("gvisor_setup.rs");
         let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
         assert!(
-            fn_body.contains("rootless_gvisor")
-                && fn_body
-                    .contains("matches!(self.config.gvisor_platform, GVisorPlatform::Systrap)")
-                && fn_body.contains("GVisorPlatform::Ptrace")
+            fn_body.contains("let platform = self.config.gvisor_platform;")
                 && fn_body.contains("platform,"),
-            "rootless gVisor must avoid systrap sandbox startup"
+            "rootless gVisor must preserve the configured runsc platform"
+        );
+        assert!(
+            !fn_body.contains("GVisorPlatform::Ptrace"),
+            "rootless gVisor must not silently rewrite systrap to ptrace"
         );
     }
 

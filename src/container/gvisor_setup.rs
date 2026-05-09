@@ -6,8 +6,8 @@ use crate::filesystem::{
 };
 use crate::network::{BridgeNetwork, NetworkMode};
 use crate::security::{
-    load_json_policy, GVisorNetworkMode, GVisorOciRunOptions, GVisorPlatform, GVisorRuntime,
-    OciBundle, OciConfig, OciMount, OciSeccomp,
+    load_json_policy, GVisorNetworkMode, GVisorOciRunOptions, GVisorRuntime, OciBundle, OciConfig,
+    OciMount, OciSeccomp,
 };
 use nix::unistd::Uid;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -205,13 +205,7 @@ impl Container {
         // user namespace launches need it because runsc itself starts as the
         // non-root service user.
         let runsc_rootless = rootless_gvisor;
-        let platform =
-            if rootless_gvisor && matches!(self.config.gvisor_platform, GVisorPlatform::Systrap) {
-                info!("Using gVisor ptrace platform for rootless user namespace");
-                GVisorPlatform::Ptrace
-            } else {
-                self.config.gvisor_platform
-            };
+        let platform = self.config.gvisor_platform;
         // Rootless gVisor supervisor handoffs cannot reliably install a
         // host-side Landlock execute allowlist after namespace setup. Keep
         // that policy for rootful production gVisor only; rootless workloads
