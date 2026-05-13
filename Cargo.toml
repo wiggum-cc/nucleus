@@ -1,8 +1,8 @@
 [package]
 name = "nucleus-container"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.93"
 description = "Extremely lightweight Docker alternative for agents and production services — isolated execution using cgroups, namespaces, seccomp, Landlock, and gVisor"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/wiggum-cc/nucleus"
@@ -58,18 +58,18 @@ seccompiler = "0.5"
 landlock = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-dirs = "5"
+dirs = "6"
 tempfile = "3"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 hex = "0.4"
-toml = "0.8"
+toml = "1.1"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [dev-dependencies]
 proptest = "1"
 tla-connect = "0.0.4"
 itf = "0.4"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "context_populator"
