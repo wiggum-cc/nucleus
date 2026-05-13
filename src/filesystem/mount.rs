@@ -1,4 +1,4 @@
-use super::attestation::ROOTFS_STORE_PATHS_FILE;
+use super::attestation::{is_immediate_nix_store_object_path, ROOTFS_STORE_PATHS_FILE};
 use crate::error::{NucleusError, Result};
 use nix::fcntl::{open, OFlag};
 use nix::mount::{mount, MsFlags};
@@ -508,9 +508,9 @@ fn bind_mount_rootfs_store_paths(root: &Path, rootfs_path: &Path) -> Result<()> 
             continue;
         }
         let source = Path::new(source);
-        if !source.starts_with("/nix/store") {
+        if !is_immediate_nix_store_object_path(source) {
             return Err(NucleusError::FilesystemError(format!(
-                "Invalid rootfs store path on line {} in {:?}: {}",
+                "Invalid rootfs store path on line {} in {:?}: {} (expected immediate /nix/store/<32-char-hash>-<name> object)",
                 line_no + 1,
                 store_paths_file,
                 source.display()
@@ -530,9 +530,9 @@ fn bind_mount_rootfs_store_paths(root: &Path, rootfs_path: &Path) -> Result<()> 
                 source, e
             ))
         })?;
-        if !source.starts_with("/nix/store") {
+        if !is_immediate_nix_store_object_path(&source) {
             return Err(NucleusError::FilesystemError(format!(
-                "Rootfs store path escapes /nix/store: {}",
+                "Rootfs store path must resolve to an immediate /nix/store/<32-char-hash>-<name> object: {}",
                 source.display()
             )));
         }
@@ -1815,6 +1815,44 @@ mod tests {
             validate_rootfs_path_under_store(&store.join("rootfs-link"), &store).unwrap();
 
         assert_eq!(canonical, std::fs::canonicalize(rootfs).unwrap());
+    }
+
+    #[test]
+    fn test_rootfs_store_path_binds_reject_store_root_before_mounting() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let container_root = temp.path().join("container-root");
+        let rootfs = temp.path().join("rootfs");
+        std::fs::create_dir_all(&container_root).unwrap();
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::write(rootfs.join(ROOTFS_STORE_PATHS_FILE), "/nix/store\n").unwrap();
+
+        let err = bind_mount_rootfs_store_paths(&container_root, &rootfs).unwrap_err();
+
+        assert!(
+            err.to_string().contains("expected immediate"),
+            "expected immediate-store-object rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rootfs_store_path_binds_reject_store_subpath_before_mounting() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let container_root = temp.path().join("container-root");
+        let rootfs = temp.path().join("rootfs");
+        std::fs::create_dir_all(&container_root).unwrap();
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::write(
+            rootfs.join(ROOTFS_STORE_PATHS_FILE),
+            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-hello/bin\n",
+        )
+        .unwrap();
+
+        let err = bind_mount_rootfs_store_paths(&container_root, &rootfs).unwrap_err();
+
+        assert!(
+            err.to_string().contains("expected immediate"),
+            "expected immediate-store-object rejection, got: {err}"
+        );
     }
 
     #[test]

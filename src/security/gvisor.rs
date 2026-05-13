@@ -68,12 +68,11 @@ pub struct GVisorOciRunOptions {
     pub network_mode: GVisorNetworkMode,
     /// Skip runsc's cgroup setup when Nucleus manages cgroups externally.
     pub ignore_cgroups: bool,
-    /// Tell runsc to use its own rootless launcher.
+    /// Tell runsc to use its rootless launcher and helper handoff semantics.
     ///
-    /// Do not set this when Nucleus has already entered a mapped user
-    /// namespace and is uid 0 there. That path runs runsc as a regular
-    /// supervisor inside the mapped namespace, with only the capability set
-    /// needed for startup restored before exec.
+    /// This is independent from `require_supervisor_exec_policy`: production
+    /// callers decide separately whether the host-side execute allowlist is
+    /// compatible with the selected handoff path.
     pub runsc_rootless: bool,
     /// Stage runsc into the per-container runtime directory before exec.
     ///
@@ -316,11 +315,11 @@ impl GVisorRuntime {
     ///
     /// `ignore_cgroups` skips runsc's internal cgroup configuration because
     /// Nucleus already manages cgroups externally and unprivileged callers
-    /// cannot configure them directly. `runsc_rootless` tells runsc to use its
-    /// own rootless launcher; Nucleus' pre-created mapped namespace path should
-    /// leave it false because runsc already starts as uid 0 inside that
-    /// namespace. `stage_runsc_binary` forces a private runsc copy for
-    /// non-store binaries or host-side supervisor execute policy isolation.
+    /// cannot configure them directly. `runsc_rootless` tells runsc that its
+    /// supervisor is not running with host-root privileges, so helpers must
+    /// keep caller privileges during handoff. `stage_runsc_binary` forces a
+    /// private runsc copy for non-store binaries or host-side supervisor
+    /// execute policy isolation.
     /// `require_supervisor_exec_policy` fail-closes if Nucleus cannot install
     /// the host-side execute allowlist before handing control to runsc.
     pub fn exec_with_oci_bundle_options(
@@ -388,10 +387,9 @@ impl GVisorRuntime {
 
         // Install an execute-only Landlock allowlist before handing control to
         // runsc when the caller requested a fail-closed supervisor policy.
-        // Nucleus' pre-created bridge namespace cannot tolerate this
-        // host-side policy during runsc's supervisor/gofer handoff, so
-        // rootless flag selection is intentionally independent from policy
-        // selection.
+        // Rootless runsc flag selection remains independent from policy
+        // selection; production callers request this policy explicitly except
+        // for the pre-created bridge userns handoff.
         if options.require_supervisor_exec_policy {
             self.apply_supervisor_exec_policy(
                 &exec_allow_roots,

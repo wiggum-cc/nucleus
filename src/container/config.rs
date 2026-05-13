@@ -92,8 +92,8 @@ pub enum ServiceMode {
     #[default]
     Agent,
     /// Long-running production service. Enforces strict security invariants:
-    /// - Forbids degraded security, chroot fallback, and native host networking
-    /// - Requires explicit host-network opt-in for gVisor host networking
+    /// - Forbids degraded security, chroot fallback, and host network modes
+    ///   (production egress policy enforcement requires an isolated network namespace)
     /// - Requires cgroup resource limits
     /// - Requires pivot_root (no chroot fallback)
     /// - Requires explicit rootfs path (no host bind mounts)
@@ -805,32 +805,24 @@ impl ContainerConfig {
             ));
         }
 
-        let host_network = matches!(self.network, crate::network::NetworkMode::Host);
-        let gvisor_host_network = matches!(self.network, crate::network::NetworkMode::GVisorHost);
-
-        if self.allow_host_network && !gvisor_host_network {
-            return Err(crate::error::NucleusError::ConfigError(
-                "Production mode only allows --allow-host-network with --network gvisor-host"
-                    .to_string(),
-            ));
-        }
+        let host_network = matches!(
+            self.network,
+            crate::network::NetworkMode::Host | crate::network::NetworkMode::GVisorHost
+        );
 
         if host_network {
             return Err(crate::error::NucleusError::ConfigError(
-                "Production mode forbids native host network mode; use --network gvisor-host with --runtime gvisor and --allow-host-network"
+                "Production mode forbids host network modes because egress policy \
+                 enforcement requires an isolated network namespace"
                     .to_string(),
             ));
         }
 
-        if gvisor_host_network && !self.use_gvisor {
+        if self.allow_host_network {
             return Err(crate::error::NucleusError::ConfigError(
-                "Production gVisor host network mode requires --runtime gvisor".to_string(),
-            ));
-        }
-
-        if gvisor_host_network && !self.allow_host_network {
-            return Err(crate::error::NucleusError::ConfigError(
-                "Production gVisor host network mode requires --allow-host-network".to_string(),
+                "Production mode forbids --allow-host-network because host networking bypasses \
+                 egress policy enforcement"
+                    .to_string(),
             ));
         }
 
@@ -1255,17 +1247,13 @@ mod tests {
     }
 
     #[test]
-    fn test_production_mode_allows_explicit_gvisor_host_network() {
-        let rootfs = test_rootfs_path();
-        if !rootfs.is_dir() {
-            return;
-        }
+    fn test_production_mode_rejects_explicit_gvisor_host_network() {
         let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
             .with_service_mode(ServiceMode::Production)
             .with_network(NetworkMode::GVisorHost)
             .with_allow_host_network(true)
-            .with_rootfs_path(rootfs.clone())
+            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
             .with_verify_rootfs_attestation(true)
             .with_limits(
                 crate::resources::ResourceLimits::default()
@@ -1275,22 +1263,41 @@ mod tests {
                     .unwrap(),
             );
 
-        assert!(cfg.validate_production_mode().is_ok());
+        let err = cfg.validate_production_mode().unwrap_err();
+        assert!(err.to_string().contains("egress policy enforcement"));
+    }
+
+    #[test]
+    fn test_production_mode_rejects_gvisor_host_network_with_egress_policy() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_service_mode(ServiceMode::Production)
+            .with_network(NetworkMode::GVisorHost)
+            .with_allow_host_network(true)
+            .with_egress_policy(crate::network::EgressPolicy::deny_all())
+            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
+            .with_verify_rootfs_attestation(true)
+            .with_limits(
+                crate::resources::ResourceLimits::default()
+                    .with_memory("512M")
+                    .unwrap()
+                    .with_cpu_cores(2.0)
+                    .unwrap(),
+            );
+
+        let err = cfg.validate_production_mode().unwrap_err();
+        assert!(err.to_string().contains("egress policy enforcement"));
     }
 
     #[test]
     fn test_production_mode_rejects_native_host_network() {
-        let rootfs = test_rootfs_path();
-        if !rootfs.is_dir() {
-            return;
-        }
         let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
             .with_gvisor(false)
             .with_service_mode(ServiceMode::Production)
             .with_network(NetworkMode::Host)
             .with_allow_host_network(true)
-            .with_rootfs_path(rootfs.clone())
+            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
             .with_verify_rootfs_attestation(true)
             .with_limits(
                 crate::resources::ResourceLimits::default()
@@ -1301,22 +1308,17 @@ mod tests {
             );
 
         let err = cfg.validate_production_mode().unwrap_err();
-        assert!(err.to_string().contains("gvisor-host"));
+        assert!(err.to_string().contains("host network"));
     }
 
     #[test]
-    fn test_production_mode_rejects_gvisor_host_without_gvisor_runtime() {
-        let rootfs = test_rootfs_path();
-        if !rootfs.is_dir() {
-            return;
-        }
+    fn test_production_mode_rejects_gvisor_host_without_explicit_opt_in() {
         let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
             .with_gvisor(false)
             .with_service_mode(ServiceMode::Production)
             .with_network(NetworkMode::GVisorHost)
-            .with_allow_host_network(true)
-            .with_rootfs_path(rootfs.clone())
+            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
             .with_verify_rootfs_attestation(true)
             .with_limits(
                 crate::resources::ResourceLimits::default()
@@ -1327,7 +1329,7 @@ mod tests {
             );
 
         let err = cfg.validate_production_mode().unwrap_err();
-        assert!(err.to_string().contains("--runtime gvisor"));
+        assert!(err.to_string().contains("host network"));
     }
 
     #[test]

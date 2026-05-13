@@ -15,6 +15,13 @@ use tracing::info;
 
 use super::{config::ServiceMode, runtime::Container};
 
+fn require_gvisor_supervisor_exec_policy(
+    service_mode: ServiceMode,
+    precreated_userns: bool,
+) -> bool {
+    service_mode == ServiceMode::Production && !precreated_userns
+}
+
 impl Container {
     /// Set up container with gVisor and exec.
     pub(super) fn setup_and_exec_gvisor(&self, precreated_userns: bool) -> Result<()> {
@@ -216,13 +223,12 @@ impl Container {
         // non-root service user.
         let runsc_rootless = rootless_gvisor;
         let platform = self.config.gvisor_platform;
-        // Rootless gVisor supervisor handoffs cannot reliably install a
-        // host-side Landlock execute allowlist after namespace setup. Keep
-        // that policy for rootful production gVisor only; rootless workloads
-        // still execute inside the gVisor sandbox boundary.
-        let require_supervisor_exec_policy = self.config.service_mode == ServiceMode::Production
-            && !precreated_userns
-            && !rootless_gvisor;
+        // Production gVisor launches fail closed under the host-side
+        // supervisor execute policy except for the pre-created bridge userns
+        // handoff. Do not key this off user_ns_config: root-run production
+        // auto-enables root_remapped() and still needs the policy.
+        let require_supervisor_exec_policy =
+            require_gvisor_supervisor_exec_policy(self.config.service_mode, precreated_userns);
         // Keep runsc on its immutable package path. gVisor helper processes may
         // drop to credentials that cannot traverse Nucleus' private runtime
         // directory, while the Nix store binary is world-executable and
@@ -558,6 +564,33 @@ impl Container {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_root_remapped_production_gvisor_requires_supervisor_exec_policy() {
+        let user_ns_config = crate::isolation::UserNamespaceConfig::root_remapped();
+
+        assert!(!user_ns_config.uid_mappings.is_empty());
+        assert!(require_gvisor_supervisor_exec_policy(
+            ServiceMode::Production,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_precreated_gvisor_bridge_userns_skips_supervisor_exec_policy() {
+        assert!(!require_gvisor_supervisor_exec_policy(
+            ServiceMode::Production,
+            true
+        ));
+    }
+
+    #[test]
+    fn test_non_production_gvisor_does_not_require_supervisor_exec_policy() {
+        assert!(!require_gvisor_supervisor_exec_policy(
+            ServiceMode::Agent,
+            false
+        ));
+    }
 
     #[test]
     fn test_ensure_secure_gvisor_artifact_dir_sets_owner_only_permissions() {

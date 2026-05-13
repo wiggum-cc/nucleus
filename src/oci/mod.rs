@@ -1,7 +1,8 @@
 use crate::container::OciStatus;
 use crate::error::{NucleusError, Result};
 use crate::filesystem::{
-    normalize_container_destination, normalize_volume_destination, ROOTFS_STORE_PATHS_FILE,
+    is_immediate_nix_store_object_path, normalize_container_destination,
+    normalize_volume_destination, ROOTFS_STORE_PATHS_FILE,
 };
 use crate::isolation::{IdMapping, NamespaceConfig, UserNamespaceConfig};
 use crate::resources::ResourceLimits;
@@ -1174,9 +1175,9 @@ impl OciConfig {
                 continue;
             }
             let source = Path::new(source);
-            if !source.starts_with("/nix/store") {
+            if !is_immediate_nix_store_object_path(source) {
                 return Err(NucleusError::FilesystemError(format!(
-                    "Invalid rootfs store path on line {} in {:?}: {}",
+                    "Invalid rootfs store path on line {} in {:?}: {} (expected immediate /nix/store/<32-char-hash>-<name> object)",
                     line_no + 1,
                     store_paths_file,
                     source.display()
@@ -1196,9 +1197,9 @@ impl OciConfig {
                     source, e
                 ))
             })?;
-            if !canonical.starts_with("/nix/store") {
+            if !is_immediate_nix_store_object_path(&canonical) {
                 return Err(NucleusError::FilesystemError(format!(
-                    "Rootfs store path escapes /nix/store: {} -> {}",
+                    "Rootfs store path must resolve to an immediate /nix/store/<32-char-hash>-<name> object: {} -> {}",
                     source.display(),
                     canonical.display()
                 )));
@@ -1706,7 +1707,7 @@ mod tests {
             entries
                 .flatten()
                 .map(|entry| entry.path())
-                .find(|path| path.is_dir())
+                .find(|path| path.is_dir() && is_immediate_nix_store_object_path(path))
         }) else {
             return;
         };
@@ -1733,6 +1734,44 @@ mod tests {
             .iter()
             .any(|mount| mount.destination == destination
                 && mount.source == fs::canonicalize(&store_path).unwrap().to_string_lossy()));
+    }
+
+    #[test]
+    fn test_rootfs_binds_reject_store_root_manifest_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let rootfs = temp_dir.path().join("rootfs");
+        fs::create_dir_all(rootfs.join("nix/store")).unwrap();
+        fs::write(rootfs.join(ROOTFS_STORE_PATHS_FILE), "/nix/store\n").unwrap();
+
+        let err = OciConfig::new(vec!["/bin/sh".to_string()], None)
+            .with_rootfs_binds(&rootfs)
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("expected immediate"),
+            "expected immediate-store-object rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rootfs_binds_reject_store_subpath_manifest_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let rootfs = temp_dir.path().join("rootfs");
+        fs::create_dir_all(rootfs.join("nix/store")).unwrap();
+        fs::write(
+            rootfs.join(ROOTFS_STORE_PATHS_FILE),
+            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-hello/bin\n",
+        )
+        .unwrap();
+
+        let err = OciConfig::new(vec!["/bin/sh".to_string()], None)
+            .with_rootfs_binds(&rootfs)
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("expected immediate"),
+            "expected immediate-store-object rejection, got: {err}"
+        );
     }
 
     #[test]

@@ -1508,18 +1508,49 @@ impl Container {
                 missing
             )));
         }
-        caps::set(None, CapSet::Inheritable, &caps).map_err(|e| {
+        let extra_permitted: Vec<_> = permitted.difference(&caps).copied().collect();
+        let bounding = caps::read(None, CapSet::Bounding).map_err(|e| {
             NucleusError::CapabilityError(format!(
-                "Failed to set gVisor bridge handoff inheritable capabilities: {}",
+                "Failed to read gVisor bridge handoff bounding capabilities: {}",
                 e
             ))
         })?;
+        let extra_bounding: Vec<_> = bounding.difference(&caps).copied().collect();
+        caps::clear(None, CapSet::Ambient).map_err(|e| {
+            NucleusError::CapabilityError(format!(
+                "Failed to clear gVisor bridge handoff ambient capabilities: {}",
+                e
+            ))
+        })?;
+        // The caps crate preserves the other base sets during each capset.
+        // Lower effective before removing permitted extras so the kernel never
+        // sees effective bits outside the new permitted set.
         caps::set(None, CapSet::Effective, &caps).map_err(|e| {
             NucleusError::CapabilityError(format!(
                 "Failed to set gVisor bridge handoff effective capabilities: {}",
                 e
             ))
         })?;
+        caps::set(None, CapSet::Inheritable, &caps).map_err(|e| {
+            NucleusError::CapabilityError(format!(
+                "Failed to set gVisor bridge handoff inheritable capabilities: {}",
+                e
+            ))
+        })?;
+        for cap in &extra_bounding {
+            caps::drop(None, CapSet::Bounding, *cap).map_err(|e| {
+                NucleusError::CapabilityError(format!(
+                    "Failed to drop extra gVisor bridge handoff bounding capability {cap:?}: {e}"
+                ))
+            })?;
+        }
+        for cap in &extra_permitted {
+            caps::drop(None, CapSet::Permitted, *cap).map_err(|e| {
+                NucleusError::CapabilityError(format!(
+                    "Failed to drop extra gVisor bridge handoff permitted capability {cap:?}: {e}"
+                ))
+            })?;
+        }
         caps::set(None, CapSet::Ambient, &caps).map_err(|e| {
             NucleusError::CapabilityError(format!(
                 "Failed to set gVisor bridge handoff ambient capabilities: {}",
@@ -1528,6 +1559,8 @@ impl Container {
         })?;
         debug!(
             ?caps,
+            ?extra_permitted,
+            ?extra_bounding,
             "Restored gVisor bridge handoff capabilities inside mapped user namespace"
         );
         Ok(())
@@ -2252,18 +2285,23 @@ mod tests {
     }
 
     #[test]
-    fn test_gvisor_rootless_skips_supervisor_exec_policy() {
+    fn test_gvisor_root_remap_keeps_production_supervisor_exec_policy() {
         let source = include_str!("gvisor_setup.rs");
         let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
+        let helper = extract_fn_body(source, "fn require_gvisor_supervisor_exec_policy");
         let policy = fn_body.find("let require_supervisor_exec_policy").unwrap();
         assert!(
-            fn_body.contains("let rootless_gvisor =")
-                && fn_body.contains("self.config.user_ns_config.is_some()")
-                && fn_body.contains("!Uid::effective().is_root()")
-                && fn_body[policy..].contains("ServiceMode::Production")
-                && fn_body[policy..].contains("!precreated_userns")
-                && fn_body[policy..].contains("!rootless_gvisor"),
-            "explicit user namespaces and effective non-root gVisor must not apply the host-side Landlock exec policy"
+            fn_body[policy..].contains(
+                "require_gvisor_supervisor_exec_policy(self.config.service_mode, precreated_userns)"
+            ),
+            "gVisor setup must use the explicit supervisor policy predicate"
+        );
+        assert!(
+            helper.contains("ServiceMode::Production")
+                && helper.contains("!precreated_userns")
+                && !helper.contains("rootless_gvisor")
+                && !helper.contains("user_ns_config"),
+            "root-remapped user namespace config must not disable the production exec policy"
         );
     }
 
@@ -2327,16 +2365,38 @@ mod tests {
     }
 
     #[test]
-    fn test_gvisor_bridge_handoff_does_not_raise_permitted_caps() {
+    fn test_gvisor_bridge_handoff_narrows_permitted_caps() {
         let source = include_str!("runtime.rs");
         let fn_body = extract_fn_body(source, "fn restore_gvisor_bridge_handoff_capabilities");
+        let read_permitted = fn_body.find("caps::read(None, CapSet::Permitted)").unwrap();
+        let missing_check = fn_body.find("if !missing.is_empty()").unwrap();
+        let set_effective = fn_body.find("caps::set(None, CapSet::Effective").unwrap();
+        let drop_permitted = fn_body.find("caps::drop(None, CapSet::Permitted").unwrap();
         assert!(
-            fn_body.contains("caps::read(None, CapSet::Permitted)"),
+            read_permitted < missing_check && missing_check < set_effective,
             "gVisor bridge handoff must verify existing permitted capabilities"
         );
         assert!(
-            !fn_body.contains("caps::set(None, CapSet::Permitted"),
-            "gVisor bridge handoff must not try to raise permitted capabilities after the uid switch"
+            fn_body.contains("permitted.difference(&caps)")
+                && set_effective < drop_permitted
+                && !fn_body.contains("caps::set(None, CapSet::Permitted"),
+            "gVisor bridge handoff must drop extra permitted capabilities without trying to raise permitted"
+        );
+    }
+
+    #[test]
+    fn test_gvisor_bridge_handoff_narrows_bounding_caps() {
+        let source = include_str!("runtime.rs");
+        let fn_body = extract_fn_body(source, "fn restore_gvisor_bridge_handoff_capabilities");
+        let set_effective = fn_body.find("caps::set(None, CapSet::Effective").unwrap();
+        let drop_bounding = fn_body.find("caps::drop(None, CapSet::Bounding").unwrap();
+        let drop_permitted = fn_body.find("caps::drop(None, CapSet::Permitted").unwrap();
+        assert!(
+            fn_body.contains("caps::read(None, CapSet::Bounding)")
+                && fn_body.contains("bounding.difference(&caps)")
+                && set_effective < drop_bounding
+                && drop_bounding < drop_permitted,
+            "gVisor bridge handoff must drop extra bounding capabilities before exec"
         );
     }
 

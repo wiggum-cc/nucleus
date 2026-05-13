@@ -5,10 +5,12 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufReader, Read};
-use std::path::Path;
+use std::path::{Component, Path};
 
 pub const ROOTFS_ATTESTATION_FILE: &str = ".nucleus-rootfs-sha256";
 pub const ROOTFS_STORE_PATHS_FILE: &str = ".nucleus-rootfs-store-paths";
+const NIX_STORE_HASH_LEN: usize = 32;
+const NIX_STORE_HASH_ALPHABET: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
 pub type DirectoryManifest = BTreeMap<String, String>;
 
@@ -47,6 +49,60 @@ pub fn verify_rootfs_attestation(root: &Path) -> Result<()> {
     let mut actual = BTreeMap::new();
     scan_dir(root, root, ScanMode::Rootfs, &mut actual)?;
     compare_manifests(&expected, &actual, "rootfs")
+}
+
+pub fn is_immediate_nix_store_object_path(path: &Path) -> bool {
+    immediate_nix_store_object_name(path).is_some()
+}
+
+fn immediate_nix_store_object_name(path: &Path) -> Option<&OsStr> {
+    let (store_name, has_trailing_components) = nix_store_object_name(path)?;
+    if has_trailing_components || !is_valid_nix_store_object_name(store_name) {
+        return None;
+    }
+    Some(store_name)
+}
+
+fn nix_store_object_name(path: &Path) -> Option<(&OsStr, bool)> {
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return None;
+    }
+    match components.next() {
+        Some(Component::Normal(component)) if component == OsStr::new("nix") => {}
+        _ => return None,
+    }
+    match components.next() {
+        Some(Component::Normal(component)) if component == OsStr::new("store") => {}
+        _ => return None,
+    }
+    let store_name = match components.next() {
+        Some(Component::Normal(component)) => component,
+        _ => return None,
+    };
+    Some((store_name, components.next().is_some()))
+}
+
+fn is_valid_nix_store_object_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some((hash, package_name)) = name.split_once('-') else {
+        return false;
+    };
+
+    hash.len() == NIX_STORE_HASH_LEN
+        && !package_name.is_empty()
+        && package_name != "."
+        && package_name != ".."
+        && hash
+            .bytes()
+            .all(|byte| NIX_STORE_HASH_ALPHABET.contains(&byte))
+        && package_name.bytes().all(is_valid_nix_store_name_byte)
+}
+
+fn is_valid_nix_store_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.' | b'_' | b'?' | b'=')
 }
 
 fn read_manifest_file(path: &Path) -> Result<DirectoryManifest> {
@@ -225,24 +281,11 @@ fn validate_rootfs_symlink_target(root: &Path, path: &Path) -> Result<()> {
         NucleusError::FilesystemError(format!("Failed to resolve rootfs {:?}: {}", root, e))
     })?;
 
-    // M6: Tighten /nix/store symlink allowance. Only allow targets
-    // that resolve to a valid /nix/store/<hash>-<name> path pattern
-    // (32-char base32 hash followed by a dash and a package name).
     if resolved.starts_with(&canonical_root) {
         return Ok(());
     }
-    if resolved.starts_with("/nix/store/") {
-        let store_relative = resolved
-            .strip_prefix("/nix/store/")
-            .unwrap_or_else(|_| std::path::Path::new(""));
-        let store_entry = store_relative
-            .to_string_lossy()
-            .split('/')
-            .next()
-            .unwrap_or("")
-            .to_string();
-        // Valid Nix store paths have the form <32-char-hash>-<name>
-        if store_entry.len() >= 34 && store_entry.as_bytes()[32] == b'-' {
+    if let Some((store_name, _)) = nix_store_object_name(&resolved) {
+        if is_valid_nix_store_object_name(store_name) {
             return Ok(());
         }
         return Err(NucleusError::FilesystemError(format!(
@@ -331,6 +374,26 @@ mod tests {
 
         let manifest = read_manifest_file(&path).unwrap();
         assert_eq!(manifest.get("bin/tool").unwrap(), "abc");
+    }
+
+    #[test]
+    fn test_immediate_nix_store_object_path_validation() {
+        let valid = Path::new("/nix/store/0123456789abcdfghijklmnpqrsvwxyz-hello-2.12.1");
+        assert!(is_immediate_nix_store_object_path(valid));
+
+        for path in [
+            "/nix/store",
+            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-hello/bin",
+            "/nix/store/0123456789abcdfghijklmnpqrsvwxy-hello",
+            "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-hello",
+            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-",
+            "/tmp/nix/store/0123456789abcdfghijklmnpqrsvwxyz-hello",
+        ] {
+            assert!(
+                !is_immediate_nix_store_object_path(Path::new(path)),
+                "{path} must not be accepted as an immediate Nix store object"
+            );
+        }
     }
 
     #[test]
