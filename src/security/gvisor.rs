@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 const NIX_STORE_EXEC_ROOT: &str = "/nix/store";
 const NIXOS_ROOTLESS_USERNS_WRAPPER_DIR: &str = "/run/wrappers/bin";
 const ROOTLESS_USERNS_HELPERS: &[&str] = &["newuidmap", "newgidmap"];
+const ROOTLESS_USERNS_HELPER_EXEC_ROOTS_ENV: &str = "NUCLEUS_ROOTLESS_USERNS_HELPER_EXEC_ROOTS";
 const RUNSC_DEBUG_DIR_ENV: &str = "NUCLEUS_RUNSC_DEBUG_DIR";
 const RUNSC_REEXEC_VIA_PROC_SELF_EXE_ENV: &str = "NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE";
 const RUNSC_SUPERVISOR_PATH: &str =
@@ -567,10 +568,22 @@ impl GVisorRuntime {
         // NixOS exposes newuidmap/newgidmap as setuid wrappers below
         // /run/wrappers/bin. Rootless runsc invokes them while creating the
         // OCI user namespace, after the supervisor execute allowlist is active.
-        ROOTLESS_USERNS_HELPERS
+        let mut roots: Vec<PathBuf> = ROOTLESS_USERNS_HELPERS
             .iter()
             .map(|helper| PathBuf::from(NIXOS_ROOTLESS_USERNS_WRAPPER_DIR).join(helper))
-            .collect()
+            .collect();
+
+        // The NixOS wrappers exec immutable store binaries, but the wrapper
+        // executables are intentionally unreadable so Nucleus cannot discover
+        // those targets by inspecting the wrapper. Callers that install a
+        // fail-closed supervisor policy can provide the concrete helper paths.
+        if let Some(raw_roots) = std::env::var_os(ROOTLESS_USERNS_HELPER_EXEC_ROOTS_ENV)
+            .filter(|value| !value.is_empty())
+        {
+            roots.extend(std::env::split_paths(&raw_roots).filter(|path| path.is_absolute()));
+        }
+
+        roots
     }
 
     fn nix_store_runsc_exec_root(program: &Path) -> Option<PathBuf> {
@@ -1434,7 +1447,9 @@ mod tests {
     }
 
     #[test]
-    fn test_rootless_userns_helper_exec_roots_are_exact_wrappers() {
+    fn test_rootless_userns_helper_exec_roots_include_default_wrappers() {
+        let _env_lock = EnvLock::acquire();
+        let _helper_roots = EnvVarGuard::remove(ROOTLESS_USERNS_HELPER_EXEC_ROOTS_ENV);
         let roots = GVisorRuntime::rootless_userns_helper_exec_roots();
 
         assert_eq!(
@@ -1442,6 +1457,31 @@ mod tests {
             vec![
                 PathBuf::from("/run/wrappers/bin/newuidmap"),
                 PathBuf::from("/run/wrappers/bin/newgidmap"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rootless_userns_helper_exec_roots_include_configured_absolute_roots() {
+        let _env_lock = EnvLock::acquire();
+        let configured_roots = std::env::join_paths([
+            PathBuf::from("/nix/store/shadow/bin/newuidmap"),
+            PathBuf::from("relative/newgidmap"),
+            PathBuf::from("/nix/store/shadow/bin/newgidmap"),
+        ])
+        .unwrap();
+        let _helper_roots =
+            EnvVarGuard::set(ROOTLESS_USERNS_HELPER_EXEC_ROOTS_ENV, configured_roots);
+
+        let roots = GVisorRuntime::rootless_userns_helper_exec_roots();
+
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/run/wrappers/bin/newuidmap"),
+                PathBuf::from("/run/wrappers/bin/newgidmap"),
+                PathBuf::from("/nix/store/shadow/bin/newuidmap"),
+                PathBuf::from("/nix/store/shadow/bin/newgidmap"),
             ]
         );
     }
