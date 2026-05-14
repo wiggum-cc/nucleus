@@ -12,6 +12,8 @@ use std::process::Command;
 use tracing::{debug, info, warn};
 
 const NIX_STORE_EXEC_ROOT: &str = "/nix/store";
+const NIXOS_ROOTLESS_USERNS_WRAPPER_DIR: &str = "/run/wrappers/bin";
+const ROOTLESS_USERNS_HELPERS: &[&str] = &["newuidmap", "newgidmap"];
 const RUNSC_DEBUG_DIR_ENV: &str = "NUCLEUS_RUNSC_DEBUG_DIR";
 const RUNSC_REEXEC_VIA_PROC_SELF_EXE_ENV: &str = "NUCLEUS_RUNSC_REEXEC_VIA_PROC_SELF_EXE";
 const RUNSC_SUPERVISOR_PATH: &str =
@@ -344,8 +346,11 @@ impl GVisorRuntime {
         let runsc_runtime_dir = runsc_root.join("runtime");
         Self::ensure_secure_runsc_dir(&runsc_runtime_dir, "runsc runtime directory")?;
 
-        let (program_path, exec_allow_roots) =
+        let (program_path, mut exec_allow_roots) =
             self.prepare_supervisor_runsc_program(&runsc_root, options.stage_runsc_binary)?;
+        if options.runsc_rootless {
+            exec_allow_roots.extend(Self::rootless_userns_helper_exec_roots());
+        }
 
         // Build runsc command with OCI bundle.
         // Global flags (--root, --network, --platform) must come BEFORE the subcommand.
@@ -556,6 +561,16 @@ impl GVisorRuntime {
         // The patched runsc resolves helper re-execs to its concrete binary
         // path. Keep the supervisor policy scoped to that executable root.
         vec![program_root]
+    }
+
+    fn rootless_userns_helper_exec_roots() -> Vec<PathBuf> {
+        // NixOS exposes newuidmap/newgidmap as setuid wrappers below
+        // /run/wrappers/bin. Rootless runsc invokes them while creating the
+        // OCI user namespace, after the supervisor execute allowlist is active.
+        ROOTLESS_USERNS_HELPERS
+            .iter()
+            .map(|helper| PathBuf::from(NIXOS_ROOTLESS_USERNS_WRAPPER_DIR).join(helper))
+            .collect()
     }
 
     fn nix_store_runsc_exec_root(program: &Path) -> Option<PathBuf> {
@@ -1416,6 +1431,39 @@ mod tests {
         let roots = GVisorRuntime::supervisor_exec_allow_roots(PathBuf::from(NIX_STORE_EXEC_ROOT));
 
         assert_eq!(roots, vec![PathBuf::from(NIX_STORE_EXEC_ROOT)]);
+    }
+
+    #[test]
+    fn test_rootless_userns_helper_exec_roots_are_exact_wrappers() {
+        let roots = GVisorRuntime::rootless_userns_helper_exec_roots();
+
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/run/wrappers/bin/newuidmap"),
+                PathBuf::from("/run/wrappers/bin/newgidmap"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rootless_supervisor_policy_allows_userns_helpers() {
+        let source = include_str!("gvisor.rs");
+        let start = source.find("pub fn exec_with_oci_bundle_options").unwrap();
+        let end = source[start..]
+            .find("pub fn exec_with_oci_bundle_network")
+            .map(|offset| start + offset)
+            .unwrap();
+        let fn_body = &source[start..end];
+        let helper_roots = fn_body
+            .find("exec_allow_roots.extend(Self::rootless_userns_helper_exec_roots())")
+            .unwrap();
+        let policy = fn_body.find("self.apply_supervisor_exec_policy").unwrap();
+
+        assert!(
+            helper_roots < policy,
+            "rootless runsc must allow newuidmap/newgidmap before installing Landlock"
+        );
     }
 
     #[test]
