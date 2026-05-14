@@ -152,12 +152,12 @@ impl Container {
         }
 
         if let Some(user_ns_config) = &self.config.user_ns_config {
-            // Rootless bridge networking already placed runsc in a mapped user
-            // namespace so it can inherit the prepared netns. Do not ask runsc
-            // to create a nested OCI user namespace with host IDs that are not
-            // mapped in the intermediate namespace.
+            // Rootless gVisor handoff already placed runsc in a mapped user
+            // namespace so it can inherit the prepared launch context. Do not
+            // ask runsc to create a nested OCI user namespace with host IDs
+            // that are not mapped in the intermediate namespace.
             if precreated_userns {
-                info!("Using pre-created rootless user namespace for gVisor bridge networking");
+                info!("Using pre-created rootless user namespace for gVisor handoff");
             } else {
                 oci_config = oci_config.with_rootless_user_namespace(user_ns_config);
             }
@@ -217,14 +217,14 @@ impl Container {
 
         let rootless_gvisor = self.config.user_ns_config.is_some() || !Uid::effective().is_root();
         let ignore_cgroups = rootless_gvisor;
-        // Tell runsc whenever the launch is rootless. Pre-created bridge
-        // namespaces need this so helper handoff keeps mapped privileges; OCI
-        // user namespace launches need it because runsc itself starts as the
-        // non-root service user.
+        // Tell runsc whenever the launch is rootless. Pre-created gVisor
+        // handoff namespaces need this so helper handoff keeps mapped
+        // privileges; OCI user namespace launches need it because runsc itself
+        // starts as the non-root service user.
         let runsc_rootless = rootless_gvisor;
         let platform = self.config.gvisor_platform;
         // Production gVisor launches fail closed under the host-side
-        // supervisor execute policy except for the pre-created bridge userns
+        // supervisor execute policy except for the pre-created gVisor userns
         // handoff. Do not key this off user_ns_config: root-run production
         // auto-enables root_remapped() and still needs the policy.
         let require_supervisor_exec_policy =

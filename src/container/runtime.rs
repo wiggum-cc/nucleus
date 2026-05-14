@@ -135,6 +135,16 @@ impl Container {
         )))
     }
 
+    fn gvisor_needs_precreated_userns(config: &ContainerConfig, host_is_root: bool) -> bool {
+        config.use_gvisor
+            && !host_is_root
+            && config.user_ns_config.is_some()
+            && matches!(
+                config.network,
+                NetworkMode::Bridge(_) | NetworkMode::GVisorHost
+            )
+    }
+
     fn prepare_runtime_base_override(
         config: &ContainerConfig,
         host_is_root: bool,
@@ -432,12 +442,9 @@ impl Container {
         } else {
             None
         };
-        let gvisor_bridge_needs_userns_mapping = config.use_gvisor
-            && !is_root
-            && config.user_ns_config.is_some()
-            && matches!(config.network, NetworkMode::Bridge(_));
+        let gvisor_needs_precreated_userns = Self::gvisor_needs_precreated_userns(&config, is_root);
         let needs_external_userns_mapping = config.user_ns_config.is_some()
-            && (!config.use_gvisor || gvisor_bridge_needs_userns_mapping);
+            && (!config.use_gvisor || gvisor_needs_precreated_userns);
         let runtime_base_override =
             Self::prepare_runtime_base_override(&config, is_root, needs_external_userns_mapping)?;
 
@@ -739,13 +746,14 @@ impl Container {
         let mut fs_state = FilesystemState::Unmounted;
         let mut sec_state = SecurityState::Privileged;
 
-        // gVisor creates the container namespaces. Bridge mode is the exception:
-        // Nucleus must hand slirp/port-forward setup a concrete target netns,
-        // then runsc inherits that netns via --network host.
+        // gVisor creates the container namespaces. Rootless bridge and
+        // gvisor-host pre-create the user namespace so runsc inherits a mapped
+        // launch context. Bridge also pre-creates a netns for slirp/NAT setup;
+        // gvisor-host intentionally keeps the host netns for runsc hostinet.
         if self.config.use_gvisor {
-            let gvisor_bridge_precreated_userns =
-                if matches!(self.config.network, NetworkMode::Bridge(_)) {
-                    self.prepare_gvisor_bridge_namespace(
+            let gvisor_precreated_userns =
+                if Self::gvisor_needs_precreated_userns(&self.config, Uid::effective().is_root()) {
+                    self.prepare_gvisor_handoff_namespace(
                         userns_request_pipe.as_ref(),
                         userns_ack_pipe.as_ref(),
                     )?
@@ -763,7 +771,7 @@ impl Container {
                     "Failed waiting for parent setup acknowledgement",
                 )?;
             }
-            return self.setup_and_exec_gvisor(gvisor_bridge_precreated_userns);
+            return self.setup_and_exec_gvisor(gvisor_precreated_userns);
         }
 
         // 1. Create namespaces in child and optionally configure user mapping.
@@ -1470,12 +1478,12 @@ impl Container {
                 e
             ))
         })?;
-        Self::restore_gvisor_bridge_handoff_capabilities()?;
+        Self::restore_gvisor_handoff_capabilities()?;
         debug!("Switched setup process to uid/gid 0 inside mapped user namespace");
         Ok(())
     }
 
-    fn gvisor_bridge_handoff_capabilities() -> CapsHashSet {
+    fn gvisor_handoff_capabilities() -> CapsHashSet {
         [
             Capability::CAP_CHOWN,
             Capability::CAP_DAC_OVERRIDE,
@@ -1493,32 +1501,32 @@ impl Container {
         .collect()
     }
 
-    fn restore_gvisor_bridge_handoff_capabilities() -> Result<()> {
-        let caps = Self::gvisor_bridge_handoff_capabilities();
+    fn restore_gvisor_handoff_capabilities() -> Result<()> {
+        let caps = Self::gvisor_handoff_capabilities();
         let permitted = caps::read(None, CapSet::Permitted).map_err(|e| {
             NucleusError::CapabilityError(format!(
-                "Failed to read gVisor bridge handoff permitted capabilities: {}",
+                "Failed to read gVisor handoff permitted capabilities: {}",
                 e
             ))
         })?;
         let missing: Vec<_> = caps.difference(&permitted).copied().collect();
         if !missing.is_empty() {
             return Err(NucleusError::CapabilityError(format!(
-                "Missing gVisor bridge handoff permitted capabilities after entering mapped user namespace: {:?}",
+                "Missing gVisor handoff permitted capabilities after entering mapped user namespace: {:?}",
                 missing
             )));
         }
         let extra_permitted: Vec<_> = permitted.difference(&caps).copied().collect();
         let bounding = caps::read(None, CapSet::Bounding).map_err(|e| {
             NucleusError::CapabilityError(format!(
-                "Failed to read gVisor bridge handoff bounding capabilities: {}",
+                "Failed to read gVisor handoff bounding capabilities: {}",
                 e
             ))
         })?;
         let extra_bounding: Vec<_> = bounding.difference(&caps).copied().collect();
         caps::clear(None, CapSet::Ambient).map_err(|e| {
             NucleusError::CapabilityError(format!(
-                "Failed to clear gVisor bridge handoff ambient capabilities: {}",
+                "Failed to clear gVisor handoff ambient capabilities: {}",
                 e
             ))
         })?;
@@ -1527,33 +1535,33 @@ impl Container {
         // sees effective bits outside the new permitted set.
         caps::set(None, CapSet::Effective, &caps).map_err(|e| {
             NucleusError::CapabilityError(format!(
-                "Failed to set gVisor bridge handoff effective capabilities: {}",
+                "Failed to set gVisor handoff effective capabilities: {}",
                 e
             ))
         })?;
         caps::set(None, CapSet::Inheritable, &caps).map_err(|e| {
             NucleusError::CapabilityError(format!(
-                "Failed to set gVisor bridge handoff inheritable capabilities: {}",
+                "Failed to set gVisor handoff inheritable capabilities: {}",
                 e
             ))
         })?;
         for cap in &extra_bounding {
             caps::drop(None, CapSet::Bounding, *cap).map_err(|e| {
                 NucleusError::CapabilityError(format!(
-                    "Failed to drop extra gVisor bridge handoff bounding capability {cap:?}: {e}"
+                    "Failed to drop extra gVisor handoff bounding capability {cap:?}: {e}"
                 ))
             })?;
         }
         for cap in &extra_permitted {
             caps::drop(None, CapSet::Permitted, *cap).map_err(|e| {
                 NucleusError::CapabilityError(format!(
-                    "Failed to drop extra gVisor bridge handoff permitted capability {cap:?}: {e}"
+                    "Failed to drop extra gVisor handoff permitted capability {cap:?}: {e}"
                 ))
             })?;
         }
         caps::set(None, CapSet::Ambient, &caps).map_err(|e| {
             NucleusError::CapabilityError(format!(
-                "Failed to set gVisor bridge handoff ambient capabilities: {}",
+                "Failed to set gVisor handoff ambient capabilities: {}",
                 e
             ))
         })?;
@@ -1561,12 +1569,12 @@ impl Container {
             ?caps,
             ?extra_permitted,
             ?extra_bounding,
-            "Restored gVisor bridge handoff capabilities inside mapped user namespace"
+            "Restored gVisor handoff capabilities inside mapped user namespace"
         );
         Ok(())
     }
 
-    fn prepare_gvisor_bridge_namespace(
+    fn prepare_gvisor_handoff_namespace(
         &self,
         userns_request_pipe: Option<&OwnedFd>,
         userns_ack_pipe: Option<&OwnedFd>,
@@ -1575,42 +1583,44 @@ impl Container {
         if self.config.user_ns_config.is_some() && !Uid::effective().is_root() {
             nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWUSER).map_err(|e| {
                 NucleusError::NamespaceError(format!(
-                    "Failed to unshare gVisor bridge user namespace: {}",
+                    "Failed to unshare gVisor handoff user namespace: {}",
                     e
                 ))
             })?;
 
             let request_fd = userns_request_pipe.ok_or_else(|| {
                 NucleusError::ExecError(
-                    "Missing user namespace request pipe in gVisor bridge child".to_string(),
+                    "Missing user namespace request pipe in gVisor handoff child".to_string(),
                 )
             })?;
             let ack_fd = userns_ack_pipe.ok_or_else(|| {
                 NucleusError::ExecError(
-                    "Missing user namespace acknowledgement pipe in gVisor bridge child"
+                    "Missing user namespace acknowledgement pipe in gVisor handoff child"
                         .to_string(),
                 )
             })?;
 
             Self::send_sync_byte(
                 request_fd,
-                "Failed to request gVisor bridge user namespace mappings from parent",
+                "Failed to request gVisor handoff user namespace mappings from parent",
             )?;
             Self::wait_for_sync_byte(
                 ack_fd,
-                "Parent closed user namespace ack pipe before gVisor bridge mappings were written",
-                "Failed waiting for parent to finish gVisor bridge user namespace mappings",
+                "Parent closed user namespace ack pipe before gVisor handoff mappings were written",
+                "Failed waiting for parent to finish gVisor handoff user namespace mappings",
             )?;
             Self::become_userns_root_for_setup()?;
             precreated_userns = true;
         }
 
-        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).map_err(|e| {
-            NucleusError::NamespaceError(format!(
-                "Failed to unshare gVisor bridge network namespace: {}",
-                e
-            ))
-        })?;
+        if matches!(self.config.network, NetworkMode::Bridge(_)) {
+            nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).map_err(|e| {
+                NucleusError::NamespaceError(format!(
+                    "Failed to unshare gVisor bridge network namespace: {}",
+                    e
+                ))
+            })?;
+        }
         Ok(precreated_userns)
     }
 
@@ -2309,85 +2319,99 @@ mod tests {
     fn test_gvisor_bridge_rootless_requests_external_userns_mapping() {
         let source = include_str!("runtime.rs");
         let create_body = extract_fn_body(source, "fn create_internal");
+        let helper = extract_fn_body(source, "fn gvisor_needs_precreated_userns");
         assert!(
-            create_body.contains("let gvisor_bridge_needs_userns_mapping"),
+            create_body.contains("let gvisor_needs_precreated_userns"),
             "gVisor bridge rootless setup must request parent-written userns mappings"
         );
         assert!(
-            create_body.contains("matches!(config.network, NetworkMode::Bridge(_))"),
-            "external mapping request must be scoped to gVisor bridge networking"
+            create_body.contains("!config.use_gvisor || gvisor_needs_precreated_userns"),
+            "external mapping request must be routed through the gVisor pre-created userns predicate"
         );
-    }
-
-    #[test]
-    fn test_gvisor_host_does_not_request_external_userns_mapping() {
-        let source = include_str!("runtime.rs");
-        let create_body = extract_fn_body(source, "fn create_internal");
         assert!(
-            !create_body.contains("NetworkMode::GVisorHost")
-                || !create_body.contains(
-                    "matches!(config.network, NetworkMode::Bridge(_) | NetworkMode::GVisorHost)"
-                ),
-            "gVisor host mode must not use the bridge pre-created userns/netns handoff"
+            helper.contains("NetworkMode::Bridge(_)"),
+            "external mapping request must include gVisor bridge networking"
         );
     }
 
     #[test]
-    fn test_gvisor_bridge_namespace_creates_userns_before_netns() {
+    fn test_gvisor_host_rootless_requests_external_userns_mapping() {
         let source = include_str!("runtime.rs");
-        let fn_body = extract_fn_body(source, "fn prepare_gvisor_bridge_namespace");
+        let helper = extract_fn_body(source, "fn gvisor_needs_precreated_userns");
+        assert!(
+            helper.contains("NetworkMode::GVisorHost"),
+            "gVisor host mode must use the pre-created userns handoff so runsc hostinet starts rootless"
+        );
+        assert!(
+            helper.contains("!host_is_root") && helper.contains("config.user_ns_config.is_some()"),
+            "gVisor host handoff must stay scoped to rootless user namespace launches"
+        );
+    }
+
+    #[test]
+    fn test_gvisor_handoff_namespace_creates_userns_before_bridge_netns() {
+        let source = include_str!("runtime.rs");
+        let fn_body = extract_fn_body(source, "fn prepare_gvisor_handoff_namespace");
         let userns = fn_body.find("CLONE_NEWUSER").unwrap();
         let request = fn_body.find("send_sync_byte").unwrap();
         let become_root = fn_body.find("become_userns_root_for_setup").unwrap();
+        let bridge_only = fn_body
+            .find("if matches!(self.config.network, NetworkMode::Bridge(_))")
+            .unwrap();
         let netns = fn_body.find("CLONE_NEWNET").unwrap();
         assert!(
-            userns < request && request < become_root && become_root < netns,
-            "rootless gVisor bridge setup must map userns before creating the netns"
+            userns < request
+                && request < become_root
+                && become_root < bridge_only
+                && bridge_only < netns,
+            "rootless gVisor handoff must map userns before creating the bridge netns"
+        );
+        assert!(
+            !fn_body.contains("NetworkMode::GVisorHost"),
+            "gVisor host handoff must not create an OCI network namespace before runsc hostinet"
         );
     }
 
     #[test]
-    fn test_gvisor_bridge_userns_preserves_caps_for_runsc_exec() {
+    fn test_gvisor_handoff_userns_preserves_caps_for_runsc_exec() {
         let source = include_str!("runtime.rs");
         let fn_body = extract_fn_body(source, "fn become_userns_root_for_setup");
         let setuid = fn_body.find("setresuid").unwrap();
-        let restore = fn_body
-            .find("restore_gvisor_bridge_handoff_capabilities")
-            .unwrap();
+        let restore = fn_body.find("restore_gvisor_handoff_capabilities").unwrap();
         assert!(
             setuid < restore,
-            "gVisor bridge setup must restore exec-time capabilities after switching to uid 0 in the mapped namespace"
+            "gVisor setup must restore exec-time capabilities after switching to uid 0 in the mapped namespace"
         );
         assert!(
             !fn_body.contains("set_keepcaps"),
-            "gVisor bridge setup must let the uid 0 switch grant namespace capabilities instead of preserving the pre-switch empty set"
+            "gVisor setup must let the uid 0 switch grant namespace capabilities instead of preserving the pre-switch empty set"
         );
     }
 
     #[test]
-    fn test_gvisor_bridge_handoff_narrows_permitted_caps() {
+    fn test_gvisor_handoff_narrows_permitted_caps() {
         let source = include_str!("runtime.rs");
-        let fn_body = extract_fn_body(source, "fn restore_gvisor_bridge_handoff_capabilities");
+        let fn_body = extract_fn_body(source, "fn restore_gvisor_handoff_capabilities");
         let read_permitted = fn_body.find("caps::read(None, CapSet::Permitted)").unwrap();
         let missing_check = fn_body.find("if !missing.is_empty()").unwrap();
         let set_effective = fn_body.find("caps::set(None, CapSet::Effective").unwrap();
         let drop_permitted = fn_body.find("caps::drop(None, CapSet::Permitted").unwrap();
         assert!(
             read_permitted < missing_check && missing_check < set_effective,
-            "gVisor bridge handoff must verify existing permitted capabilities"
+            "gVisor handoff must verify existing permitted capabilities"
         );
         assert!(
             fn_body.contains("permitted.difference(&caps)")
                 && set_effective < drop_permitted
                 && !fn_body.contains("caps::set(None, CapSet::Permitted"),
-            "gVisor bridge handoff must drop extra permitted capabilities without trying to raise permitted"
+            "gVisor handoff must drop extra permitted capabilities without trying to raise permitted"
         );
     }
 
     #[test]
-    fn test_gvisor_bridge_handoff_narrows_bounding_caps() {
+    fn test_gvisor_handoff_narrows_bounding_caps() {
         let source = include_str!("runtime.rs");
-        let fn_body = extract_fn_body(source, "fn restore_gvisor_bridge_handoff_capabilities");
+        let fn_body = extract_fn_body(source, "fn restore_gvisor_handoff_capabilities");
         let set_effective = fn_body.find("caps::set(None, CapSet::Effective").unwrap();
         let drop_bounding = fn_body.find("caps::drop(None, CapSet::Bounding").unwrap();
         let drop_permitted = fn_body.find("caps::drop(None, CapSet::Permitted").unwrap();
@@ -2396,13 +2420,13 @@ mod tests {
                 && fn_body.contains("bounding.difference(&caps)")
                 && set_effective < drop_bounding
                 && drop_bounding < drop_permitted,
-            "gVisor bridge handoff must drop extra bounding capabilities before exec"
+            "gVisor handoff must drop extra bounding capabilities before exec"
         );
     }
 
     #[test]
-    fn test_gvisor_bridge_handoff_caps_are_bounded_to_runsc_startup() {
-        let caps = Container::gvisor_bridge_handoff_capabilities();
+    fn test_gvisor_handoff_caps_are_bounded_to_runsc_startup() {
+        let caps = Container::gvisor_handoff_capabilities();
         for cap in [
             Capability::CAP_CHOWN,
             Capability::CAP_DAC_OVERRIDE,
@@ -2418,17 +2442,17 @@ mod tests {
         ] {
             assert!(
                 caps.contains(&cap),
-                "gVisor bridge handoff caps must include {cap:?}"
+                "gVisor handoff caps must include {cap:?}"
             );
         }
         assert_eq!(
             caps.len(),
             11,
-            "gVisor bridge handoff caps must stay aligned with the frontend systemd bounding set"
+            "gVisor handoff caps must stay aligned with the frontend systemd bounding set"
         );
         assert!(
             !caps.contains(&Capability::CAP_NET_ADMIN) && !caps.contains(&Capability::CAP_MKNOD),
-            "gVisor bridge handoff must not grow into broader host-style privilege"
+            "gVisor handoff must not grow into broader host-style privilege"
         );
     }
 
