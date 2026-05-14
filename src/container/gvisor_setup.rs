@@ -577,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn test_precreated_gvisor_bridge_userns_skips_supervisor_exec_policy() {
+    fn test_precreated_gvisor_userns_skips_supervisor_exec_policy() {
         assert!(!require_gvisor_supervisor_exec_policy(
             ServiceMode::Production,
             true

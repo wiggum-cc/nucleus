@@ -2235,7 +2235,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gvisor_bridge_precreated_userns_skips_nested_oci_userns() {
+    fn test_gvisor_precreated_userns_skips_nested_oci_userns() {
         let source = include_str!("gvisor_setup.rs");
         let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
         let precreated_check = fn_body.find("if precreated_userns").unwrap();
@@ -2243,18 +2243,18 @@ mod tests {
         let oci_userns = fn_body.find("with_rootless_user_namespace").unwrap();
         assert!(
             precreated_check < remove_oci_userns && remove_oci_userns < oci_userns,
-            "pre-created rootless bridge userns must remove nested OCI user namespace setup"
+            "pre-created rootless gVisor userns must remove nested OCI user namespace setup"
         );
     }
 
     #[test]
-    fn test_gvisor_bridge_precreated_userns_disables_oci_no_new_privileges() {
+    fn test_gvisor_precreated_userns_disables_oci_no_new_privileges() {
         let source = include_str!("gvisor_setup.rs");
         let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
         assert!(
             fn_body.contains("if precreated_userns")
                 && fn_body.contains("with_no_new_privileges(false)"),
-            "pre-created rootless bridge userns must not pass OCI noNewPrivileges to runsc"
+            "pre-created rootless gVisor userns must not pass OCI noNewPrivileges to runsc"
         );
     }
 
@@ -2284,13 +2284,13 @@ mod tests {
     }
 
     #[test]
-    fn test_gvisor_bridge_precreated_userns_keeps_store_runsc_binary() {
+    fn test_gvisor_precreated_userns_keeps_store_runsc_binary() {
         let source = include_str!("gvisor_setup.rs");
         let fn_body = extract_fn_body(source, "fn setup_and_exec_gvisor_oci");
         assert!(
             fn_body.contains("let stage_runsc_binary = false")
                 && fn_body.contains("stage_runsc_binary,"),
-            "pre-created rootless bridge userns must keep runsc on its validated store path"
+            "pre-created rootless gVisor userns must keep runsc on its validated store path"
         );
     }
 
