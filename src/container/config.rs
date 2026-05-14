@@ -92,8 +92,8 @@ pub enum ServiceMode {
     #[default]
     Agent,
     /// Long-running production service. Enforces strict security invariants:
-    /// - Forbids degraded security, chroot fallback, and host network modes
-    ///   (production egress policy enforcement requires an isolated network namespace)
+    /// - Forbids degraded security, chroot fallback, and native host network mode
+    /// - Allows gvisor-host only with explicit gVisor runtime and hostinet opt-in
     /// - Requires cgroup resource limits
     /// - Requires pivot_root (no chroot fallback)
     /// - Requires explicit rootfs path (no host bind mounts)
@@ -805,23 +805,37 @@ impl ContainerConfig {
             ));
         }
 
-        let host_network = matches!(
-            self.network,
-            crate::network::NetworkMode::Host | crate::network::NetworkMode::GVisorHost
-        );
-
-        if host_network {
+        if matches!(self.network, crate::network::NetworkMode::Host) {
             return Err(crate::error::NucleusError::ConfigError(
-                "Production mode forbids host network modes because egress policy \
-                 enforcement requires an isolated network namespace"
+                "Production mode forbids native host network mode because it collapses the \
+                 runtime boundary; use --network gvisor-host with --runtime gvisor and \
+                 --allow-host-network when hostinet is required"
                     .to_string(),
             ));
         }
 
-        if self.allow_host_network {
+        if matches!(self.network, crate::network::NetworkMode::GVisorHost) {
+            if !self.use_gvisor {
+                return Err(crate::error::NucleusError::ConfigError(
+                    "Production mode requires --runtime gvisor for --network gvisor-host"
+                        .to_string(),
+                ));
+            }
+            if !self.allow_host_network {
+                return Err(crate::error::NucleusError::ConfigError(
+                    "Production mode requires --allow-host-network for --network gvisor-host"
+                        .to_string(),
+                ));
+            }
+            if self.egress_policy.is_some() {
+                return Err(crate::error::NucleusError::ConfigError(
+                    "Production mode cannot enforce egress policy with --network gvisor-host"
+                        .to_string(),
+                ));
+            }
+        } else if self.allow_host_network {
             return Err(crate::error::NucleusError::ConfigError(
-                "Production mode forbids --allow-host-network because host networking bypasses \
-                 egress policy enforcement"
+                "Production mode permits --allow-host-network only with --network gvisor-host"
                     .to_string(),
             ));
         }
@@ -1247,13 +1261,18 @@ mod tests {
     }
 
     #[test]
-    fn test_production_mode_rejects_explicit_gvisor_host_network() {
+    fn test_production_mode_allows_explicit_gvisor_host_network() {
+        let rootfs = test_rootfs_path();
+        if !rootfs.is_dir() {
+            return;
+        }
         let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
+            .with_gvisor(true)
             .with_service_mode(ServiceMode::Production)
             .with_network(NetworkMode::GVisorHost)
             .with_allow_host_network(true)
-            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
+            .with_rootfs_path(rootfs)
             .with_verify_rootfs_attestation(true)
             .with_limits(
                 crate::resources::ResourceLimits::default()
@@ -1263,14 +1282,14 @@ mod tests {
                     .unwrap(),
             );
 
-        let err = cfg.validate_production_mode().unwrap_err();
-        assert!(err.to_string().contains("egress policy enforcement"));
+        assert!(cfg.validate_production_mode().is_ok());
     }
 
     #[test]
     fn test_production_mode_rejects_gvisor_host_network_with_egress_policy() {
         let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
+            .with_gvisor(true)
             .with_service_mode(ServiceMode::Production)
             .with_network(NetworkMode::GVisorHost)
             .with_allow_host_network(true)
@@ -1286,7 +1305,7 @@ mod tests {
             );
 
         let err = cfg.validate_production_mode().unwrap_err();
-        assert!(err.to_string().contains("egress policy enforcement"));
+        assert!(err.to_string().contains("egress policy"));
     }
 
     #[test]
@@ -1312,10 +1331,32 @@ mod tests {
     }
 
     #[test]
-    fn test_production_mode_rejects_gvisor_host_without_explicit_opt_in() {
+    fn test_production_mode_rejects_gvisor_host_without_gvisor_runtime() {
         let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
             .unwrap()
             .with_gvisor(false)
+            .with_service_mode(ServiceMode::Production)
+            .with_network(NetworkMode::GVisorHost)
+            .with_allow_host_network(true)
+            .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
+            .with_verify_rootfs_attestation(true)
+            .with_limits(
+                crate::resources::ResourceLimits::default()
+                    .with_memory("512M")
+                    .unwrap()
+                    .with_cpu_cores(2.0)
+                    .unwrap(),
+            );
+
+        let err = cfg.validate_production_mode().unwrap_err();
+        assert!(err.to_string().contains("--runtime gvisor"));
+    }
+
+    #[test]
+    fn test_production_mode_rejects_gvisor_host_without_explicit_opt_in() {
+        let cfg = ContainerConfig::try_new(None, vec!["/bin/sh".to_string()])
+            .unwrap()
+            .with_gvisor(true)
             .with_service_mode(ServiceMode::Production)
             .with_network(NetworkMode::GVisorHost)
             .with_rootfs_path(std::path::PathBuf::from("/nix/store/fake-rootfs"))
@@ -1329,7 +1370,7 @@ mod tests {
             );
 
         let err = cfg.validate_production_mode().unwrap_err();
-        assert!(err.to_string().contains("host network"));
+        assert!(err.to_string().contains("--allow-host-network"));
     }
 
     #[test]

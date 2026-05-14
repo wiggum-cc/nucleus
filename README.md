@@ -197,10 +197,11 @@ The systemd transient service uses `KillMode=mixed` and `TimeoutStopSec=30`, so 
 ### Production Mode
 
 Production mode enforces strict security invariants:
-- Forbids `--allow-degraded-security`, `--allow-chroot-fallback`, and `--allow-host-network`
+- Forbids `--allow-degraded-security`, `--allow-chroot-fallback`, and native `--network host`
+- Permits `--allow-host-network` only with `--network gvisor-host --runtime gvisor`
 - Requires explicit `--memory` limit
 - Requires successful cgroup creation (no fallback to running without limits)
-- Egress policy failures are fatal (no silent degradation)
+- Egress policy failures are fatal where Nucleus owns the network namespace; `gvisor-host` cannot use Nucleus egress policy
 - Bridge DNS must be configured explicitly (no public resolver defaults)
 
 ```bash
@@ -618,11 +619,11 @@ This produces a Nix store path containing `/bin`, `/lib`, `/etc`, etc. from the 
 | Service mode | `--service-mode agent` (default) | `--service-mode production` |
 | Degraded security | Allowed with flag | Forbidden |
 | Chroot fallback | Allowed with flag | Forbidden |
-| Host networking | Allowed with flag | Forbidden |
+| Host networking | Allowed with flag | Native `host` forbidden; `gvisor-host` allowed with gVisor + explicit opt-in |
 | Cgroup limits | Best-effort | Required (fatal on failure) |
 | Bridge DNS | Defaults to 8.8.8.8/8.8.4.4 | Must be configured explicitly |
 | Rootfs | Host bind mounts (/bin, /usr, /lib, /nix) | Pre-built Nix closure (`--rootfs`) |
-| Egress policy | Optional | Deny-all default (fatal on apply failure) |
+| Egress policy | Optional | Deny-all default where enforceable; unavailable with `gvisor-host` |
 | Memory limit | Optional | Required |
 | PID 1 init | Direct exec | Mini-init with zombie reaping + signal forwarding |
 | Workload uid/gid | Root by default | Configurable post-setup drop via `--user` / `--group` |
@@ -680,7 +681,7 @@ When using gVisor (`--runtime gvisor`), the network mode is selected explicitly:
 | `bridge` | `host` | Nucleus prepares a bridge/userspace NAT namespace, then runsc inherits it |
 | `gvisor-host` | `host` | gVisor hostinet mode; omits the OCI network namespace and requires `--allow-host-network` |
 
-The `gvisor-host` mode is intentionally separate from native `host` networking. Native `host` remains a direct host namespace mode. `gvisor-host` keeps the gVisor runtime boundary, but weakens network isolation by letting runsc hostinet use the host network stack.
+The `gvisor-host` mode is intentionally separate from native `host` networking. Native `host` remains a direct host namespace mode. `gvisor-host` keeps the gVisor runtime boundary, but weakens network isolation by letting runsc hostinet use the host network stack. Because there is no Nucleus-owned network namespace in this mode, Nucleus egress policy is unavailable with `gvisor-host`.
 
 ## OCI Support
 

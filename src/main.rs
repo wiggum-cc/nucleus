@@ -1728,15 +1728,23 @@ fn try_main() -> Result<i32> {
                 config = config.with_landlock_policy_sha256(sha256);
             }
 
-            // Egress policy: in production mode, always set a policy (deny-all if no
-            // --egress-allow given); in agent mode, only set when explicitly configured.
+            // Egress policy: in production mode, set deny-all by default for
+            // network namespaces where Nucleus can enforce it. gvisor-host is
+            // explicit hostinet and cannot be constrained by namespace-local
+            // iptables rules.
+            let gvisor_host_network = matches!(config.network, NetworkMode::GVisorHost);
             if !egress_allow.is_empty() {
+                if gvisor_host_network {
+                    return Err(NucleusError::ConfigError(
+                        "--egress-allow cannot be enforced with --network gvisor-host".to_string(),
+                    ));
+                }
                 let policy = EgressPolicy::default()
                     .with_allowed_cidrs(egress_allow)
                     .with_allowed_tcp_ports(egress_tcp_ports)
                     .with_allowed_udp_ports(egress_udp_ports);
                 config = config.with_egress_policy(policy);
-            } else if service_mode == ServiceMode::Production {
+            } else if service_mode == ServiceMode::Production && !gvisor_host_network {
                 // Default deny-all egress for production services
                 config = config.with_egress_policy(EgressPolicy::deny_all());
             }
